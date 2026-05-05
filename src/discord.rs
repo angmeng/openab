@@ -711,16 +711,26 @@ impl EventHandler for Handler {
                     debug!(filename = %attachment.filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
+            } else if mime.starts_with("image/") {
+                if let Some(block) = media::download_and_encode_image(
+                    &attachment.url,
+                    attachment.content_type.as_deref(),
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                ).await {
+                    debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                    extra_blocks.push(block);
+                }
+            } else if let Some(block) = media::download_to_disk(
                 &attachment.url,
-                attachment.content_type.as_deref(),
                 &attachment.filename,
+                mime,
                 u64::from(attachment.size),
                 None,
-            )
-            .await
-            {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                &msg.id.to_string(),
+            ).await {
+                debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment via disk path");
                 extra_blocks.push(block);
             } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
                 debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");

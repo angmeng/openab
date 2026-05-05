@@ -337,6 +337,120 @@ pub async fn download_and_read_text_file(
     ))
 }
 
+
+/// Sanitize a single path component so it cannot escape its parent dir or
+/// hit reserved characters on common filesystems.
+fn sanitize_path_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' | ':' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Download an arbitrary attachment to disk and return a ContentBlock::Text
+/// referencing the on-disk path. This is the fallback for files that are
+/// neither audio (handled by STT), nor inlineable text, nor images.
+///
+/// `bucket_id` is a stable per-message id (Slack `ts`, Discord message id).
+/// Files end up at `${OPENAB_ATTACHMENTS_DIR:-/tmp/openab-attachments}/<bucket>/<filename>`.
+///
+/// Returns None on download/write failure or when size exceeds 200MB.
+pub async fn download_to_disk(
+    url: &str,
+    filename: &str,
+    mime: &str,
+    size: u64,
+    auth_token: Option<&str>,
+    bucket_id: &str,
+) -> Option<ContentBlock> {
+    const MAX_SIZE: u64 = 200 * 1024 * 1024; // 200 MB
+
+    if url.is_empty() {
+        return None;
+    }
+    if size > 0 && size > MAX_SIZE {
+        tracing::warn!(filename, size, "attachment exceeds 200MB limit, skipping");
+        return None;
+    }
+
+    let base = std::env::var("OPENAB_ATTACHMENTS_DIR")
+        .unwrap_or_else(|_| "/tmp/openab-attachments".to_string());
+    let safe_bucket = sanitize_path_component(bucket_id);
+    let safe_name = sanitize_path_component(filename);
+    let target_dir = std::path::PathBuf::from(&base).join(&safe_bucket);
+
+    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+        tracing::error!(?target_dir, error = %e, "failed to create attachment dir");
+        return None;
+    }
+    let target_path = target_dir.join(&safe_name);
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(url, error = %e, "attachment download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::error!(url, status = %resp.status(), "attachment download failed");
+        return None;
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(url, error = %e, "attachment read failed");
+            return None;
+        }
+    };
+    if bytes.len() as u64 > MAX_SIZE {
+        tracing::error!(filename, size = bytes.len(), "downloaded attachment exceeds 200MB limit");
+        return None;
+    }
+
+    if let Err(e) = tokio::fs::write(&target_path, &bytes).await {
+        tracing::error!(?target_path, error = %e, "failed to write attachment");
+        return None;
+    }
+
+    let mime_label = if mime.is_empty() {
+        "application/octet-stream"
+    } else {
+        mime
+    };
+    debug!(
+        filename = %safe_name,
+        path = %target_path.display(),
+        size = bytes.len(),
+        mime = mime_label,
+        "attachment saved to disk",
+    );
+
+    Some(ContentBlock::Text {
+        text: format!(
+            "[Attachment received]\nFilename: {}\nType: {}\nSize: {} bytes\nSaved to: {}\nUse the appropriate skill to read or process this file.",
+            safe_name,
+            mime_label,
+            bytes.len(),
+            target_path.display(),
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1386,16 +1386,26 @@ async fn handle_message(
                     debug!(filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
+            } else if mimetype.starts_with("image/") {
+                if let Some(block) = media::download_and_encode_image(
+                    url,
+                    Some(mimetype),
+                    filename,
+                    size,
+                    Some(bot_token),
+                ).await {
+                    debug!(filename, "adding image attachment");
+                    extra_blocks.push(block);
+                }
+            } else if let Some(block) = media::download_to_disk(
                 url,
-                Some(mimetype),
                 filename,
+                mimetype,
                 size,
                 Some(bot_token),
-            )
-            .await
-            {
-                debug!(filename, "adding image attachment");
+                &ts,
+            ).await {
+                debug!(filename, "adding file attachment via disk path");
                 extra_blocks.push(block);
             } else {
                 // Fallback for unhandled file types (video, PDF, Office docs,
