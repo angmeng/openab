@@ -80,6 +80,11 @@ pub struct SlackAdapter {
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
+    /// Dedup set for file uploads — keyed on `{channel}|{thread_ts}|{path}`.
+    /// Streaming edit_message can fire repeatedly during a single agent turn,
+    /// each potentially containing the file-send marker. Without dedup we'd
+    /// re-upload the same file dozens of times. Cleared once per session restart.
+    file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl SlackAdapter {
@@ -97,6 +102,7 @@ impl SlackAdapter {
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
+            file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -703,6 +709,63 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        // Marker handling for the streaming path: OpenAB streams the final agent
+        // response via repeated edit_message calls against a placeholder. If the
+        // text contains file-send markers, we strip them from the edit (so the
+        // placeholder shows clean text) and trigger uploads as separate follow-up
+        // messages in the same channel/thread.
+        //
+        // Idempotency: we only want to upload each file ONCE per session, not on
+        // every streaming edit. We track this via the file_upload_cache keyed on
+        // (channel_id, thread_ts, path). The cache lives on the adapter struct.
+        if let Some((stripped_text, file_paths)) = extract_file_send_markers(content) {
+            // Edit the placeholder to the clean text (without markers).
+            let stripped_mrkdwn = markdown_to_mrkdwn(&stripped_text);
+            self.api_post(
+                "chat.update",
+                serde_json::json!({
+                    "channel": msg.channel.channel_id,
+                    "ts": msg.message_id,
+                    "text": stripped_mrkdwn,
+                }),
+            )
+            .await?;
+
+            // Upload each file as a follow-up. Dedup via the cache so we don't
+            // re-upload on each streaming edit chunk.
+            for path in &file_paths {
+                let cache_key = format!(
+                    "{}|{}|{}",
+                    msg.channel.channel_id,
+                    msg.channel.thread_id.as_deref().unwrap_or(""),
+                    path
+                );
+                {
+                    let cache = self.file_upload_cache.lock().await;
+                    if cache.contains(&cache_key) {
+                        debug!(path = %path, "skipping duplicate file upload (cached)");
+                        continue;
+                    }
+                }
+                match self.send_file_to_slack(&msg.channel, path).await {
+                    Ok(_) => {
+                        info!(path = %path, "slack: file uploaded via edit_message");
+                        let mut cache = self.file_upload_cache.lock().await;
+                        cache.insert(cache_key);
+                    }
+                    Err(e) => {
+                        error!(path = %path, error = %e, "slack: file upload failed");
+                        let err_text = format!(
+                            "⚠️ Failed to send file `{}`: {}\n(See OpenAB logs for details.)",
+                            path, e
+                        );
+                        let _ = self.send_plain_text(&msg.channel, &err_text).await;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let mrkdwn = markdown_to_mrkdwn(content);
         self.api_post(
             "chat.update",
