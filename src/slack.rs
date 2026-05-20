@@ -733,6 +733,13 @@ impl ChatAdapter for SlackAdapter {
 
             // Upload each file as a follow-up. Dedup via the cache so we don't
             // re-upload on each streaming edit chunk.
+            //
+            // Race-free check-and-claim: insert into cache FIRST under the lock,
+            // then upload. If insertion returns false (key already present),
+            // another edit_message call already claimed the slot — skip.
+            // The previous version did check-then-act with the lock released
+            // between check and insert, allowing duplicate uploads when two
+            // streaming edits fired within the upload latency window.
             for path in &file_paths {
                 let cache_key = format!(
                     "{}|{}|{}",
@@ -740,21 +747,24 @@ impl ChatAdapter for SlackAdapter {
                     msg.channel.thread_id.as_deref().unwrap_or(""),
                     path
                 );
-                {
-                    let cache = self.file_upload_cache.lock().await;
-                    if cache.contains(&cache_key) {
-                        debug!(path = %path, "skipping duplicate file upload (cached)");
-                        continue;
-                    }
+                let claimed = {
+                    let mut cache = self.file_upload_cache.lock().await;
+                    cache.insert(cache_key.clone()) // returns true if newly inserted
+                };
+                if !claimed {
+                    debug!(path = %path, "skipping duplicate file upload (already claimed)");
+                    continue;
                 }
                 match self.send_file_to_slack(&msg.channel, path).await {
                     Ok(_) => {
                         info!(path = %path, "slack: file uploaded via edit_message");
-                        let mut cache = self.file_upload_cache.lock().await;
-                        cache.insert(cache_key);
                     }
                     Err(e) => {
                         error!(path = %path, error = %e, "slack: file upload failed");
+                        // Roll back the claim so a future retry of the SAME path
+                        // (e.g. user re-asks after fixing the path) isn't blocked.
+                        let mut cache = self.file_upload_cache.lock().await;
+                        cache.remove(&cache_key);
                         let err_text = format!(
                             "⚠️ Failed to send file `{}`: {}\n(See OpenAB logs for details.)",
                             path, e
