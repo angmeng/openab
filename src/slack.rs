@@ -1069,6 +1069,35 @@ async fn handle_message(
             {
                 debug!(filename, "adding image attachment");
                 extra_blocks.push(block);
+            } else {
+                // Fallback for unhandled file types (video, PDF, Office docs,
+                // archives, generic binary). Without this, OpenAB silently
+                // drops the file — the agent never knows the user attached
+                // anything and reasons from incomplete context.
+                //
+                // Inject a small text ContentBlock with metadata so the agent
+                // can: (a) acknowledge the file exists, (b) optionally fetch
+                // it via a separate tool (Slack MCP's read_file, manual curl,
+                // etc.) if it has the capability and the content matters.
+                //
+                // Size-bound: only inject metadata, not contents — keeps the
+                // ACP message small regardless of file size.
+                let human_size = format_size_human(size);
+                let metadata = format!(
+                    "[Slack file attachment — not auto-loaded by OpenAB]\n\
+                     - filename: {filename}\n\
+                     - mimetype: {mimetype}\n\
+                     - size: {human_size}\n\
+                     - url: {url}\n\
+                     \n\
+                     This file type isn't auto-forwarded into your context. \
+                     If the contents matter to the user's request, fetch it \
+                     separately (Slack MCP's slack_read_file, or download via \
+                     curl with Bearer token if you have it). Otherwise just \
+                     acknowledge that the user shared the file."
+                );
+                debug!(filename, mimetype, size, "injecting unhandled-file metadata block");
+                extra_blocks.push(ContentBlock::Text { text: metadata });
             }
         }
     }
@@ -1219,6 +1248,25 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
 /// Strip MIME parameters like `; charset=utf-8` so type-detection helpers see
 /// the bare media type. Slack occasionally sends mimetypes like
 /// `text/plain; charset=utf-8`; `media::is_text_file` expects the bare form.
+/// Format a byte count in a human-readable way (e.g. "2.2 MB", "456 KB").
+/// Used in the unhandled-file metadata block so the agent sees a friendly size.
+fn format_size_human(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes > 0 {
+        format!("{bytes} bytes")
+    } else {
+        "unknown size".to_string()
+    }
+}
+
 fn strip_mime_params(mimetype: &str) -> &str {
     mimetype.split(';').next().unwrap_or(mimetype).trim()
 }
