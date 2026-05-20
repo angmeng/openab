@@ -406,7 +406,17 @@ impl AcpConnection {
 
         self.send_raw(&data).await?;
 
-        let timeout_secs = if method == "session/new" { 120 } else { 30 };
+        // session/new and initialize both involve heavyweight startup: initialize spins up
+        // the agent's runtime + auth + MCP server probes (can take 30-60s on a cold first run),
+        // session/new triggers Claude's full session bootstrap (120s is empirically sufficient).
+        // The default 30s for initialize was too tight — agents on first DM after a long
+        // idle window consistently timed out. Bumped to 90s to cover cold-start latency
+        // with headroom for slow networks.
+        let timeout_secs = match method {
+            "session/new" => 120,
+            "initialize" => 90,
+            _ => 30,
+        };
         let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
