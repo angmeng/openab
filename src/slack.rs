@@ -13,9 +13,13 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 /// Marker syntax for outbound file attachments in agent text output.
-/// Tifa writes `<<openab:send-file:/abs/path/to/file>>` in her response, OpenAB
+/// Tifa writes `<<openab-send-file /abs/path/to/file>>` in her response, OpenAB
 /// intercepts before posting and uploads the file via Slack's files API.
-const FILE_SEND_MARKER_PREFIX: &str = "<<openab:send-file:";
+///
+/// IMPORTANT: do NOT use colons in this marker (`:something:` would collide
+/// with Slack's emoji shortcode parser and get rendered as a gray-box
+/// placeholder even before our interceptor runs).
+const FILE_SEND_MARKER_PREFIX: &str = "<<openab-send-file ";
 const FILE_SEND_MARKER_SUFFIX: &str = ">>";
 /// Sanity cap so an agent typo doesn't try to upload /Users/jazlim or similar.
 /// Slack's own per-file limit is 1 GB by default; we cap at 100 MB.
