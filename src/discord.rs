@@ -722,24 +722,38 @@ impl EventHandler for Handler {
                     debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_to_disk(
-                &attachment.url,
-                &attachment.filename,
-                mime,
-                u64::from(attachment.size),
-                None,
-                &msg.id.to_string(),
-            ).await {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment via disk path");
-                extra_blocks.push(block);
-            } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                extra_blocks.push(video_attachment_block(
-                    &attachment.filename,
-                    attachment.content_type.as_deref(),
-                    u64::from(attachment.size),
+            } else {
+                // Fallback for unhandled types (video, PDF, Office docs, archives, generic
+                // binary): try disk download first so the agent gets a local path. If that
+                // fails AND the file is a video, fall back to the URL-pass-through block —
+                // Discord CDN URLs are signed and don't need Bearer auth, so they're still
+                // usable. Anything else with a failed disk write is silently dropped (matches
+                // upstream behavior pre-disk-fallback).
+                match media::download_to_disk(
                     &attachment.url,
-                ));
+                    &attachment.filename,
+                    mime,
+                    u64::from(attachment.size),
+                    None,
+                    &msg.id.to_string(),
+                )
+                .await
+                {
+                    Some(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment via disk path");
+                        extra_blocks.push(block);
+                    }
+                    None if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "disk write failed, falling back to video URL block");
+                        extra_blocks.push(video_attachment_block(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                            u64::from(attachment.size),
+                            &attachment.url,
+                        ));
+                    }
+                    None => {}
+                }
             }
         }
 

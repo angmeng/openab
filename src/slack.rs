@@ -1397,45 +1397,43 @@ async fn handle_message(
                     debug!(filename, "adding image attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_to_disk(
-                url,
-                filename,
-                mimetype,
-                size,
-                Some(bot_token),
-                &ts,
-            ).await {
-                debug!(filename, "adding file attachment via disk path");
-                extra_blocks.push(block);
             } else {
                 // Fallback for unhandled file types (video, PDF, Office docs,
-                // archives, generic binary). Without this, OpenAB silently
-                // drops the file — the agent never knows the user attached
-                // anything and reasons from incomplete context.
-                //
-                // Inject a small text ContentBlock with metadata so the agent
-                // can: (a) acknowledge the file exists, (b) optionally fetch
-                // it via a separate tool (Slack MCP's read_file, manual curl,
-                // etc.) if it has the capability and the content matters.
-                //
-                // Size-bound: only inject metadata, not contents — keeps the
-                // ACP message small regardless of file size.
-                let human_size = format_size_human(size);
-                let metadata = format!(
-                    "[Slack file attachment — not auto-loaded by OpenAB]\n\
-                     - filename: {filename}\n\
-                     - mimetype: {mimetype}\n\
-                     - size: {human_size}\n\
-                     - url: {url}\n\
-                     \n\
-                     This file type isn't auto-forwarded into your context. \
-                     If the contents matter to the user's request, fetch it \
-                     separately (Slack MCP's slack_read_file, or download via \
-                     curl with Bearer token if you have it). Otherwise just \
-                     acknowledge that the user shared the file."
-                );
-                debug!(filename, mimetype, size, "injecting unhandled-file metadata block");
-                extra_blocks.push(ContentBlock::Text { text: metadata });
+                // archives, generic binary): download to disk so the agent
+                // gets a local path it can hand to ffmpeg / pdftotext / etc.
+                // If the disk write fails, inject a failure-notice block so
+                // the agent still knows the file existed (fail loudly, don't
+                // silently drop).
+                match media::download_to_disk(
+                    url,
+                    filename,
+                    mimetype,
+                    size,
+                    Some(bot_token),
+                    &ts,
+                )
+                .await
+                {
+                    Some(block) => {
+                        debug!(filename, "adding file attachment via disk path");
+                        extra_blocks.push(block);
+                    }
+                    None => {
+                        let human_size = format_size_human(size);
+                        let notice = format!(
+                            "[Slack file attachment — download failed]\n\
+                             - filename: {filename}\n\
+                             - mimetype: {mimetype}\n\
+                             - size: {human_size}\n\
+                             \n\
+                             OpenAB tried to save this file locally but the download or write \
+                             failed (see logs). The user shared the file; acknowledge it but \
+                             note you couldn't access the contents."
+                        );
+                        warn!(filename, mimetype, size, "download_to_disk failed, emitting failure notice");
+                        extra_blocks.push(ContentBlock::Text { text: notice });
+                    }
+                }
             }
         }
     }
