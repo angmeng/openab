@@ -357,6 +357,29 @@ fn sanitize_path_component(s: &str) -> String {
     }
 }
 
+/// Default per-file size cap when `OPENAB_ATTACHMENTS_MAX_MB` is unset.
+const ATTACHMENT_DEFAULT_MAX_MB: u64 = 200;
+
+/// Default attachments directory when `OPENAB_ATTACHMENTS_DIR` is unset.
+const ATTACHMENT_DEFAULT_DIR: &str = "/tmp/openab-attachments";
+
+/// Resolve the max attachment size in bytes, honoring `OPENAB_ATTACHMENTS_MAX_MB`.
+fn attachments_max_bytes() -> u64 {
+    std::env::var("OPENAB_ATTACHMENTS_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(ATTACHMENT_DEFAULT_MAX_MB)
+        * 1024
+        * 1024
+}
+
+/// Resolve the configured attachments base directory.
+fn attachments_base_dir() -> std::path::PathBuf {
+    std::env::var("OPENAB_ATTACHMENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(ATTACHMENT_DEFAULT_DIR))
+}
+
 /// Download an arbitrary attachment to disk and return a ContentBlock::Text
 /// referencing the on-disk path. This is the fallback for files that are
 /// neither audio (handled by STT), nor inlineable text, nor images.
@@ -364,7 +387,14 @@ fn sanitize_path_component(s: &str) -> String {
 /// `bucket_id` is a stable per-message id (Slack `ts`, Discord message id).
 /// Files end up at `${OPENAB_ATTACHMENTS_DIR:-/tmp/openab-attachments}/<bucket>/<filename>`.
 ///
-/// Returns None on download/write failure or when size exceeds 200MB.
+/// Size cap: `OPENAB_ATTACHMENTS_MAX_MB` (default 200 MB).
+///
+/// Path containment: after building the target path, we canonicalize both the
+/// base dir and the target dir and verify the target stays under base. This
+/// guards against pathological filenames slipping past `sanitize_path_component`
+/// (e.g. via symlinks introduced into the base dir out-of-band).
+///
+/// Returns None on download/write failure, oversized files, or containment violation.
 pub async fn download_to_disk(
     url: &str,
     filename: &str,
@@ -373,27 +403,52 @@ pub async fn download_to_disk(
     auth_token: Option<&str>,
     bucket_id: &str,
 ) -> Option<ContentBlock> {
-    const MAX_SIZE: u64 = 200 * 1024 * 1024; // 200 MB
+    let max_size = attachments_max_bytes();
 
     if url.is_empty() {
         return None;
     }
-    if size > 0 && size > MAX_SIZE {
-        tracing::warn!(filename, size, "attachment exceeds 200MB limit, skipping");
+    if size > 0 && size > max_size {
+        tracing::warn!(filename, size, max = max_size, "attachment exceeds size limit, skipping");
         return None;
     }
 
-    let base = std::env::var("OPENAB_ATTACHMENTS_DIR")
-        .unwrap_or_else(|_| "/tmp/openab-attachments".to_string());
+    let base = attachments_base_dir();
     let safe_bucket = sanitize_path_component(bucket_id);
     let safe_name = sanitize_path_component(filename);
-    let target_dir = std::path::PathBuf::from(&base).join(&safe_bucket);
+    let target_dir = base.join(&safe_bucket);
 
     if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
         tracing::error!(?target_dir, error = %e, "failed to create attachment dir");
         return None;
     }
-    let target_path = target_dir.join(&safe_name);
+
+    // Path containment check: after the dir exists, canonicalize and verify
+    // the target_dir is still under base. Symlinks or `..` in env-provided
+    // base resolve here. We canonicalize base too so both sides are absolute.
+    let canonical_base = match tokio::fs::canonicalize(&base).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(?base, error = %e, "failed to canonicalize attachments base dir");
+            return None;
+        }
+    };
+    let canonical_target_dir = match tokio::fs::canonicalize(&target_dir).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(?target_dir, error = %e, "failed to canonicalize target dir");
+            return None;
+        }
+    };
+    if !canonical_target_dir.starts_with(&canonical_base) {
+        tracing::error!(
+            ?canonical_base,
+            ?canonical_target_dir,
+            "path containment violation, refusing to write"
+        );
+        return None;
+    }
+    let target_path = canonical_target_dir.join(&safe_name);
 
     let mut req = HTTP_CLIENT.get(url);
     if let Some(token) = auth_token {
@@ -417,8 +472,8 @@ pub async fn download_to_disk(
             return None;
         }
     };
-    if bytes.len() as u64 > MAX_SIZE {
-        tracing::error!(filename, size = bytes.len(), "downloaded attachment exceeds 200MB limit");
+    if bytes.len() as u64 > max_size {
+        tracing::error!(filename, size = bytes.len(), max = max_size, "downloaded attachment exceeds size limit");
         return None;
     }
 
@@ -543,4 +598,35 @@ mod tests {
         assert!(is_video_file("clip.MOV", None));
         assert!(!is_video_file("notes.txt", Some("text/plain")));
     }
+
+    #[test]
+    fn sanitize_strips_path_separators_and_control_chars() {
+        // `/` and `\` become `_`. Leading `..` is trimmed (dot-trim), so
+        // `../etc/passwd` -> `.._etc_passwd` -> `_etc_passwd`. The leading
+        // underscore is acceptable: the value is joined under a known base
+        // dir, never used as an absolute path.
+        assert_eq!(sanitize_path_component("../etc/passwd"), "_etc_passwd");
+        assert_eq!(sanitize_path_component("foo\\bar"), "foo_bar");
+        assert_eq!(sanitize_path_component("a\0b"), "a_b");
+        assert_eq!(sanitize_path_component("C:report.xlsx"), "C_report.xlsx");
+        assert_eq!(sanitize_path_component(".....hidden"), "hidden");
+        assert_eq!(sanitize_path_component(""), "file");
+        assert_eq!(sanitize_path_component("..."), "file");
+        // Control chars (newline, tab, etc.) → underscore.
+        assert_eq!(sanitize_path_component("a\nb\tc"), "a_b_c");
+    }
+
+    #[test]
+    fn attachments_max_bytes_honors_env_override() {
+        // SAFETY: tests share env; use a scoped guard pattern.
+        let original = std::env::var("OPENAB_ATTACHMENTS_MAX_MB").ok();
+        std::env::set_var("OPENAB_ATTACHMENTS_MAX_MB", "50");
+        assert_eq!(attachments_max_bytes(), 50 * 1024 * 1024);
+        std::env::remove_var("OPENAB_ATTACHMENTS_MAX_MB");
+        assert_eq!(attachments_max_bytes(), 200 * 1024 * 1024);
+        if let Some(v) = original {
+            std::env::set_var("OPENAB_ATTACHMENTS_MAX_MB", v);
+        }
+    }
+
 }
