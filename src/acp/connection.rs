@@ -269,7 +269,12 @@ impl AcpConnection {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Capture stderr so cold-start init hangs are debuggable. Without this
+            // the agent's startup errors (missing env, MCP probe failures, auth
+            // issues) silently disappear into /dev/null and the only signal is a
+            // 90s timeout on initialize. A drainer task below logs each line at
+            // WARN so it surfaces in the bridge log alongside spawn events.
+            .stderr(std::process::Stdio::piped())
             .current_dir(working_dir);
         // Create a new process group so we can kill the entire tree.
         // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
@@ -353,6 +358,32 @@ impl AcpConnection {
 
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        // Drain stderr line-by-line so the pipe buffer doesn't fill and block
+        // the child. Each non-empty line goes to WARN — agent stderr should be
+        // rare in steady state, so volume isn't a concern. EOF (Ok(0)) breaks
+        // the loop and lets the task drop cleanly when the child exits.
+        if let Some(stderr) = proc.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() {
+                                tracing::warn!(child_stderr = %trimmed, "agent stderr");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "agent stderr read failed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let stdin = Arc::new(Mutex::new(stdin));
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
