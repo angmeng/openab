@@ -137,6 +137,10 @@ tables = "code"  # "code" (default) | "bullets" | "off"
 [reactions]
 enabled = true
 remove_after_reply = false
+tool_display = "none"   # none (default) | compact | full
+                        # none: hide tool calls — only the final agent reply is shown
+                        # compact: one-line count summary, e.g. ✅ 3 · 🔧 1 tool(s)
+                        # full: every tool call rendered inline (verbose; useful for debugging)
 
 [reactions.emojis]
 queued = "👀"

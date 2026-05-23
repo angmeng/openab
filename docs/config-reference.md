@@ -178,7 +178,7 @@ Emoji reaction feedback on messages to show agent processing status.
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable reaction feedback. |
 | `remove_after_reply` | bool | `false` | Remove the status reaction after the agent replies. |
-| `tool_display` | string | `"full"` | How tool calls are rendered: `"full"` (complete title), `"compact"` (count summary, e.g. `✅ 3 · 🔧 1 tool(s)`), or `"none"` (hidden). |
+| `tool_display` | string | `"none"` | How tool calls are rendered: `"none"` (hidden — recommended for chat UIs), `"compact"` (count summary, e.g. `✅ 3 · 🔧 1 tool(s)`), or `"full"` (complete title — useful for debugging). |
 
 ### `[reactions.emojis]`
 

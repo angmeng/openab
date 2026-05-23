@@ -375,9 +375,9 @@ fn default_cron_timezone() -> String {
 /// - `none`: hide tool lines entirely, only show final response
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolDisplay {
-    #[default]
     Full,
     Compact,
+    #[default]
     None,
 }
 
@@ -789,8 +789,8 @@ command = "echo"
     }
 
     #[test]
-    fn tool_display_default_is_full() {
-        assert_eq!(ToolDisplay::default(), ToolDisplay::Full);
+    fn tool_display_default_is_none() {
+        assert_eq!(ToolDisplay::default(), ToolDisplay::None);
     }
 
     #[test]
