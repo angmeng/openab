@@ -11,6 +11,7 @@ mod gateway;
 mod markdown;
 mod media;
 mod reactions;
+mod relay;
 mod remind;
 mod setup;
 mod slack;
