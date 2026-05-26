@@ -1,5 +1,21 @@
 # OpenAB — Open Agent Broker
 
+> ⚠️ **This is a personal fork** (`angmeng/openab`) used as an internal testing
+> tool. It is **not** an official distribution of OpenAB and may contain
+> experimental patches that have not been (and may never be) submitted upstream.
+>
+> - **For OpenAB users**: please use the upstream repo at
+>   [`openabdev/openab`](https://github.com/openabdev/openab) instead. This fork
+>   has no support, no release schedule, and may break or rewrite history at
+>   any time.
+> - **For 洺哥's collaborators**: branches here track local experiments
+>   (Slack context-footer, cross-channel relay, etc.). Design + status lives
+>   in the personal vault under `AI-Memory/shared/proposals/` and `kaizen/`.
+> - **No redistribution**: bundled config / runtime references may include
+>   private channel IDs, persona names, or other internal-only identifiers.
+
+---
+
 [![Stars](https://img.shields.io/github/stars/openabdev/openab?style=flat-square)](https://github.com/openabdev/openab) [![GitHub Release](https://img.shields.io/github/v/release/openabdev/openab?style=flat-square&logo=github)](https://github.com/openabdev/openab/releases/latest) ![License](https://img.shields.io/badge/license-MIT-A374ED?style=flat-square)
 
 ![OpenAB banner](images/banner.jpg)
