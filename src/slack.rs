@@ -517,49 +517,53 @@ impl SlackAdapter {
     }
 }
 
-/// Parse outbound text for file-send markers `<<openab:send-file:PATH>>`.
+/// Parse outbound text for file-send markers `<<openab-send-file PATH>>`.
 /// Returns `Some((text_without_markers, paths))` if at least one marker found,
-/// `None` if the text contains no markers (fast-path).
+/// `None` if no marker line is present (fast-path).
 ///
-/// Marker syntax is deliberately ugly/unambiguous so it never collides with
-/// natural language. Whitespace around markers is collapsed cleanly.
+/// **Line-anchored** (2026-05-26): the marker must occupy a line on its own
+/// (after trimming whitespace). Inline occurrences inside running text are
+/// preserved as literal — this prevents the agent from self-triggering when
+/// quoting its own source code or documentation that mentions the marker.
+///
+/// Lines containing other content alongside a marker are left untouched (no
+/// partial extraction); the agent must put the marker on its own line for it
+/// to fire. This trades a slightly stricter calling convention for immunity
+/// from natural-language and code-quote collisions.
 fn extract_file_send_markers(content: &str) -> Option<(String, Vec<String>)> {
     if !content.contains(FILE_SEND_MARKER_PREFIX) {
         return None;
     }
 
     let mut paths: Vec<String> = Vec::new();
-    let mut stripped = String::with_capacity(content.len());
-    let mut remaining = content;
+    let mut kept_lines: Vec<&str> = Vec::new();
 
-    while let Some(start) = remaining.find(FILE_SEND_MARKER_PREFIX) {
-        // Push everything before the marker into the stripped text.
-        stripped.push_str(&remaining[..start]);
-        let after_prefix = &remaining[start + FILE_SEND_MARKER_PREFIX.len()..];
-
-        match after_prefix.find(FILE_SEND_MARKER_SUFFIX) {
-            Some(end) => {
-                let path = after_prefix[..end].trim().to_string();
-                if !path.is_empty() {
-                    paths.push(path);
-                }
-                remaining = &after_prefix[end + FILE_SEND_MARKER_SUFFIX.len()..];
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with(FILE_SEND_MARKER_PREFIX) && trimmed.ends_with(FILE_SEND_MARKER_SUFFIX)
+        {
+            // Verified marker line: extract path between prefix and suffix.
+            let inner = &trimmed[FILE_SEND_MARKER_PREFIX.len()
+                ..trimmed.len() - FILE_SEND_MARKER_SUFFIX.len()];
+            let path = inner.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+                // Skip this line entirely from output.
+                continue;
             }
-            None => {
-                // Unterminated marker — treat as literal text, preserve.
-                stripped.push_str(FILE_SEND_MARKER_PREFIX);
-                stripped.push_str(after_prefix);
-                remaining = "";
-            }
+            // Empty path inside otherwise-valid marker — drop the line too
+            // (don't leak the empty `<<openab-send-file >>` to the user).
+            continue;
         }
+        // Not a marker line — preserve verbatim. Inline `<<openab-send-file ...>>`
+        // text is intentionally kept as literal content.
+        kept_lines.push(line);
     }
-    // Append any trailing text after the last marker.
-    stripped.push_str(remaining);
 
     if paths.is_empty() {
         return None;
     }
-    Some((stripped, paths))
+    Some((kept_lines.join("\n"), paths))
 }
 
 /// Pull the share message timestamp out of a `files.completeUploadExternal`
@@ -1952,5 +1956,80 @@ mod tests {
             !adapter.use_streaming(true),
             "should NOT stream when other bot present"
         );
+    }
+
+    // --- extract_file_send_markers tests (added 2026-05-26 with line-anchoring fix) ---
+
+    #[test]
+    fn marker_extracts_anchored_single_line() {
+        let input = "Here is the file:\n<<openab-send-file /tmp/report.pdf>>\nHope it helps.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("marker should fire");
+        assert_eq!(paths, vec!["/tmp/report.pdf".to_string()]);
+        // Marker line is removed entirely; surrounding text joins directly.
+        assert_eq!(stripped, "Here is the file:\nHope it helps.");
+    }
+
+    #[test]
+    fn marker_extracts_multiple_anchored_lines() {
+        let input = "Files:\n<<openab-send-file /a.txt>>\n<<openab-send-file /b.txt>>\nDone.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("markers should fire");
+        assert_eq!(paths, vec!["/a.txt".to_string(), "/b.txt".to_string()]);
+        assert_eq!(stripped, "Files:\nDone.");
+    }
+
+    #[test]
+    fn marker_inline_is_not_extracted() {
+        // Self-trigger regression: agent quotes the marker mid-sentence.
+        // Should be preserved verbatim; no upload attempted.
+        let input = "The marker syntax is `<<openab-send-file /abs/path>>` you write in chat.";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_indented_still_anchored() {
+        // Whitespace-only padding on the marker line should still anchor.
+        let input = "Result:\n    <<openab-send-file /tmp/x.png>>   \nDone.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("marker should fire");
+        assert_eq!(paths, vec!["/tmp/x.png".to_string()]);
+        assert_eq!(stripped, "Result:\nDone.");
+    }
+
+    #[test]
+    fn marker_at_bof_and_eof() {
+        // Marker as very first / last line should still fire.
+        let bof = "<<openab-send-file /a>>\ntrailing";
+        let (s1, p1) = extract_file_send_markers(bof).expect("BOF marker should fire");
+        assert_eq!(p1, vec!["/a".to_string()]);
+        assert_eq!(s1, "trailing");
+
+        let eof = "leading\n<<openab-send-file /b>>";
+        let (s2, p2) = extract_file_send_markers(eof).expect("EOF marker should fire");
+        assert_eq!(p2, vec!["/b".to_string()]);
+        assert_eq!(s2, "leading");
+    }
+
+    #[test]
+    fn marker_with_trailing_text_on_same_line_is_ignored() {
+        // Marker followed by non-whitespace on the same line → not anchored,
+        // preserved as literal.
+        let input = "<<openab-send-file /a.txt>> caption text";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_self_trigger_regression_quoted_source_code() {
+        // Regression for 2026-05-26 incident: Tifa read slack.rs and quoted
+        // the marker prefix verbatim in a Slack reply. Old impl tried to
+        // upload garbage as a file. New impl preserves it as literal.
+        let input = "OpenAB marker syntax `<<openab-send-file ` and suffix `>>` plus other words like `<<openab-relay-to discord:swat-team>>` describe the design.";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_empty_path_drops_line_without_upload() {
+        // Defensive: anchored marker with no path between prefix/suffix
+        // shouldn't produce a phantom upload entry.
+        let input = "Before\n<<openab-send-file >>\nAfter";
+        assert!(extract_file_send_markers(input).is_none());
     }
 }
