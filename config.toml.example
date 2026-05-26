@@ -179,3 +179,20 @@ error_hold_ms = 2500
 # schedule = "0 0 * * 0"
 # channel = "123456789"
 # message = "generate weekly status report"
+
+# --- Cross-channel relay (Slack ↔ Discord) ---
+# When enabled, agents can emit a `<<openab-relay-to {platform}:{alias}>> ...
+# <<openab-relay-end>>` block in their response, and OpenAB forwards the body
+# to the configured peer adapter. Disabled by default — no behaviour change
+# unless explicitly enabled. Spec: AI-Memory/shared/proposals/2026-05-26-
+# openab-cross-channel-relay.md.
+
+# [relay]
+# enabled = false                              # master switch
+# prefix_template = "[via {sender_persona} from {sender_platform}]"
+#                                              # auto-prepended to relayed body; max 200 bytes
+#                                              # supported substitutions: {sender_persona}, {sender_platform}
+
+# [relay.aliases]
+# "discord:swat-team" = { channel_id = "1485156316480803018" }
+# "slack:tifa-dm"     = { channel_id = "D0B4JKKM9PD" }

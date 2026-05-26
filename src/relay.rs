@@ -54,8 +54,6 @@ pub const PREFIX_TEMPLATE_MAX_LEN: usize = 200;
 pub struct RelayConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_loop_guard_depth")]
-    pub loop_guard_max_depth: u8,
     #[serde(default = "default_prefix_template")]
     pub prefix_template: String,
     #[serde(default)]
@@ -66,15 +64,10 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            loop_guard_max_depth: default_loop_guard_depth(),
             prefix_template: default_prefix_template(),
             aliases: HashMap::new(),
         }
     }
-}
-
-fn default_loop_guard_depth() -> u8 {
-    1
 }
 
 fn default_prefix_template() -> String {

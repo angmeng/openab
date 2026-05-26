@@ -145,13 +145,15 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let router = Arc::new(AdapterRouter::new(
-        pool.clone(),
-        cfg.reactions,
-        cfg.markdown.tables,
-        cfg.pool.prompt_hard_timeout_secs,
-        cfg.pool.liveness_check_secs,
-    ));
+    // Take relay config out of cfg now (before adapters are built) so we can
+    // validate it early. Actual RelayContext construction is deferred until
+    // shared_*_adapter handles exist (a few dozen lines below).
+    let relay_cfg: Option<relay::RelayConfig> = cfg.relay.take();
+    if let Some(ref rc) = relay_cfg {
+        if let Err(e) = rc.validate() {
+            anyhow::bail!("invalid [relay] config: {e}");
+        }
+    }
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -191,6 +193,38 @@ async fn main() -> anyhow::Result<()> {
             s.allow_bot_messages,
         ))
     });
+
+    // Build cross-channel relay context. Peers stored as Weak refs to avoid
+    // cross-adapter Arc cycles. Only platforms with a shared adapter handle
+    // are registered as peers.
+    let relay_ctx: Option<Arc<relay::RelayContext>> = relay_cfg
+        .filter(|c| c.enabled)
+        .map(|cfg_inner| {
+            let mut peers: std::collections::HashMap<String, std::sync::Weak<dyn adapter::ChatAdapter>> =
+                std::collections::HashMap::new();
+            if let Some(ref s) = shared_slack_adapter {
+                let s_dyn: Arc<dyn adapter::ChatAdapter> = s.clone();
+                peers.insert("slack".to_string(), Arc::downgrade(&s_dyn));
+            }
+            if let Some(ref d) = shared_discord_adapter {
+                peers.insert("discord".to_string(), Arc::downgrade(d));
+            }
+            info!(peers = peers.len(), "relay enabled");
+            Arc::new(relay::RelayContext {
+                config: Arc::new(cfg_inner),
+                peers,
+            })
+        });
+
+    // Now we can build the AdapterRouter (needs relay_ctx).
+    let router = Arc::new(AdapterRouter::new(
+        pool.clone(),
+        cfg.reactions.clone(),
+        cfg.markdown.tables,
+        cfg.pool.prompt_hard_timeout_secs,
+        cfg.pool.liveness_check_secs,
+        relay_ctx,
+    ));
 
     // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
     let mut configured_platforms: Vec<&str> = Vec::new();
