@@ -1248,8 +1248,14 @@ async fn handle_message(
     };
     let thread_ts = event["thread_ts"].as_str().map(|s| s.to_string());
 
-    // Check allowed channels
-    if !allow_all_channels && !allowed_channels.contains(&channel_id) {
+    // Check allowed channels. DMs (channel id starts with 'D') are exempt:
+    // they're inherently 1:1 and already gated by `allowed_users` below, so
+    // they must not require the DM channel to appear in `allowed_channels`.
+    // Without this exemption, setting `allowed_channels` to lock down a shared
+    // channel silently drops every DM (regression from the Atlas team-bots
+    // patch, 2026-05-28).
+    let is_dm = channel_id.starts_with('D');
+    if !is_dm && !allow_all_channels && !allowed_channels.contains(&channel_id) {
         return;
     }
 
