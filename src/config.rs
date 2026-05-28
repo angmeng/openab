@@ -260,6 +260,16 @@ pub struct SlackConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    /// Enable streaming (typewriter) replies via repeated chat.update edits.
+    /// Default: true (preserves the prior single-bot DM behaviour for configs
+    /// that don't set it). Set to false to always send replies once via
+    /// chat.postMessage — required in multi-bot channels, because peer bots only
+    /// receive a streamed message as `message_changed` events (which their
+    /// handlers skip), so a streamed @mention never triggers them. Note: even
+    /// with this true, `use_streaming` also forces send-once when any
+    /// `trusted_bot_ids` are configured (multi-bot deployment).
+    #[serde(default = "default_true")]
+    pub streaming: bool,
 }
 
 #[derive(Debug, Deserialize)]

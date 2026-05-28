@@ -80,6 +80,17 @@ pub struct SlackAdapter {
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
+    /// Config `[slack].streaming`. When false, streaming (typewriter) edits are
+    /// disabled outright — every reply is sent once via chat.postMessage. (B)
+    /// Previously the SlackAdapter ignored this flag entirely; the only gate was
+    /// the runtime `!other_bot_present` check, so `streaming = false` was dead.
+    streaming: bool,
+    /// Trusted peer-bot user IDs (from `[slack].trusted_bot_ids`). Used to decide
+    /// whether a channel is a multi-bot context where streaming must be off — see
+    /// `use_streaming`. (A) A streamed reply reaches peer bots only as
+    /// `message_changed` events, which every bot's handler skips, so any @mention
+    /// of a peer bot in a streamed message never triggers it.
+    trusted_bot_ids: HashSet<String>,
     /// Dedup set for file uploads — keyed on `{channel}|{thread_ts}|{path}`.
     /// Streaming edit_message can fire repeatedly during a single agent turn,
     /// each potentially containing the file-send marker. Without dedup we'd
@@ -92,6 +103,8 @@ impl SlackAdapter {
         bot_token: String,
         session_ttl: std::time::Duration,
         _allow_bot_messages: AllowBots,
+        streaming: bool,
+        trusted_bot_ids: HashSet<String>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -102,6 +115,8 @@ impl SlackAdapter {
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
+            streaming,
+            trusted_bot_ids,
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -794,6 +809,24 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
+        // (B) Config master switch: `[slack].streaming = false` disables it outright.
+        if !self.streaming {
+            return false;
+        }
+        // (A) If this deployment has any trusted peer bots configured, it's a
+        // multi-bot setup. Don't stream — a streamed reply reaches peer bots
+        // only as `message_changed` events (which every bot's handler skips),
+        // so any @mention of a peer bot in the reply would never trigger it.
+        // This closes the race the trait doc admits: `other_bot_present` can be
+        // false when a peer bot is addressed before it has posted in the thread
+        // (e.g. "@Tifa say hi to Nyx" — Nyx hasn't spoken yet). Keying off the
+        // configured trusted-bot set is race-free; the cost is that a pure-DM
+        // bot that happens to have trusted_bot_ids set also won't stream, which
+        // is acceptable (streaming is a nicety, peer-bot delivery is correctness).
+        if !self.trusted_bot_ids.is_empty() {
+            return false;
+        }
+        // Single-bot deployment: stream unless a peer bot is already in-thread.
         !other_bot_present
     }
 }
@@ -1949,10 +1982,12 @@ mod tests {
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).
+    /// Single-bot deployment: streaming enabled in config, no trusted peers.
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions);
+        let adapter =
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, HashSet::new());
 
         assert!(
             adapter.use_streaming(false),
@@ -1962,6 +1997,36 @@ mod tests {
             !adapter.use_streaming(true),
             "should NOT stream when other bot present"
         );
+    }
+
+    /// (B) `[slack].streaming = false` disables streaming outright, regardless
+    /// of thread state.
+    #[test]
+    fn streaming_config_master_switch_off() {
+        let ttl = std::time::Duration::from_secs(300);
+        let adapter =
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, HashSet::new());
+
+        assert!(!adapter.use_streaming(false), "streaming=false must win even with no other bot");
+        assert!(!adapter.use_streaming(true));
+    }
+
+    /// (A) A deployment with trusted peer bots configured never streams — even
+    /// before any peer bot has posted in the thread (the race the trait doc
+    /// admits). This is what stops a streamed "@peer" mention from being eaten
+    /// by the message_changed skip.
+    #[test]
+    fn streaming_off_when_trusted_bots_configured() {
+        let ttl = std::time::Duration::from_secs(300);
+        let trusted = HashSet::from(["U0B6FQF0GTD".to_string()]);
+        let adapter =
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, trusted);
+
+        assert!(
+            !adapter.use_streaming(false),
+            "multi-bot deployment must not stream even when no peer has posted yet"
+        );
+        assert!(!adapter.use_streaming(true));
     }
 
     // --- extract_file_send_markers tests (added 2026-05-26 with line-anchoring fix) ---
