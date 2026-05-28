@@ -515,6 +515,25 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                 println!("       npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp");
                 cprintln!(C.cyan, "  2. Authenticate:");
                 println!("       claude auth login");
+                cprintln!(C.cyan, "  3. (Recommended) Pin the ACP adapter to your");
+                cprintln!(C.cyan, "     auto-updating Claude CLI:");
+                println!("       export CLAUDE_CODE_EXECUTABLE=\"$(command -v claude)\"");
+                cprintln!(
+                    C.yellow,
+                    "     claude-agent-acp bundles its own pinned `claude` binary via"
+                );
+                cprintln!(
+                    C.yellow,
+                    "     @anthropic-ai/claude-agent-sdk, so it ignores the globally"
+                );
+                cprintln!(
+                    C.yellow,
+                    "     installed claude-code unless CLAUDE_CODE_EXECUTABLE points at"
+                );
+                cprintln!(
+                    C.yellow,
+                    "     it. Without this the adapter can run a stale model list."
+                );
             }
             "codex" => {
                 cprintln!(C.cyan, "  1. Install Codex CLI + ACP adapter:");
