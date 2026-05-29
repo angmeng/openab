@@ -1041,6 +1041,12 @@ pub(crate) fn context_footer_threshold() -> u8 {
         .unwrap_or(70)
 }
 
+/// Upper bound on a single relay send_message call. A relay send runs inline on
+/// the per-lane consumer loop, so an unbounded hang wedges the whole lane (see
+/// Fix 1 note in dispatch_relay_block). 15s comfortably covers a normal Slack/
+/// Discord post + retry while still failing loudly if the call never returns.
+const RELAY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Forward a single relay block to its peer adapter. Caller (the post-stream
 /// hook in `stream_prompt_blocks`) handles error reporting back to the origin
 /// channel.
@@ -1057,9 +1063,18 @@ async fn dispatch_relay_block(
         .get(&alias_key)
         .ok_or_else(|| anyhow!("unknown relay alias: {}", alias_key))?;
 
-    let peer = ctx
-        .peer(&block.target_platform)
-        .ok_or_else(|| anyhow!("no peer adapter for platform: {}", block.target_platform))?;
+    // Fix 2: same-platform relay (e.g. slack→slack: a Slack thread relaying into
+    // another Slack channel like #ai-workflow) uses the ORIGIN adapter directly.
+    // Resolving ctx.peer("slack") returns the same shared adapter we're already
+    // running on (self-peer) — routing the send back through a Weak::upgrade of
+    // ourselves is needless indirection. Only reach for the peer registry when
+    // the target is a genuinely different platform.
+    let sender: Arc<dyn ChatAdapter> = if block.target_platform == origin_adapter.platform() {
+        origin_adapter.clone()
+    } else {
+        ctx.peer(&block.target_platform)
+            .ok_or_else(|| anyhow!("no peer adapter for platform: {}", block.target_platform))?
+    };
 
     if relay::contains_relay_marker(&block.body) {
         return Err(anyhow!(
@@ -1091,11 +1106,29 @@ async fn dispatch_relay_block(
 
     // Peer-side splitting. Adapters' send_message does NOT split internally
     // (split is normally done by AdapterRouter before adapter.send_message).
-    // Since relay bypasses that path, we split here using the peer's own
+    // Since relay bypasses that path, we split here using the sender's own
     // message_limit. Loop send_message over chunks.
-    let chunks = format::split_message(&formatted, peer.message_limit());
+    //
+    // Fix 1: each send is bounded by RELAY_SEND_TIMEOUT. dispatch_relay_block is
+    // awaited inline on the per-lane consumer_loop (dispatch.rs) — a send that
+    // never returns would wedge that lane forever, silently queuing every
+    // subsequent message on the same (thread, sender) key (observed 2026-05-29:
+    // a slack→slack relay turn never returned, so the originating DM thread
+    // stopped responding until a fresh non-thread DM opened a new lane). The
+    // timeout converts a hang into an Err the caller already handles
+    // (warn + user-facing ⚠️), guaranteeing the consumer loop drains.
+    let chunks = format::split_message(&formatted, sender.message_limit());
     for chunk in &chunks {
-        peer.send_message(&target, chunk).await?;
+        tokio::time::timeout(RELAY_SEND_TIMEOUT, sender.send_message(&target, chunk))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "relay send timed out after {}s (target {}:{})",
+                    RELAY_SEND_TIMEOUT.as_secs(),
+                    block.target_platform,
+                    block.target_alias
+                )
+            })??;
     }
     Ok(())
 }
