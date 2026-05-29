@@ -8,14 +8,14 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install Cursor Agent CLI (pinned version)
 # Tarball source: https://downloads.cursor.com/lab/<version>/linux/<arch>/agent-cli-package.tar.gz
 # URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
 # If Cursor changes this pattern, the build fails with curl 404. Monitor
 # https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
-ARG CURSOR_VERSION=2026.04.30-4edb302
+ARG CURSOR_VERSION=2026.05.20-2b5dd59
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
     curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
@@ -39,7 +39,7 @@ WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 
-RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent/.cursor
+RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

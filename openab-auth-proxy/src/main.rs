@@ -19,36 +19,104 @@ use tokio::{
 };
 use tracing::{error, info};
 
-// === Constants (borrowed from Hermes) ===
-
-const XAI_OAUTH_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
-const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
-const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
-const XAI_OAUTH_REDIRECT_PORT: u16 = 56121;
-const XAI_API_BASE: &str = "https://api.x.ai";
 const REFRESH_SKEW_SECONDS: u64 = 120;
+
+// === Provider Config ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderConfig {
+    name: String,
+    discovery_url: String,
+    client_id: String,
+    scopes: String,
+    upstream_base_url: String,
+    #[serde(default = "default_redirect_port")]
+    redirect_port: u16,
+    #[serde(default)]
+    device_authorization_endpoint: Option<String>,
+}
+
+fn default_redirect_port() -> u16 {
+    56121
+}
+
+impl ProviderConfig {
+    fn xai() -> Self {
+        Self {
+            name: "xAI".to_string(),
+            discovery_url: "https://auth.x.ai/.well-known/openid-configuration".to_string(),
+            client_id: "b1a00492-073a-47ea-816f-4c329264a828".to_string(),
+            scopes: "openid profile email offline_access grok-cli:access api:access".to_string(),
+            upstream_base_url: "https://api.x.ai".to_string(),
+            redirect_port: 56121,
+            device_authorization_endpoint: None,
+        }
+    }
+
+    fn upstream_host(&self) -> &str {
+        self.upstream_base_url
+            .strip_prefix("https://")
+            .or_else(|| self.upstream_base_url.strip_prefix("http://"))
+            .unwrap_or(&self.upstream_base_url)
+            .split('/')
+            .next()
+            .unwrap_or("localhost")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigFile {
+    provider: ProviderConfig,
+}
+
+fn load_config(path: Option<&PathBuf>) -> Result<ProviderConfig> {
+    if let Some(p) = path {
+        let content = std::fs::read_to_string(p)
+            .with_context(|| format!("Cannot read config file: {}", p.display()))?;
+        let cfg: ConfigFile = toml::from_str(&content)?;
+        return Ok(cfg.provider);
+    }
+    // Check default locations
+    let candidates = [
+        PathBuf::from("auth-proxy.toml"),
+        dirs::config_dir()
+            .unwrap_or_default()
+            .join("openab-auth-proxy/config.toml"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            let content = std::fs::read_to_string(c)?;
+            let cfg: ConfigFile = toml::from_str(&content)?;
+            return Ok(cfg.provider);
+        }
+    }
+    // Default to xAI
+    Ok(ProviderConfig::xai())
+}
 
 // === CLI ===
 
 #[derive(Parser)]
-#[command(name = "xai-proxy", about = "xAI OAuth proxy sidecar")]
+#[command(name = "openab-auth-proxy", about = "Generic OAuth proxy sidecar for LLM APIs")]
 struct Cli {
+    /// Path to config file (default: auth-proxy.toml or xAI preset)
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with xAI via browser OAuth (PKCE)
+    /// Authenticate via browser OAuth (PKCE)
     Login,
-    /// Authenticate with xAI via device-code flow (headless/K8s/ECS)
+    /// Authenticate via device-code flow (headless/K8s/ECS)
     LoginDevice,
     /// Start the proxy server
     Serve {
-        /// Listen port
         #[arg(short, long, default_value = "9090")]
         port: u16,
-        /// Listen address
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
     },
@@ -61,12 +129,20 @@ struct TokenStore {
     access_token: String,
     refresh_token: String,
     #[serde(default)]
-    expires_at: u64, // unix timestamp
+    expires_at: u64,
     #[serde(default)]
     token_endpoint: String,
 }
 
-fn token_path() -> PathBuf {
+fn token_path(provider: &ProviderConfig) -> PathBuf {
+    if let Ok(p) = std::env::var("AUTH_PROXY_TOKEN_PATH") {
+        let path = PathBuf::from(p);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        return path;
+    }
+    // Legacy env var for backward compat
     if let Ok(p) = std::env::var("XAI_PROXY_TOKEN_PATH") {
         let path = PathBuf::from(p);
         if let Some(dir) = path.parent() {
@@ -76,23 +152,23 @@ fn token_path() -> PathBuf {
     }
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xai-proxy");
+        .join(".openab-auth-proxy")
+        .join(provider.name.to_lowercase().replace(' ', "-"));
     std::fs::create_dir_all(&dir).ok();
     dir.join("tokens.json")
 }
 
-fn load_tokens() -> Result<TokenStore> {
-    let path = token_path();
+fn load_tokens(provider: &ProviderConfig) -> Result<TokenStore> {
+    let path = token_path(provider);
     let data = std::fs::read_to_string(&path)
-        .with_context(|| format!("No token file at {}. Run `xai-proxy login` first.", path.display()))?;
+        .with_context(|| format!("No token file at {}. Run `openab-auth-proxy login` first.", path.display()))?;
     serde_json::from_str(&data).context("Invalid token file")
 }
 
-fn save_tokens(store: &TokenStore) -> Result<()> {
-    let path = token_path();
+fn save_tokens(provider: &ProviderConfig, store: &TokenStore) -> Result<()> {
+    let path = token_path(provider);
     let data = serde_json::to_string_pretty(store)?;
     std::fs::write(&path, data)?;
-    // chmod 600
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -111,10 +187,10 @@ struct OidcDiscovery {
     device_authorization_endpoint: String,
 }
 
-async fn discover_endpoints() -> Result<OidcDiscovery> {
+async fn discover_endpoints(provider: &ProviderConfig) -> Result<OidcDiscovery> {
     let client = reqwest::Client::new();
     let resp = client
-        .get(XAI_OAUTH_DISCOVERY_URL)
+        .get(&provider.discovery_url)
         .send()
         .await?
         .error_for_status()?;
@@ -134,101 +210,84 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
-// === OAuth Login ===
+// === OAuth Login (browser PKCE) ===
 
-async fn do_login() -> Result<()> {
-    info!("Starting xAI OAuth PKCE login...");
-    let discovery = discover_endpoints().await?;
+async fn do_login(provider: &ProviderConfig) -> Result<()> {
+    info!("Starting {} OAuth PKCE login...", provider.name);
+    let discovery = discover_endpoints(provider).await?;
 
     let code_verifier = pkce_verifier();
     let code_challenge = pkce_challenge(&code_verifier);
     let state = uuid::Uuid::new_v4().to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
-
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", XAI_OAUTH_REDIRECT_PORT);
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", provider.redirect_port);
 
     let authorize_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&nonce={}&plan=generic&referrer=xai-proxy",
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&nonce={}",
         discovery.authorization_endpoint,
-        urlencoding::encode(XAI_OAUTH_CLIENT_ID),
+        urlencoding::encode(&provider.client_id),
         urlencoding::encode(&redirect_uri),
-        urlencoding::encode(XAI_OAUTH_SCOPE),
+        urlencoding::encode(&provider.scopes),
         urlencoding::encode(&code_challenge),
         urlencoding::encode(&state),
         urlencoding::encode(&nonce),
     );
 
-    // Start local callback server
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", XAI_OAUTH_REDIRECT_PORT))
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", provider.redirect_port))
         .await
-        .context("Failed to bind callback port 56121")?;
+        .with_context(|| format!("Failed to bind callback port {}", provider.redirect_port))?;
 
-    println!("\nOpen this URL to authorize:\n");
-    println!("  {}\n", authorize_url);
-
-    // Try to open browser
+    println!("\nOpen this URL to authorize:\n\n  {}\n", authorize_url);
     if open::that(&authorize_url).is_ok() {
         println!("Browser opened. Waiting for callback...");
     } else {
         println!("Could not open browser. Please open the URL above manually.");
     }
 
-    // Wait for callback
     let (mut stream, _) = listener.accept().await?;
     let mut reader = BufReader::new(&mut stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
-    // Parse GET /callback?code=...&state=... HTTP/1.1
     let path = request_line
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| anyhow!("Invalid HTTP request"))?;
-
     let url = url::Url::parse(&format!("http://localhost{}", path))?;
     let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
 
-    // Drain remaining headers
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            break;
-        }
+        if line.trim().is_empty() { break; }
     }
 
-    // Send response
-    let body = "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>";
+    let body = "<html><body><h1>Authorization received.</h1>You can close this tab.</body></html>";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+        body.len(), body
     );
     stream.write_all(response.as_bytes()).await?;
 
-    // Validate state
     let received_state = params.get("state").ok_or_else(|| anyhow!("No state in callback"))?;
     if received_state.as_ref() != state {
         return Err(anyhow!("State mismatch — possible CSRF"));
     }
-
     let code = params
         .get("code")
         .ok_or_else(|| anyhow!("No code in callback. Error: {:?}", params.get("error")))?;
 
-    // Exchange code for tokens
     info!("Exchanging authorization code for tokens...");
     let client = reqwest::Client::new();
     let resp = client
         .post(&discovery.token_endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_ref()),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", XAI_OAUTH_CLIENT_ID),
-            ("code_verifier", &code_verifier),
-            ("code_challenge", &code_challenge),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", provider.client_id.as_str()),
+            ("code_verifier", code_verifier.as_str()),
+            ("code_challenge", code_challenge.as_str()),
             ("code_challenge_method", "S256"),
         ])
         .send()
@@ -241,47 +300,45 @@ async fn do_login() -> Result<()> {
     }
 
     let token_resp: serde_json::Value = resp.json().await?;
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token in response"))?;
-    let refresh_token = token_resp["refresh_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No refresh_token in response"))?;
+    let access_token = token_resp["access_token"].as_str().ok_or_else(|| anyhow!("No access_token"))?;
+    let refresh_token = token_resp["refresh_token"].as_str().ok_or_else(|| anyhow!("No refresh_token"))?;
     let expires_in = token_resp["expires_in"].as_u64().unwrap_or(3600);
-
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
     let store = TokenStore {
         access_token: access_token.to_string(),
         refresh_token: refresh_token.to_string(),
         expires_at: now + expires_in,
         token_endpoint: discovery.token_endpoint,
     };
-    save_tokens(&store)?;
-
-    println!("\n✅ Login successful! Token saved to {:?}", token_path());
-    println!("   Run `xai-proxy serve` to start the proxy.");
+    save_tokens(provider, &store)?;
+    println!("\n✅ Login successful! Token saved to {:?}", token_path(provider));
     Ok(())
 }
 
-// === Device-Code Login (headless) ===
+// === Device-Code Login ===
 
-async fn do_login_device() -> Result<()> {
-    info!("Starting xAI device-code login...");
-    let discovery = discover_endpoints().await?;
+async fn do_login_device(provider: &ProviderConfig) -> Result<()> {
+    info!("Starting {} device-code login...", provider.name);
+    let discovery = discover_endpoints(provider).await?;
 
-    let device_endpoint = if discovery.device_authorization_endpoint.is_empty() {
-        "https://auth.x.ai/oauth2/device/code".to_string()
-    } else {
-        discovery.device_authorization_endpoint
-    };
+    let device_endpoint = provider
+        .device_authorization_endpoint
+        .clone()
+        .unwrap_or_else(|| {
+            if discovery.device_authorization_endpoint.is_empty() {
+                // Fallback: derive from discovery URL
+                let base = provider.discovery_url.trim_end_matches("/.well-known/openid-configuration");
+                format!("{}/oauth2/device/code", base)
+            } else {
+                discovery.device_authorization_endpoint.clone()
+            }
+        });
 
     let client = reqwest::Client::new();
     let resp = client
         .post(&device_endpoint)
-        .form(&[
-            ("client_id", XAI_OAUTH_CLIENT_ID),
-            ("scope", XAI_OAUTH_SCOPE),
-        ])
+        .form(&[("client_id", provider.client_id.as_str()), ("scope", provider.scopes.as_str())])
         .send()
         .await?;
 
@@ -291,16 +348,12 @@ async fn do_login_device() -> Result<()> {
     }
 
     let device_resp: serde_json::Value = resp.json().await?;
-    let device_code = device_resp["device_code"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No device_code in response"))?;
-    let user_code = device_resp["user_code"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No user_code in response"))?;
+    let device_code = device_resp["device_code"].as_str().ok_or_else(|| anyhow!("No device_code"))?;
+    let user_code = device_resp["user_code"].as_str().ok_or_else(|| anyhow!("No user_code"))?;
     let verification_uri = device_resp["verification_uri"]
         .as_str()
         .or_else(|| device_resp["verification_url"].as_str())
-        .unwrap_or("https://auth.x.ai/oauth2/device");
+        .unwrap_or("(see provider docs)");
     let interval = device_resp["interval"].as_u64().unwrap_or(5);
 
     println!("\n  Go to:     {}", verification_uri);
@@ -309,12 +362,11 @@ async fn do_login_device() -> Result<()> {
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-
         let resp = client
             .post(&discovery.token_endpoint)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", XAI_OAUTH_CLIENT_ID),
+                ("client_id", provider.client_id.as_str()),
                 ("device_code", device_code),
             ])
             .send()
@@ -324,12 +376,8 @@ async fn do_login_device() -> Result<()> {
         let payload: serde_json::Value = resp.json().await?;
 
         if status.is_success() {
-            let access_token = payload["access_token"]
-                .as_str()
-                .ok_or_else(|| anyhow!("No access_token"))?;
-            let refresh_token = payload["refresh_token"]
-                .as_str()
-                .ok_or_else(|| anyhow!("No refresh_token"))?;
+            let access_token = payload["access_token"].as_str().ok_or_else(|| anyhow!("No access_token"))?;
+            let refresh_token = payload["refresh_token"].as_str().ok_or_else(|| anyhow!("No refresh_token"))?;
             let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
@@ -339,32 +387,30 @@ async fn do_login_device() -> Result<()> {
                 expires_at: now + expires_in,
                 token_endpoint: discovery.token_endpoint,
             };
-            save_tokens(&store)?;
-            println!("\n✅ Login successful! Token saved to {:?}", token_path());
-            println!("   Run `xai-proxy serve` to start the proxy.");
+            save_tokens(provider, &store)?;
+            println!("\n✅ Login successful! Token saved to {:?}", token_path(provider));
             return Ok(());
         }
 
-        let error = payload["error"].as_str().unwrap_or_default();
-        match error {
+        match payload["error"].as_str().unwrap_or_default() {
             "authorization_pending" | "slow_down" => continue,
             "expired_token" => return Err(anyhow!("Device code expired. Try again.")),
             "access_denied" => return Err(anyhow!("Authorization denied by user.")),
-            _ => return Err(anyhow!("Device-code error: {} — {:?}", error, payload)),
+            e => return Err(anyhow!("Device-code error: {} — {:?}", e, payload)),
         }
     }
 }
 
 // === Token Refresh ===
 
-async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
+async fn refresh_token(provider: &ProviderConfig, store: &TokenStore) -> Result<TokenStore> {
     let client = reqwest::Client::new();
     let resp = client
         .post(&store.token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", &store.refresh_token),
-            ("client_id", XAI_OAUTH_CLIENT_ID),
+            ("client_id", &provider.client_id),
         ])
         .send()
         .await?;
@@ -376,26 +422,23 @@ async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     }
 
     let token_resp: serde_json::Value = resp.json().await?;
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token in refresh response"))?;
-    let refresh_token = token_resp["refresh_token"]
-        .as_str()
-        .unwrap_or(&store.refresh_token);
+    let access_token = token_resp["access_token"].as_str().ok_or_else(|| anyhow!("No access_token"))?;
+    let new_refresh = token_resp["refresh_token"].as_str().unwrap_or(&store.refresh_token);
     let expires_in = token_resp["expires_in"].as_u64().unwrap_or(3600);
-
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
     Ok(TokenStore {
         access_token: access_token.to_string(),
-        refresh_token: refresh_token.to_string(),
+        refresh_token: new_refresh.to_string(),
         expires_at: now + expires_in,
         token_endpoint: store.token_endpoint.clone(),
     })
 }
 
-// === Proxy State ===
+// === Proxy ===
 
 struct ProxyState {
+    provider: ProviderConfig,
     tokens: RwLock<TokenStore>,
     http_client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
 }
@@ -409,27 +452,20 @@ impl ProxyState {
                 return Ok(tokens.access_token.clone());
             }
         }
-        // Need refresh
         let mut tokens = self.tokens.write().await;
-        // Double-check after acquiring write lock
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         if tokens.expires_at > now + REFRESH_SKEW_SECONDS {
             return Ok(tokens.access_token.clone());
         }
-        info!("Refreshing xAI OAuth token...");
-        let new_tokens = refresh_token(&tokens).await?;
-        save_tokens(&new_tokens)?;
+        info!("Refreshing OAuth token...");
+        let new_tokens = refresh_token(&self.provider, &tokens).await?;
+        save_tokens(&self.provider, &new_tokens)?;
         *tokens = new_tokens;
         Ok(tokens.access_token.clone())
     }
 }
 
-// === Proxy Handler ===
-
-async fn proxy_handler(
-    State(state): State<Arc<ProxyState>>,
-    mut req: Request<Body>,
-) -> Response<Body> {
+async fn proxy_handler(State(state): State<Arc<ProxyState>>, mut req: Request<Body>) -> Response<Body> {
     let token = match state.get_valid_token().await {
         Ok(t) => t,
         Err(e) => {
@@ -441,27 +477,19 @@ async fn proxy_handler(
         }
     };
 
-    // Rewrite URI to api.x.ai
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let target_uri = format!("{}{}", XAI_API_BASE, path_and_query);
-
+    let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let target_uri = format!("{}{}", state.provider.upstream_base_url, path_and_query);
     *req.uri_mut() = target_uri.parse().unwrap();
 
-    // Inject auth header
     req.headers_mut().insert(
         hyper::header::AUTHORIZATION,
         format!("Bearer {}", token).parse().unwrap(),
     );
     req.headers_mut().insert(
         hyper::header::HOST,
-        "api.x.ai".parse().unwrap(),
+        state.provider.upstream_host().parse().unwrap(),
     );
 
-    // Forward
     match state.http_client.request(req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
@@ -477,23 +505,19 @@ async fn proxy_handler(
     }
 }
 
-// === Serve ===
+async fn do_serve(provider: &ProviderConfig, bind: &str, port: u16) -> Result<()> {
+    let store = load_tokens(provider)?;
 
-async fn do_serve(bind: &str, port: u16) -> Result<()> {
-    let store = load_tokens()?;
-
-    // Check if token needs immediate refresh
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let store = if store.expires_at <= now + REFRESH_SKEW_SECONDS {
         info!("Token expired, refreshing...");
-        let new_store = refresh_token(&store).await?;
-        save_tokens(&new_store)?;
+        let new_store = refresh_token(provider, &store).await?;
+        save_tokens(provider, &new_store)?;
         new_store
     } else {
         store
     };
 
-    // Build HTTPS client for upstream
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()?
         .https_or_http()
@@ -503,6 +527,7 @@ async fn do_serve(bind: &str, port: u16) -> Result<()> {
     let http_client = Client::builder(TokioExecutor::new()).build(https);
 
     let state = Arc::new(ProxyState {
+        provider: provider.clone(),
         tokens: RwLock::new(store),
         http_client,
     });
@@ -514,9 +539,9 @@ async fn do_serve(bind: &str, port: u16) -> Result<()> {
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
     let listener = TcpListener::bind(addr).await?;
-    info!("xai-proxy listening on http://{}", addr);
-    println!("xai-proxy listening on http://{}", addr);
-    println!("Set your client's base URL to: http://{}/v1", addr);
+    info!("openab-auth-proxy ({}) listening on http://{}", provider.name, addr);
+    println!("openab-auth-proxy ({}) listening on http://{}", provider.name, addr);
+    println!("Upstream: {}", provider.upstream_base_url);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -533,14 +558,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "xai_proxy=info".into()),
+                .unwrap_or_else(|_| "openab_auth_proxy=info".into()),
         )
         .init();
 
     let cli = Cli::parse();
+    let provider = load_config(cli.config.as_ref())?;
+    info!("Provider: {} (upstream: {})", provider.name, provider.upstream_base_url);
+
     match cli.command {
-        Commands::Login => do_login().await,
-        Commands::LoginDevice => do_login_device().await,
-        Commands::Serve { port, bind } => do_serve(&bind, port).await,
+        Commands::Login => do_login(&provider).await,
+        Commands::LoginDevice => do_login_device(&provider).await,
+        Commands::Serve { port, bind } => do_serve(&provider, &bind, port).await,
     }
 }

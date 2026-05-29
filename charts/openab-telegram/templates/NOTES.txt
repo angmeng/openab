@@ -1,0 +1,71 @@
+🎉 OpenAB Telegram bot deployed!
+
+Pod: {{ include "openab-telegram.fullname" . }} (3 containers: openab, gateway, cloudflared)
+
+## Post-Install Steps (complete in order)
+
+### Step 1: Configure Cloudflare Tunnel ingress
+
+The tunnel is running but has no ingress rules yet — webhook will return 503 until configured.
+
+Option A — Via Cloudflare API (AI-friendly):
+
+  Extract credentials from the K8s secret:
+    ACCOUNT_ID=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .a)
+    TUNNEL_ID=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .t)
+    CF_API_TOKEN=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-api-token}' | base64 -d)
+
+  Then configure ingress:
+    curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d '{"config":{"ingress":[{"hostname":"{{ .Values.webhookDomain | default "bot.example.com" }}","service":"http://localhost:8080"},{"service":"http_status:404"}]}}'
+
+  After configuring, restart the pod to pick up the new ingress:
+    kubectl rollout restart deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }}
+
+  Note: cloudflare-api-token is optional in the Secret. If not present, use Option B.
+
+Option B — Via Cloudflare Dashboard:
+  https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:
+    Hostname: {{ .Values.webhookDomain | default "bot.example.com" }}
+    Type: HTTP
+    URL: localhost:8080
+
+{{- if .Values.webhookDomain }}
+
+### Step 2: Set the Telegram webhook
+
+Run this command to point Telegram at your tunnel:
+
+  curl "https://api.telegram.org/bot$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.telegram-bot-token}' | base64 -d)/setWebhook" \
+    -d "url=https://{{ .Values.webhookDomain }}/webhook/telegram"
+
+{{- else }}
+
+### Step 2: Set the Telegram webhook
+
+  curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+    -d "url=https://YOUR_DOMAIN/webhook/telegram"
+
+  Tip: pass --set webhookDomain=bot.example.com to get a ready-to-run command here.
+
+{{- end }}
+
+### Step 3: Authenticate the agent
+
+The agent needs a one-time OAuth login. Run the device flow:
+
+  kubectl exec -it deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }} -c openab -- {{ .Values.agent.command }} login --use-device-flow
+
+Then restart to pick up credentials:
+
+  kubectl rollout restart deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }}
+
+## Verify
+
+Send a message to your bot on Telegram. Check logs if no response:
+
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-telegram.fullname" . }} -c openab --tail=20
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-telegram.fullname" . }} -c gateway --tail=20
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-telegram.fullname" . }} -c cloudflared --tail=20

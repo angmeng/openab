@@ -83,6 +83,56 @@ pub struct Config {
     pub cron: CronConfig,
     #[serde(default)]
     pub relay: Option<crate::relay::RelayConfig>,
+    #[serde(default)]
+    pub hooks: HooksConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HooksConfig {
+    pub pre_boot: Option<HookConfig>,
+    pub pre_shutdown: Option<HookConfig>,
+}
+
+/// Failure policy for a hook.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnFailure {
+    #[default]
+    Abort,
+    Warn,
+}
+
+impl<'de> Deserialize<'de> for OnFailure {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "abort" => Ok(Self::Abort),
+            "warn" => Ok(Self::Warn),
+            other => Err(serde::de::Error::unknown_variant(other, &["abort", "warn"])),
+        }
+    }
+}
+
+/// Configuration for a single hook. Exactly one of `script`, `inline`, or `url` must be set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookConfig {
+    /// Absolute path to an executable script.
+    pub script: Option<String>,
+    /// Inline script content (written to temp file and executed).
+    pub inline: Option<String>,
+    /// Remote script URL (fetched and executed).
+    pub url: Option<String>,
+    /// SHA-256 checksum of the remote script (required with `url`).
+    pub sha256: Option<String>,
+    /// Max wall-clock seconds. Default: 60.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_seconds: u64,
+    /// Failure policy. Default: abort.
+    #[serde(default)]
+    pub on_failure: OnFailure,
+}
+
+fn default_hook_timeout() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -348,6 +398,8 @@ pub struct PoolConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CronJobConfig {
+    /// Stable ID for usercron jobs that need scheduler writeback.
+    pub id: Option<String>,
     /// Whether this cronjob is active (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -368,6 +420,17 @@ pub struct CronJobConfig {
     /// Timezone (default: "UTC")
     #[serde(default = "default_cron_timezone")]
     pub timezone: String,
+    /// Usercron-only: command to run before firing. Exit 0 plus a matching
+    /// `disable_on_success_match` means the goal is complete and the scheduler
+    /// disables the job in the usercron file.
+    pub disable_on_success: Option<String>,
+    /// Usercron-only: required output marker for `disable_on_success`.
+    pub disable_on_success_match: Option<String>,
+    /// Usercron-only: timeout for `disable_on_success`.
+    #[serde(default = "default_disable_on_success_timeout_secs")]
+    pub disable_on_success_timeout_secs: u64,
+    /// Usercron-only: working directory for `disable_on_success`.
+    pub disable_on_success_working_dir: Option<String>,
 }
 
 fn default_cron_platform() -> String {
@@ -378,6 +441,9 @@ fn default_cron_sender() -> String {
 }
 fn default_cron_timezone() -> String {
     "UTC".into()
+}
+fn default_disable_on_success_timeout_secs() -> u64 {
+    60
 }
 
 /// Controls how tool calls are rendered in chat messages.

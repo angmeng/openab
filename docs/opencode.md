@@ -116,6 +116,59 @@ kubectl logs deployment/openab-opencode --tail=5
 
 `@mention` the bot in your Discord channel to start chatting.
 
+## Example: xAI Grok with SuperGrok OAuth
+
+### 1. Create the auth directory
+
+OpenCode stores credentials at `~/.local/share/opencode/auth.json`. The directory must exist before login:
+
+```bash
+kubectl exec deployment/openab-opencode -- mkdir -p /home/node/.local/share/opencode
+```
+
+### 2. Authenticate xAI (device-code flow)
+
+```bash
+kubectl exec -it deployment/openab-opencode -- opencode auth login -p xai
+```
+
+Select **"xAI Grok OAuth (Headless / Remote / VPS)"**. The CLI prints a URL and a short code:
+
+```
+Open https://x.ai/device on any device and enter code: ABCD-1234
+```
+
+Open the URL on any device with a browser, enter the code, and approve.
+
+### 3. Verify auth file was created
+
+```bash
+kubectl exec deployment/openab-opencode -- cat /home/node/.local/share/opencode/auth.json
+```
+
+You should see a JSON object with `xai` credentials.
+
+### 4. Set default model
+
+Create `opencode.json` in the working directory (`/home/node`):
+
+```bash
+kubectl exec -it deployment/openab-opencode -- bash -c 'cat > /home/node/opencode.json << "EOF"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "xai/grok-4.3"
+}
+EOF'
+```
+
+### 5. Restart to pick up config
+
+```bash
+kubectl rollout restart deployment/openab-opencode
+```
+
+> **Important:** Do NOT set a custom `baseURL` or provider override for xAI. The built-in xAI provider handles routing correctly. A stale `~/.config/opencode/opencode.json` with `baseURL: "http://localhost:9090/v1"` (from xai-proxy setups) will break xAI — delete it if present.
+
 ## Notes
 
 - **Tool authorization**: OpenCode handles tool authorization internally and never emits `session/request_permission` — all tools run without user confirmation, equivalent to `--trust-all-tools` on other backends.

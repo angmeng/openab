@@ -45,6 +45,17 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 {{- end }}
 
+{{/* Secret name to use for Slack credentials.
+     If existingSecret is set, reference it; otherwise fall back to the chart-managed agent secret.
+     Call with: dict "ctx" $ "agent" $name "cfg" $cfg */}}
+{{- define "openab.slackSecretName" -}}
+{{- if and .cfg.slack (.cfg.slack.existingSecret | default "" | trim) -}}
+{{- .cfg.slack.existingSecret | trim -}}
+{{- else -}}
+{{- include "openab.agentFullname" . -}}
+{{- end -}}
+{{- end }}
+
 {{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion).
     Caveat: "contains :" treats registry ports (e.g. my-registry:5000/img) as tagged.
     Not an issue for ghcr.io / Docker Hub; revisit if custom registries with ports are needed. */}}

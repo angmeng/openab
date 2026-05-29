@@ -1,13 +1,13 @@
-name: CI (xai-proxy)
+name: CI (openab-auth-proxy)
 
 on:
   pull_request:
     paths:
-      - "xai-proxy/**"
+      - "openab-auth-proxy/**"
   push:
     branches: [main]
     paths:
-      - "xai-proxy/**"
+      - "openab-auth-proxy/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: xai-proxy
+        working-directory: openab-auth-proxy
     steps:
       - uses: actions/checkout@v6
 
@@ -27,7 +27,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: xai-proxy
+          workspaces: openab-auth-proxy
 
       - name: cargo check
         run: cargo check

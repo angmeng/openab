@@ -1,8 +1,12 @@
 /target
+gateway/target/
 config.toml
 *.swp
 .DS_Store
 .env
 .kiro/
+
+# Claude Code (https://claude.ai/code)
 CLAUDE.md
-gateway/target/
+.claude/
+.claude.local.md

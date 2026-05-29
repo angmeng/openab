@@ -80,3 +80,74 @@ cargo check
 - Run `cargo fmt` before committing
 - Run `cargo clippy` and address warnings
 - Keep PRs focused — one feature or fix per PR
+
+## PR Lifecycle
+
+Every PR follows a label-driven lifecycle that keeps the review loop moving.
+
+```
+┌──────────────┐
+│  PR Created  │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────┐
+│  Automated Checks    │
+│  (CI, rebase, etc.)  │
+└──────┬───────────────┘
+       │
+       ├── all pass ──────────────────────►┌──────────────────────┐
+       │                                   │ pending-maintainer   │
+       │                                   └──────────┬───────────┘
+       │                                              │
+       │                                              ├── LGTM → approve & merge (or request
+       │                                              │          another maintainer review)
+       │                                              │          stays pending-maintainer
+       │                                              │
+       │                                              └── pending actions for contributor
+       │                                                         │
+       │                                                         ▼
+       └── any fail ──────────────────────►┌──────────────────────┐
+                                           │ pending-contributor  │◄─────────┐
+                                           └──────────┬───────────┘          │
+                                                      │                      │
+                                                      │ stale 2 days         │
+                                                      │ (no author activity) │
+                                                      ▼                      │
+                                           ┌───────────────────┐             │
+                                           │   closing-soon    │             │
+                                           │ (or immediate if  │             │
+                                           │  blocker detected)│             │
+                                           └────────┬──────────┘             │
+                                                    │                        │
+                                       ┌────────────┴──────────┐             │
+                                       │                       │             │
+                                       ▼                       ▼             │
+                             author comments            3 more days          │
+                             within 3 days             no activity           │
+                                       │                       │             │
+                                       ▼                       ▼             │
+                             ┌────────────────────┐  ┌────────────┐          │
+                             │ pending-maintainer  │  │  PR Closed │          │
+                             │ (labels removed)    │  └────────────┘          │
+                             └────────┬───────────┘                          │
+                                      │                                      │
+                                      └── re-check fails ────────────────────┘
+```
+
+### Label Transitions
+
+| Current State | Trigger | Action |
+|---------------|---------|--------|
+| `pending-contributor` | No author activity for 2 days | Add `closing-soon` |
+| `closing-soon` | No author activity for 3 more days | Auto-close PR |
+| `pending-contributor` | Author adds a comment | Remove `pending-contributor`, add `pending-maintainer` |
+| `closing-soon` | Author adds a comment | Remove `closing-soon` and `pending-contributor`, add `pending-maintainer` |
+
+### Key Rules
+
+- **`pending-contributor`** — the ball is on the contributor; maintainers are waiting for updates.
+- **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days.
+- **Author comment always resets** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
+- **Re-check may re-apply `closing-soon`** — after the flip, automated checks still run. If blockers remain (e.g., missing Discord URL, CI failure, `needs-rebase`), `closing-soon` will be re-applied immediately, keeping the ball on the contributor.
+- **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period.

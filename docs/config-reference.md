@@ -95,10 +95,10 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
+| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
-| `env` | map | `{}` | Extra environment variables (e.g. `{ ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }`). |
+| `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
@@ -114,10 +114,11 @@ working_dir = "/home/agent"
 
 # Claude Code
 [agent]
-command = "claude"
-args = ["--acp"]
+command = "claude-agent-acp"
+args = []
 working_dir = "/home/node"
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
+# Auth: kubectl exec -it deploy/openab-claude -- claude auth login
+# Credentials persist in HOME PVC across restarts. See docs/claude-code.md.
 
 # Codex
 [agent]
@@ -145,6 +146,11 @@ command = "opencode"
 args = ["acp"]
 working_dir = "/home/node"
 
+# Pi Agent
+[agent]
+command = "pi-acp"
+working_dir = "/home/node"
+
 # Cursor Agent
 [agent]
 command = "cursor-agent"
@@ -167,6 +173,53 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+
+---
+
+## `[hooks]`
+
+Lifecycle hooks that run custom scripts at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+
+### `[hooks.pre_boot]`
+
+Runs **before** agent pool creation. Use for bootstrapping files, syncing from S3, installing CLIs.
+
+### `[hooks.pre_shutdown]`
+
+Runs **after** pool shutdown on SIGTERM. Use for backing up state, syncing to S3.
+
+Both hooks share the same fields:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `script` | string | — | Absolute path to an executable script. |
+| `inline` | string | — | Script content (written to temp file and executed). |
+| `url` | string | — | Remote script URL (max 1 MiB). |
+| `sha256` | string | — | Required with `url` — hex-encoded SHA-256 checksum. |
+| `timeout_seconds` | u64 | `60` | Max wall-clock seconds before the script is killed. |
+| `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
+
+> Exactly one of `script`, `inline`, or `url` must be set. `script` must be an absolute path. `url` requires `sha256`.
+
+```toml
+[hooks.pre_boot]
+inline = '''
+#!/bin/sh
+set -e
+aws s3 sync "$BOOTSTRAP_URI" "$HOME/"
+'''
+timeout_seconds = 120
+on_failure = "abort"
+
+[hooks.pre_shutdown]
+inline = '''
+#!/bin/sh
+aws s3 sync "$HOME/" "s3://$STATE_BUCKET/$TASK_FAMILY/" \
+  --exclude "aws-cli/*" --quiet
+'''
+timeout_seconds = 30
+on_failure = "warn"
+```
 
 ---
 
@@ -270,6 +323,33 @@ timezone = "UTC"
 | `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
 
 The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
+
+### Usercron-only `[[jobs]]` fields
+
+These fields are valid only in the external usercron file, for example `$HOME/.openab/cronjob.toml`. They are rejected in baseline `[[cron.jobs]]` because OpenAB only writes state back to the user-managed cron file.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `id` | string | *required with `disable_on_success`* | Stable job ID used when the scheduler writes `enabled = false` or `thread_id` back to `cronjob.toml`. |
+| `disable_on_success` | string | — | Command to run before sending the scheduled prompt. |
+| `disable_on_success_match` | string | *required with `disable_on_success`* | Marker that must appear in stdout or stderr, in addition to exit code `0`, before the job is considered complete. |
+| `disable_on_success_timeout_secs` | integer | `60` | Timeout for the completion check command. |
+| `disable_on_success_working_dir` | string | — | Working directory for the completion check command. |
+
+Example:
+
+```toml
+[[jobs]]
+id = "fix-unit-tests"
+enabled = true
+schedule = "*/10 * * * *"
+channel = "123456789"
+message = "Unit tests are still failing. Continue fixing them."
+disable_on_success = "npm test && echo OPENAB_GOAL_SUCCESS"
+disable_on_success_match = "OPENAB_GOAL_SUCCESS"
+disable_on_success_timeout_secs = 120
+disable_on_success_working_dir = "/workspace/my-project"
+```
 
 **Cron expression format:**
 

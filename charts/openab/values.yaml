@@ -11,6 +11,23 @@ nameOverride: ""
 # Override the full release name used in generated resource names.
 fullnameOverride: ""
 
+# Chart-global ServiceAccount name for agent pods, used when an agent doesn't
+# set its own `serviceAccountName`. Empty string = use cluster default SA.
+# Per-agent values (agents.<name>.serviceAccountName) take precedence — when
+# set, they fully override this. The chart only references an existing SA; it
+# does NOT create one or manage annotations (provision out-of-band).
+# Example:
+# serviceAccountName: "openab"
+serviceAccountName: ""
+
+# Chart-global image pull secrets, used when an agent doesn't set its own
+# `imagePullSecrets`. Per-agent values (agents.<name>.imagePullSecrets) take
+# precedence — when set, they fully override (do not merge with) this list.
+# Example:
+# imagePullSecrets:
+#   - name: regcred
+imagePullSecrets: []
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -109,6 +126,28 @@ agents:
     #   agentsMd: ""
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
+    # pi:
+    #   command: pi-acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-pi:latest"
     # cursor:
     #   command: cursor-agent
     #   args:
@@ -238,6 +277,14 @@ agents:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
       appToken: ""       # App-Level Token (xapp-...) for Socket Mode
+      # Use a pre-existing K8s Secret for slack-bot-token and slack-app-token
+      # instead of having the chart create one from botToken/appToken.
+      # Set to the Secret name; the Secret must contain keys:
+      #   slack-bot-token  → Bot User OAuth Token (xoxb-...)
+      #   slack-app-token  → App-Level Token (xapp-...)
+      # When set, botToken and appToken above are ignored. Recommended path for
+      # External Secrets Operator / Vault / SealedSecrets deployments.
+      existingSecret: ""
       # allowAllChannels/allowAllUsers: same auto-infer logic as discord
       allowedChannels: []  # empty + no allowAllChannels → allow all (auto-inferred)
       allowedUsers: []     # empty + no allowAllUsers → allow all (auto-inferred)
@@ -398,6 +445,17 @@ agents:
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    # Per-agent ServiceAccount name. When set (non-empty), overrides the
+    # chart-global `serviceAccountName` for this agent only. Useful in
+    # multi-agent deployments where only some agents need a dedicated SA.
+    # serviceAccountName: "openab"
+    serviceAccountName: ""
+    # Per-agent image pull secrets. When set, overrides the chart-global
+    # `imagePullSecrets` for this agent only. Useful in multi-agent deployments
+    # where only some agents pull from a private registry.
+    # imagePullSecrets:
+    #   - name: regcred
+    imagePullSecrets: []
     # extraInitContainers adds init containers to the pod (runs before the main container)
     extraInitContainers: []
     # extraContainers adds sidecar containers to the pod

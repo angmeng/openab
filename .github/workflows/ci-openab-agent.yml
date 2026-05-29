@@ -1,0 +1,39 @@
+name: CI openab-agent
+
+on:
+  push:
+    paths:
+      - 'openab-agent/**'
+  pull_request:
+    paths:
+      - 'openab-agent/**'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: openab-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: openab-agent
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
+      - run: cargo test -- --ignored
+        env:
+          ANTHROPIC_API_KEY: "fake-key-for-ci"
+      - name: ACP smoke test
+        run: |
+          cargo build --release
+          # Test: initialize returns valid ACP response
+          RESP=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | timeout 5 ./target/release/openab-agent 2>/dev/null | head -1)
+          echo "Response: $RESP"
+          echo "$RESP" | grep -q '"agentInfo"' || (echo "FAIL: no agentInfo in response" && exit 1)
+          echo "$RESP" | grep -q '"openab-agent"' || (echo "FAIL: wrong agent name" && exit 1)
+          echo "✅ ACP initialize OK"

@@ -10,13 +10,13 @@ AI coding agents load persistent instructions every session, but without deliber
 
 This guide establishes a universal framework for organizing agent memory into layers, so rules are reliably followed, context budgets are respected, and teams can onboard new agents without starting from scratch.
 
-OpenAB is designed to be agent-agnostic — it supports Kiro, Claude Code, Codex, Gemini, Copilot, and OpenCode running side by side. This guide provides a shared memory architecture standard that allows all supported coding agents to maintain consistent behavior, collaborate effectively, and operate from a single source of truth regardless of their underlying platform differences.
+OpenAB is designed to be agent-agnostic — it supports Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode, and Pi running side by side. This guide provides a shared memory architecture standard that allows all supported coding agents to maintain consistent behavior, collaborate effectively, and operate from a single source of truth regardless of their underlying platform differences.
 
 ---
 
 How to organize AI agent memory across three tiers: hot (always loaded), warm (triggered on demand), and cold (searched when needed).
 
-Applies to: Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode — any agent that supports persistent instruction files.
+Applies to: Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode, Pi — any agent that supports persistent instruction files.
 
 ---
 
@@ -165,6 +165,7 @@ Applies to: Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode — any agent th
 | Gemini | `GEMINI.md` hierarchical (`~/.gemini/GEMINI.md` global → `./GEMINI.md` project → subdir) + `MEMORY.md` index | Same hierarchical pattern as CC/Codex. Private project memory index is hot; individual memory files are cold |
 | Copilot | `.github/copilot-instructions.md` (repo-wide) + `.github/instructions/**/*.instructions.md` (path-specific) + `AGENTS.md` (nearest-in-tree, where supported: cloud agent / CLI) | Layered: Personal > Path-specific > Repo-wide > Agent > Organization. No documented hard size cap for Chat/Agent (code review reads first 4K chars only). Keep short (~2 pages recommended) |
 | OpenCode | `AGENTS.md` or equivalent | Follows repo convention |
+| Pi | `AGENTS.md` hierarchical (project root → global) + `SYSTEM.md` or `APPEND_SYSTEM.md` in `.pi/` | Project or global `SYSTEM.md` replaces the default system prompt, while `APPEND_SYSTEM.md` appends to it. `AGENTS.md` is loaded hierarchically for context injection |
 
 ---
 

@@ -1,0 +1,334 @@
+use anyhow::Result;
+use std::path::PathBuf;
+use tracing::{debug, info};
+
+use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
+use crate::tools;
+
+const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
+
+You have 4 tools available:
+- read: Read file contents or list a directory
+- write: Create or overwrite a file
+- edit: Replace a string in a file (first occurrence)
+- bash: Execute a shell command
+
+Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
+
+const MAX_TOOL_LOOPS: usize = 50;
+/// Maximum number of messages to keep in context. When exceeded, oldest
+/// messages (excluding the first user message) are dropped.
+const MAX_CONTEXT_MESSAGES: usize = 100;
+
+pub struct Agent {
+    provider: Box<dyn LlmProvider>,
+    messages: Vec<Message>,
+    working_dir: PathBuf,
+    system_prompt: String,
+    tools: Vec<ToolDef>,
+}
+
+impl Agent {
+    #[cfg(test)]
+    pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
+        let system_prompt = Self::build_system_prompt(&working_dir);
+        Self {
+            provider: Box::new(provider),
+            messages: Vec::new(),
+            working_dir: PathBuf::from(working_dir),
+            system_prompt,
+            tools: tools::tool_definitions(),
+        }
+    }
+
+    pub fn new_boxed(provider: Box<dyn LlmProvider>, working_dir: String) -> Self {
+        let system_prompt = Self::build_system_prompt(&working_dir);
+        Self {
+            provider,
+            messages: Vec::new(),
+            working_dir: PathBuf::from(working_dir),
+            system_prompt,
+            tools: tools::tool_definitions(),
+        }
+    }
+
+    /// Run the agent with a user prompt, executing tool calls until completion.
+    /// Returns the final text response.
+    fn build_system_prompt(working_dir: &str) -> String {
+        let agents_md = std::path::Path::new(working_dir).join("AGENTS.md");
+        let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
+        if custom.is_empty() {
+            SYSTEM_PROMPT.to_string()
+        } else {
+            format!(
+                "{}
+
+---
+
+{}",
+                custom.trim(),
+                SYSTEM_PROMPT
+            )
+        }
+    }
+
+    pub async fn run(&mut self, prompt: &str) -> Result<String> {
+        // Add user message
+        self.messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+        });
+
+        let mut final_text = String::new();
+
+        for iteration in 0..MAX_TOOL_LOOPS {
+            debug!("agent loop iteration {iteration}");
+
+            // Truncate context to prevent unbounded growth / token limit
+            self.truncate_context();
+
+            let events = self.call_llm().await?;
+
+            let mut tool_calls = Vec::new();
+            let mut text_parts = Vec::new();
+
+            for event in &events {
+                match event {
+                    LlmEvent::Text(t) => text_parts.push(t.clone()),
+                    LlmEvent::ToolUse { id, name, input } => {
+                        tool_calls.push((id.clone(), name.clone(), input.clone()));
+                    }
+                    LlmEvent::Stop => {}
+                    LlmEvent::Error(e) => {
+                        return Err(anyhow::anyhow!("LLM error: {e}"));
+                    }
+                }
+            }
+
+            // Build assistant message content
+            let mut assistant_content: Vec<ContentBlock> = Vec::new();
+            if !text_parts.is_empty() {
+                assistant_content.push(ContentBlock::Text {
+                    text: text_parts.join(""),
+                });
+            }
+            for (id, name, input) in &tool_calls {
+                assistant_content.push(ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
+            }
+
+            self.messages.push(Message {
+                role: "assistant".to_string(),
+                content: assistant_content,
+            });
+
+            if tool_calls.is_empty() || !text_parts.is_empty() {
+                // No tool calls — we're done
+                final_text = text_parts.join("");
+                break;
+            }
+
+            // Execute tool calls and add results
+            let mut tool_results: Vec<ContentBlock> = Vec::new();
+            for (id, name, input) in &tool_calls {
+                info!("executing tool: {name}");
+                let result = tools::execute_tool(name, input, &self.working_dir).await;
+                match result {
+                    Ok(output) => {
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output,
+                            is_error: None,
+                        });
+                    }
+                    Err(e) => {
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: format!("Error: {e}"),
+                            is_error: Some(true),
+                        });
+                    }
+                }
+            }
+
+            self.messages.push(Message {
+                role: "user".to_string(),
+                content: tool_results,
+            });
+        }
+
+        if final_text.is_empty() {
+            return Err(anyhow::anyhow!(
+                "agent exceeded maximum tool loop iterations ({MAX_TOOL_LOOPS})"
+            ));
+        }
+
+        Ok(final_text)
+    }
+
+    /// Drop oldest message pairs when context exceeds limit, preserving the
+    /// first user message and maintaining strict user/assistant alternation.
+    fn truncate_context(&mut self) {
+        while self.messages.len() > MAX_CONTEXT_MESSAGES {
+            // Drain in pairs (assistant + user) from index 1 to maintain alternation
+            let end = (1 + 2).min(self.messages.len());
+            self.messages.drain(1..end);
+        }
+    }
+
+    async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
+        self.provider
+            .chat(&self.system_prompt, &self.messages, &self.tools)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Hand-written mock LLM provider for unit testing.
+    struct MockLlmProvider {
+        responses: Vec<Vec<LlmEvent>>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl MockLlmProvider {
+        fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self {
+                responses,
+                call_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl LlmProvider for MockLlmProvider {
+        fn chat<'a>(
+            &'a self,
+            _system: &'a str,
+            _messages: &'a [Message],
+            _tools: &'a [ToolDef],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>>
+        {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let events = self.responses[idx].clone();
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_simple_text_response() {
+        let mock = MockLlmProvider::new(vec![vec![
+            LlmEvent::Text("Hello!".to_string()),
+            LlmEvent::Stop,
+        ]]);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        let result = agent.run("hi").await.unwrap();
+        assert_eq!(result, "Hello!");
+    }
+
+    #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
+    async fn test_agent_tool_call_then_response() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "file content here").unwrap();
+
+        let mock = MockLlmProvider::new(vec![
+            // First call: LLM requests to read a file
+            vec![LlmEvent::ToolUse {
+                id: "tu_1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({ "path": "test.txt" }),
+            }],
+            // Second call: LLM responds with text
+            vec![
+                LlmEvent::Text("The file contains: file content here".to_string()),
+                LlmEvent::Stop,
+            ],
+        ]);
+
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        let result = agent.run("read test.txt").await.unwrap();
+        assert_eq!(result, "The file contains: file content here");
+    }
+
+    #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
+    async fn test_agent_tool_error_handling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mock = MockLlmProvider::new(vec![
+            // First call: LLM requests to read a non-existent file
+            vec![LlmEvent::ToolUse {
+                id: "tu_1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({ "path": "nonexistent.txt" }),
+            }],
+            // Second call: LLM acknowledges the error
+            vec![
+                LlmEvent::Text("File not found.".to_string()),
+                LlmEvent::Stop,
+            ],
+        ]);
+
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        let result = agent.run("read nonexistent.txt").await.unwrap();
+        assert_eq!(result, "File not found.");
+
+        // Verify the tool result was marked as error
+        assert_eq!(agent.messages.len(), 4); // user, assistant(tool_use), user(tool_result), assistant(text)
+        let tool_result_msg = &agent.messages[2];
+        match &tool_result_msg.content[0] {
+            ContentBlock::ToolResult { is_error, .. } => {
+                assert_eq!(*is_error, Some(true));
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
+    async fn test_agent_multiple_tool_calls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mock = MockLlmProvider::new(vec![
+            // First call: write a file
+            vec![LlmEvent::ToolUse {
+                id: "tu_1".to_string(),
+                name: "write".to_string(),
+                input: serde_json::json!({ "path": "out.txt", "content": "hello" }),
+            }],
+            // Second call: read it back
+            vec![LlmEvent::ToolUse {
+                id: "tu_2".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({ "path": "out.txt" }),
+            }],
+            // Third call: done
+            vec![
+                LlmEvent::Text("Done. File contains: hello".to_string()),
+                LlmEvent::Stop,
+            ],
+        ]);
+
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        let result = agent
+            .run("write hello to out.txt then read it")
+            .await
+            .unwrap();
+        assert_eq!(result, "Done. File contains: hello");
+
+        // Verify file was actually written
+        let content = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
+        assert_eq!(content, "hello");
+    }
+}

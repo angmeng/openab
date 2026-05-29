@@ -53,12 +53,6 @@ jobs:
                 continue;
               }
 
-              // Skip if closing-soon — contributor has incomplete work
-              if (labels.includes('closing-soon')) {
-                console.log(`#${prNumber} — closing-soon, skipping`);
-                continue;
-              }
-
               // Skip if has merge conflicts or already labeled needs-rebase
               if (pr.mergeable === false || labels.includes('needs-rebase')) {
                 console.log(`#${prNumber} — has conflicts or needs-rebase, skipping`);
@@ -119,6 +113,13 @@ jobs:
                   ...context.repo,
                   issue_number: prNumber,
                   name: CONTRIBUTOR
+                }).catch(() => {});
+              }
+              if (labels.includes('closing-soon')) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: prNumber,
+                  name: 'closing-soon'
                 }).catch(() => {});
               }
               console.log(`#${prNumber} — all clear, set ${MAINTAINER}`);

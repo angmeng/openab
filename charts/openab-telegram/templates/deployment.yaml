@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openab-telegram.fullname" . }}
+  labels:
+    {{- include "openab-telegram.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "openab-telegram.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
+      labels:
+        {{- include "openab-telegram.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # --- OAB agent (main) ---
+        - name: openab
+          image: {{ include "openab-telegram.agentImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: HOME
+              value: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- range $k, $v := .Values.agent.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range .Values.agent.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openab
+              readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+
+        # --- Gateway (sidecar) ---
+        - name: gateway
+          image: {{ include "openab-telegram.gatewayImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: HOME
+              value: {{ .Values.agent.workingDir | default "/home/agent" }}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-telegram.secretName" . }}
+                  key: telegram-bot-token
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+
+        # --- Cloudflared tunnel (sidecar) ---
+        - name: cloudflared
+          image: {{ printf "%s:%s" .Values.cloudflared.image .Values.cloudflared.tag }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - tunnel
+            - --no-autoupdate
+            - run
+            - --token
+            - $(TUNNEL_TOKEN)
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-telegram.secretName" . }}
+                  key: cloudflare-tunnel-token
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openab-telegram.fullname" . }}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "openab-telegram.fullname" .) }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}

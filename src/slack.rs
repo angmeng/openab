@@ -1331,6 +1331,7 @@ async fn handle_message(
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
+    let mut failed_image_files: Vec<String> = Vec::new();
 
     if let Some(files) = files {
         for file in files {
@@ -1430,15 +1431,49 @@ async fn handle_message(
                     extra_blocks.push(block);
                 }
             } else if mimetype.starts_with("image/") {
-                if let Some(block) = media::download_and_encode_image(
+                match media::download_and_encode_image(
                     url,
                     Some(mimetype),
                     filename,
                     size,
                     Some(bot_token),
-                ).await {
-                    debug!(filename, "adding image attachment");
-                    extra_blocks.push(block);
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    // mimetype claimed image/* but media disagreed; nothing usable.
+                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                        warn!(filename, actual, limit, "image exceeds size limit");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(
+                        media::MediaFetchError::UnsupportedResponseType { .. }
+                        | media::MediaFetchError::InvalidImageBody { .. },
+                    ) => {
+                        warn!(
+                            filename,
+                            "image validation failed; server may have returned non-image content"
+                        );
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                        warn!(filename, error = %e, "image post-processing failed");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::HttpStatus(status))
+                        if status.is_client_error() =>
+                    {
+                        warn!(filename, %status, "image download denied");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(e) => {
+                        warn!(filename, error = %e, "image download failed");
+                        failed_image_files.push(filename.to_string());
+                    }
                 }
             } else {
                 // Fallback for unhandled file types (video, PDF, Office docs,
@@ -1478,6 +1513,31 @@ async fn handle_message(
                     }
                 }
             }
+        }
+    }
+
+    // Notify user if any images couldn't be processed.
+    if !failed_image_files.is_empty() {
+        let warn_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: channel_id.clone(),
+            thread_id: thread_ts.clone().or_else(|| Some(ts.clone())),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let file_list = failed_image_files
+            .iter()
+            .map(|n| sanitize_slack_filename(n))
+            .collect::<Vec<_>>()
+            .join("`, `");
+        let msg = format!(
+            ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
+             This can happen when the bot lacks the `files:read` OAuth scope, \
+             the file format isn't supported (PNG/JPEG/GIF/WebP only), \
+             or the file is too large."
+        );
+        if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
+            warn!(error = %e, "failed to send image validation warning to user");
         }
     }
 
@@ -1624,9 +1684,6 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
-/// Strip MIME parameters like `; charset=utf-8` so type-detection helpers see
-/// the bare media type. Slack occasionally sends mimetypes like
-/// `text/plain; charset=utf-8`; `media::is_text_file` expects the bare form.
 /// Format a byte count in a human-readable way (e.g. "2.2 MB", "456 KB").
 /// Used in the unhandled-file metadata block so the agent sees a friendly size.
 fn format_size_human(bytes: u64) -> String {
@@ -1646,8 +1703,24 @@ fn format_size_human(bytes: u64) -> String {
     }
 }
 
+/// Strip MIME parameters so type-detection helpers see the bare media type.
+/// Delegates to media::strip_mime_params (single source of truth).
+/// Needed because Slack occasionally sends `text/plain; charset=utf-8` and
+/// `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
-    mimetype.split(';').next().unwrap_or(mimetype).trim()
+    media::strip_mime_params(mimetype)
+}
+
+/// Sanitize a filename for safe embedding in a Slack mrkdwn message.
+///
+/// Ampersands (`&`), backticks (`` ` ``), and angle brackets (`<`, `>`) are escaped.
+/// `&` is encoded as `&amp;` first because Slack decodes HTML entities before parsing
+/// mrkdwn — a filename like `&lt;@here&gt;` would otherwise round-trip back to
+/// `<@here>` and trigger a mention ping. Backticks and angle brackets are Slack
+/// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
+/// as mentions or @-here pings.
+pub(crate) fn sanitize_slack_filename(s: &str) -> String {
+    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
 }
 
 /// Returns `true` if `text` contains a Slack user mention for `uid`.
@@ -1923,6 +1996,45 @@ mod tests {
             "permalink": "https://docs.google.com/...",
         });
         assert_eq!(slack_file_download_url(&file), "");
+    }
+
+    // --- sanitize_slack_filename tests ---
+
+    #[test]
+    fn sanitize_leaves_normal_filename_unchanged() {
+        assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
+        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
+    }
+
+    #[test]
+    fn sanitize_replaces_backtick() {
+        assert_eq!(sanitize_slack_filename("file`name.png"), "file'name.png");
+    }
+
+    #[test]
+    fn sanitize_replaces_angle_brackets() {
+        // Angle brackets are Slack mrkdwn delimiters; they must not pass through.
+        assert_eq!(sanitize_slack_filename("<@U123>"), "(@U123)");
+        assert_eq!(sanitize_slack_filename("<!here>"), "(!here)");
+    }
+
+    #[test]
+    fn sanitize_combined_injection_attempt() {
+        // A filename constructed to inject a Slack @here ping.
+        assert_eq!(
+            sanitize_slack_filename("`<!here>`"),
+            "'(!here)'"
+        );
+    }
+
+    #[test]
+    fn sanitize_escapes_ampersand_before_angle_brackets() {
+        // Slack mrkdwn decodes HTML entities before markup parsing.
+        // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
+        // ping if & is not escaped. The & must be escaped first so downstream
+        // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
+        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
+        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
     }
 
     // --- strip_mime_params tests ---

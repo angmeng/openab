@@ -1,8 +1,8 @@
 [package]
-name = "xai-proxy"
-version = "0.1.0"
+name = "openab-auth-proxy"
+version = "0.2.0"
 edition = "2021"
-description = "Lightweight xAI OAuth proxy sidecar — PKCE login via accounts.x.ai, forwards OpenAI-compatible requests to api.x.ai/v1"
+description = "Generic OAuth proxy sidecar — authenticates via OIDC/PKCE and forwards requests to any upstream API with Bearer token injection"
 
 [dependencies]
 tokio = { version = "1.44", features = ["full"] }
@@ -15,6 +15,7 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 base64 = "0.22"

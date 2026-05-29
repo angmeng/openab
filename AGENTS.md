@@ -75,7 +75,7 @@ Never leak `DISCORD_BOT_TOKEN` or other OAB credentials to the agent.
 
 ### 4. Dockerfile Discipline
 
-There are 7 Dockerfiles: `Dockerfile`, `Dockerfile.claude`, `Dockerfile.codex`, `Dockerfile.copilot`, `Dockerfile.cursor`, `Dockerfile.gemini`, `Dockerfile.opencode`.
+There are 11 Dockerfiles: `Dockerfile`, `Dockerfile.antigravity`, `Dockerfile.claude`, `Dockerfile.codex`, `Dockerfile.copilot`, `Dockerfile.cursor`, `Dockerfile.gemini`, `Dockerfile.grok`, `Dockerfile.hermes`, `Dockerfile.opencode`, `Dockerfile.pi`.
 
 A change to one MUST be evaluated against ALL. Common layers (base image, openab binary, tini) are shared — update all or explain why not.
 

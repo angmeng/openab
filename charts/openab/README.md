@@ -12,6 +12,8 @@ This page highlights commonly used values and deployment patterns. For the compl
 |-------|-------------|---------|
 | `nameOverride` | Override the chart name portion used in generated resource names. For per-agent resource names, use `agents.<name>.nameOverride`. | `""` |
 | `fullnameOverride` | Override the full generated release name for chart resources. Useful when deploying multiple instances with predictable names. | `""` |
+| `serviceAccountName` | Chart-global ServiceAccount name attached to every agent pod that doesn't define its own. Empty = cluster `default` SA. Per-agent `agents.<name>.serviceAccountName` fully overrides this. Chart references an existing SA only — does not create one. Required for workload identity and pod-level RBAC. | `""` |
+| `imagePullSecrets` | Chart-global image pull secrets attached to every agent pod that doesn't define its own. Per-agent `agents.<name>.imagePullSecrets` fully overrides this. | `[]` |
 
 ### Agent values
 
@@ -28,6 +30,7 @@ Each agent lives under `agents.<name>`.
 | `slack.enabled` | Enable the Slack adapter for the agent. | `false` |
 | `slack.botToken` | Slack Bot User OAuth token. | `""` |
 | `slack.appToken` | Slack App-Level token for Socket Mode. | `""` |
+| `slack.existingSecret` | Name of a pre-existing K8s Secret containing `slack-bot-token` and `slack-app-token`. When set, `botToken`/`appToken` above are ignored and the chart skips creating those keys. Enables External Secrets Operator / Vault / SealedSecrets workflows. | `""` |
 | `slack.allowedChannels` | Slack channel allowlist. Empty means allow all channels by default. | `[]` |
 | `slack.allowedUsers` | Slack user allowlist. Empty means allow all users by default. | `[]` |
 | `nameOverride` | Override this agent's generated resource name. | `""` |
@@ -50,6 +53,8 @@ Each agent lives under `agents.<name>`.
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |
 | `persistence.existingClaim` | Reuse an existing PVC instead of creating one. | `""` |
 | `agentsMd` | Contents of `AGENTS.md` mounted into the working directory. | `""` |
+| `serviceAccountName` | Per-agent ServiceAccount name. When set (non-empty), fully overrides chart-global `serviceAccountName`. Useful when only some agents need a dedicated SA. | `""` |
+| `imagePullSecrets` | Per-agent image pull secrets. When set, fully overrides chart-global `imagePullSecrets`. Useful when only some agents pull from a private registry. | `[]` |
 | `extraInitContainers` | Additional init containers for the agent pod. | `[]` |
 | `extraContainers` | Additional sidecar containers for the agent pod. | `[]` |
 | `extraVolumeMounts` | Additional volume mounts for the main agent container. | `[]` |

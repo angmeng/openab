@@ -1,7 +1,7 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
-use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
@@ -94,7 +94,10 @@ impl ChatAdapter for DiscordAdapter {
         let builder = serenity::builder::CreateMessage::new()
             .content(content)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
-        match ChannelId::new(ch_id).send_message(&self.http, builder).await {
+        match ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await
+        {
             Ok(msg) => Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: msg.id.to_string(),
@@ -110,7 +113,9 @@ impl ChatAdapter for DiscordAdapter {
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
-        self.http.delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None).await?;
+        self.http
+            .delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None)
+            .await?;
         Ok(())
     }
 
@@ -397,7 +402,25 @@ impl EventHandler for Handler {
                                 .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
                                 .await;
                             if participated {
-                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                // Dedup: skip if another bot already posted the same
+                                // warning in this thread. Prevents N duplicate warnings
+                                // when N bot processes each hit the soft limit. (#530)
+                                let recent = msg
+                                    .channel_id
+                                    .messages(
+                                        &ctx.http,
+                                        serenity::builder::GetMessages::new().limit(10),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
+                                let pairs: Vec<(bool, &str)> = recent
+                                    .iter()
+                                    .map(|m| (m.author.bot, m.content.as_str()))
+                                    .collect();
+                                let already_warned = turn_limit_warning_present(&pairs);
+                                if !already_warned {
+                                    let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                }
                             }
                         }
                         return;
@@ -424,10 +447,13 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned =
-            msg.mentions_user_id(bot_id) || msg.content.contains(&format!("<@{}>", bot_id))
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
             || (!self.allowed_role_ids.is_empty()
-                && msg.mention_roles.iter().any(|r| self.allowed_role_ids.contains(&r.get())));
+                && msg
+                    .mention_roles
+                    .iter()
+                    .any(|r| self.allowed_role_ids.contains(&r.get())));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -629,6 +655,7 @@ impl EventHandler for Handler {
             .member
             .as_ref()
             .and_then(|m| m.nick.as_ref())
+            .or(msg.author.global_name.as_ref())
             .unwrap_or(&msg.author.name);
         let sender = build_sender_context(
             &msg.author.id.to_string(),
@@ -646,6 +673,7 @@ impl EventHandler for Handler {
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -712,15 +740,31 @@ impl EventHandler for Handler {
                     extra_blocks.push(block);
                 }
             } else if mime.starts_with("image/") {
-                if let Some(block) = media::download_and_encode_image(
+                match media::download_and_encode_image(
                     &attachment.url,
                     attachment.content_type.as_deref(),
                     &attachment.filename,
                     u64::from(attachment.size),
                     None,
-                ).await {
-                    debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                    extra_blocks.push(block);
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(e) => {
+                        // mime claimed image/* but download/validation failed (oversized,
+                        // network, or content not actually an image). Record so the user
+                        // gets an "image failed" notice (upstream behaviour).
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image attachment failed"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                    }
                 }
             } else {
                 // Fallback for unhandled types (video, PDF, Office docs, archives, generic
@@ -782,6 +826,23 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        // Notify user if any images couldn't be processed.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| format!("`{}`", n.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warn_msg = format!(
+                ":warning: I couldn't process the image(s) you shared ({}). \
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                file_list
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                tracing::warn!(error = %e, "failed to send image warning to user");
+            }
+        }
 
         let trigger_msg = discord_msg_ref(&msg);
 
@@ -2015,7 +2076,9 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     let out = if allowed_role_ids.is_empty() {
         out
     } else {
-        allowed_role_ids.iter().fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
+        allowed_role_ids
+            .iter()
+            .fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
     };
     // 3. Other user mentions: keep <@UID> as-is so the LLM can mention back
     // 4. Fallback: replace remaining role mentions only (user mentions are preserved)
@@ -2175,10 +2238,26 @@ fn should_process_user_message(
     }
 }
 
+/// Returns true if any bot message in `messages` contains a turn limit warning.
+/// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
+/// Note: this is best-effort — a narrow race window exists where two bots fetch
+/// simultaneously and both see no warning, resulting in a duplicate. For most
+/// deployments this is acceptable; strict once-only semantics would require
+/// shared state (e.g. gateway-owned emission or distributed lock).
+///
+/// Accepts `(is_bot, content)` pairs so the logic can be unit-tested without
+/// constructing `serenity::model::channel::Message` values (see existing test
+/// boundary comment at `format_thread_export`).
+fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
+    messages
+        .iter()
+        .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
     // --- resolve_mentions tests ---
 
@@ -2962,5 +3041,29 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    // --- WarnAndStop dedup tests (#530) ---
+
+    #[test]
+    fn dedup_detects_existing_bot_warning() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(turn_limit_warning_present(&[(true, &msg)]));
+    }
+
+    #[test]
+    fn dedup_ignores_human_warning_text() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(!turn_limit_warning_present(&[(false, &msg)]));
+    }
+
+    #[test]
+    fn dedup_returns_false_when_no_warning() {
+        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+    }
+
+    #[test]
+    fn dedup_returns_false_for_empty_messages() {
+        assert!(!turn_limit_warning_present(&[]));
     }
 }

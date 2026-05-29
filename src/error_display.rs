@@ -50,8 +50,9 @@ pub fn format_user_error(message: &str) -> String {
 
 /// Format coded error from ACP agent for display in Discord.
 /// Used for response errors that have a JSON-RPC or HTTP status code.
+/// `data_message` is the optional detail extracted from `error.data.message`.
 /// Public for reuse by other adapters (e.g. Slack).
-pub fn format_coded_error(code: i64, message: &str) -> String {
+pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) -> String {
     let prefix = match code {
         400 => "**Bad Request**",
         401 => "**Unauthorized**",
@@ -70,11 +71,18 @@ pub fn format_coded_error(code: i64, message: &str) -> String {
         -32099..=-32000 => "**Server Error**",
         _ => "**Error**",
     };
-    if message.is_empty() {
+    let mut out = if message.is_empty() {
         format!("{} (code: {})", prefix, code)
     } else {
         format!("{} (code: {})\n{}", prefix, code, message)
+    };
+    if let Some(detail) = data_message {
+        if !detail.is_empty() && !message.contains(detail) {
+            out.push_str("\n> ");
+            out.push_str(detail);
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -166,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_401() {
-        let result = format_coded_error(401, "invalid token");
+        let result = format_coded_error(401, "invalid token", None);
         assert!(result.contains("Unauthorized"));
         assert!(result.contains("401"));
         assert!(result.contains("invalid token"));
@@ -174,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_429() {
-        let result = format_coded_error(429, "");
+        let result = format_coded_error(429, "", None);
         assert!(result.contains("Rate Limited"));
         assert!(result.contains("429"));
         assert!(!result.contains("\n")); // no message, no newline
@@ -182,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_503() {
-        let result = format_coded_error(503, "service unavailable");
+        let result = format_coded_error(503, "service unavailable", None);
         assert!(result.contains("Service Unavailable"));
         assert!(result.contains("503"));
         assert!(result.contains("service unavailable"));
@@ -190,30 +198,44 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_json_rpc() {
-        let result = format_coded_error(-32602, "missing required parameter");
+        let result = format_coded_error(-32602, "missing required parameter", None);
         assert!(result.contains("Invalid Params"));
         assert!(result.contains("-32602"));
     }
 
     #[test]
     fn test_format_coded_error_server_error_range() {
-        let result = format_coded_error(-32050, "internal failure");
+        let result = format_coded_error(-32050, "internal failure", None);
         assert!(result.contains("Server Error"));
         assert!(result.contains("-32050"));
     }
 
     #[test]
     fn test_format_coded_error_connection_error() {
-        let result = format_coded_error(-32000, "connection refused");
+        let result = format_coded_error(-32000, "connection refused", None);
         assert!(result.contains("Server Error")); // -32000 falls in -32099..=-32000 range
         assert!(result.contains("-32000"));
     }
 
     #[test]
     fn test_format_coded_error_unknown_code() {
-        let result = format_coded_error(999, "something happened");
+        let result = format_coded_error(999, "something happened", None);
         assert!(result.contains("Error"));
         assert!(result.contains("999"));
         assert!(result.contains("something happened"));
+    }
+
+    #[test]
+    fn test_format_coded_error_with_data_message() {
+        let result = format_coded_error(-32603, "Internal error", Some("model not supported"));
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("model not supported"));
+    }
+
+    #[test]
+    fn test_format_coded_error_data_message_not_duplicated() {
+        // If data_message is already in message, don't repeat it
+        let result = format_coded_error(-32603, "model not supported", Some("model not supported"));
+        assert_eq!(result.matches("model not supported").count(), 1);
     }
 }

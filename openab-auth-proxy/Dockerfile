@@ -6,6 +6,6 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/xai-proxy /usr/local/bin/
-ENTRYPOINT ["xai-proxy"]
+COPY --from=builder /app/target/release/openab-auth-proxy /usr/local/bin/
+ENTRYPOINT ["openab-auth-proxy"]
 CMD ["serve", "--bind", "0.0.0.0"]

@@ -1,0 +1,116 @@
+# openab-telegram values
+#
+# Install:
+#   helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
+#     --set telegramBotToken="123:ABC" \
+#     --set cloudflareTunnelToken="eyJ..." \
+#     --set platform.allowedUsers="{YOUR_TG_USER_ID}" \
+#     --namespace openab --create-namespace
+#
+# Required:
+#   telegramBotToken       -- Telegram bot token from @BotFather
+#   cloudflareTunnelToken   -- Cloudflare Tunnel token
+#
+# Recommended:
+#   platform.allowedUsers  -- Your Telegram user ID (message @userinfobot to find it)
+#
+# Optional:
+#   webhookDomain          -- your tunnel domain (for setWebhook reminder in NOTES.txt)
+
+# -- (required unless existingSecret is set) Telegram bot token
+telegramBotToken: ""
+
+# -- (required unless existingSecret is set) Cloudflare Tunnel token
+cloudflareTunnelToken: ""
+
+# -- (optional) Cloudflare API token for automated ingress configuration.
+# Required permissions: Account:Cloudflare Tunnel:Edit
+# If set, post-install NOTES provide a ready-to-run curl command for AI agents.
+cloudflareApiToken: ""
+
+# -- Use a pre-existing K8s Secret instead of creating one from --set values.
+# The Secret must contain keys: telegram-bot-token, cloudflare-tunnel-token
+# See README.md for credential management options.
+existingSecret: ""
+
+# -- Tunnel domain (shown in post-install notes for setWebhook)
+webhookDomain: ""
+
+# -- Release channel: "stable" or "beta"
+# Resolves to the floating image tag of the same name.
+# stable = ghcr.io/openabdev/openab:stable (latest stable release)
+# beta   = ghcr.io/openabdev/openab:beta (latest pre-release)
+channel: stable
+
+# -- OAB agent image
+image:
+  repository: ghcr.io/openabdev/openab
+  tag: ""  # defaults to appVersion
+  pullPolicy: IfNotPresent
+
+# -- Gateway image
+gateway:
+  image: ghcr.io/openabdev/openab-gateway
+  tag: "v0.5.1"
+
+# -- Cloudflared image
+cloudflared:
+  image: cloudflare/cloudflared
+  tag: "2026.5.0"
+
+# -- Agent configuration
+agent:
+  command: kiro-cli
+  args:
+    - acp
+    - --trust-all-tools
+  workingDir: /home/agent
+  env: {}
+  secretEnv: []
+  # -- Pool settings
+  pool:
+    maxSessions: 10
+    sessionTtlHours: 24
+  # -- Reaction settings
+  reactions:
+    enabled: true
+    removeAfterReply: false
+
+# -- Gateway platform settings
+platform:
+  # allowAllUsers: false = only users listed in allowedUsers can talk to the bot
+  # Set to true to allow any Telegram user (not recommended for production)
+  allowAllUsers: false
+  # Telegram user IDs allowed to interact with the bot.
+  # Find your ID by messaging @userinfobot on Telegram.
+  allowedUsers: []
+  allowAllChannels: true
+  allowedChannels: []
+
+# -- Persistence for agent working directory
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  size: 1Gi
+
+# -- Pod-level settings
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

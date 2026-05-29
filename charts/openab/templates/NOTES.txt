@@ -39,6 +39,10 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "opencode" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- opencode auth login
+{{- else if eq (toString $cfg.command) "pi-acp" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- pi
+    (Once inside the interactive interface, type `/login` to authenticate)
 {{- else if eq (toString $cfg.command) "cursor-agent" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login

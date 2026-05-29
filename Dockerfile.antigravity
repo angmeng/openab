@@ -1,0 +1,55 @@
+# --- Build openab ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Build agy-acp adapter ---
+FROM rust:1-bookworm AS adapter-builder
+WORKDIR /build
+COPY agy-acp/Cargo.toml ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY agy-acp/src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps tini unzip && rm -rf /var/lib/apt/lists/*
+
+# Install agy (Google Antigravity CLI)
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+      amd64) PLATFORM="linux_amd64" ;; \
+      arm64) PLATFORM="linux_arm64" ;; \
+      *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    MANIFEST_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${PLATFORM}.json" && \
+    DOWNLOAD_URL=$(curl -fsSL "$MANIFEST_URL" | grep -o '"url": *"[^"]*"' | cut -d'"' -f4) && \
+    curl -fsSL "$DOWNLOAD_URL" | tar -xz -C /usr/local/bin && \
+    mv /usr/local/bin/antigravity /usr/local/bin/agy && \
+    chmod +x /usr/local/bin/agy
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+COPY --from=adapter-builder --chown=agent:agent /build/target/release/agy-acp /usr/local/bin/agy-acp
+
+RUN mkdir -p /home/agent/.gemini && chown -R agent:agent /home/agent
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

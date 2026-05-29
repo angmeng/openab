@@ -121,6 +121,7 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
+    _stderr_handle: Option<JoinHandle<()>>,
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -246,6 +247,7 @@ pub(crate) async fn run_reader_loop<R, W>(
             error: Some(crate::acp::protocol::JsonRpcError {
                 code: -1,
                 message: "connection closed".into(),
+                data: None,
             }),
             params: None,
         });
@@ -386,6 +388,36 @@ impl AcpConnection {
         }
         let stdin = Arc::new(Mutex::new(stdin));
 
+        // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
+        // for logging; clients MAY capture or ignore it).
+        let stderr_handle = if let Some(stderr) = proc.stderr.take() {
+            let cmd_name = command.to_string();
+            Some(tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let sanitized: String = trimmed.chars()
+                                    .filter(|c| !c.is_control() || *c == '\t')
+                                    .collect();
+                                if !sanitized.is_empty() {
+                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
@@ -411,6 +443,7 @@ impl AcpConnection {
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
+            _stderr_handle: stderr_handle,
         })
     }
 
@@ -698,6 +731,9 @@ impl AcpConnection {
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
+        if let Some(handle) = self._stderr_handle.take() {
+            handle.abort();
+        }
         self.kill_process_group();
     }
 }

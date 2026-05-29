@@ -256,6 +256,44 @@ Agent: ✅ Written to cronjob.toml, takes effect within 1 minute
 
 This enables mobile-friendly schedule management — talk to your agent from your phone, and it updates the cron file for you.
 
+### Goal-Driven Auto-Disable
+
+Usercron jobs can stop themselves once a goal is complete. Add `disable_on_success` to run a command before the scheduled prompt is sent. The job is considered complete only when the command exits `0` **and** stdout or stderr contains `disable_on_success_match`.
+
+```toml
+[[jobs]]
+id = "fix-unit-tests"                       # required for scheduler writeback
+enabled = true
+schedule = "*/10 * * * *"
+channel = "1490282656913559673"
+message = "Unit tests are still failing. Continue fixing them and report progress."
+
+disable_on_success = "npm test && echo OPENAB_GOAL_SUCCESS"
+disable_on_success_match = "OPENAB_GOAL_SUCCESS"
+disable_on_success_timeout_secs = 120
+disable_on_success_working_dir = "/workspace/my-project"
+```
+
+Execution flow:
+
+1. The schedule matches.
+2. The scheduler runs `disable_on_success`.
+3. If the command exits `0` and output contains `disable_on_success_match`, OpenAB posts `✅ Goal achieved`, writes `enabled = false` back to `$HOME/.openab/cronjob.toml`, and skips the regular prompt.
+4. Otherwise, OpenAB sends the regular `message` and the agent continues working.
+
+`disable_on_success` is supported only in usercron `[[jobs]]`, not baseline `[[cron.jobs]]`. This keeps scheduler writeback limited to the user-managed cron file.
+
+### Re-enabling a Disabled Job
+
+Once a goal is achieved and the job is disabled, re-enable it by editing `$HOME/.openab/cronjob.toml`:
+
+```toml
+# Flip back to true to restart the job
+enabled = true
+```
+
+This can be done manually, or by asking the AI agent (e.g. "re-enable the fix-unit-tests cron job").
+
 ### Kubernetes Deployment
 
 Mount `cronjob.toml` on a PVC so it persists across pod restarts, and set `usercron_path` in your config.toml:
@@ -273,7 +311,7 @@ usercron_path = "cronjob.toml"
 - **Minute-aligned**: The scheduler aligns to minute boundaries (`:00`), so `0 9 * * *` fires at exactly 09:00:00, not at whatever second the process started.
 - **Overlap protection**: If a previous execution of the same job is still running, the next tick is skipped.
 - **Isolation**: Cron failures are logged but never block interactive chat traffic.
-- **Stateless**: No persistence needed. Schedules are re-evaluated from config on restart.
+- **Usercron persistence**: For usercron jobs, the scheduler may write `thread_id` and `enabled = false` back to `cronjob.toml`.
 - **Graceful shutdown**: In-flight cron tasks are waited on (up to 30 seconds) during shutdown.
 
 ## Sender Identity
@@ -320,3 +358,4 @@ See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the 
 | Channel not found | Bot not in channel | Invite the bot to the target channel |
 | Usercron not reloading | File not saved / wrong path | Check logs for `usercron file changed, reloading` |
 | Usercron parse error | Invalid TOML syntax | Check logs for `failed to parse usercron file` |
+| Goal job does not auto-disable | Command did not exit `0` or output did not include `disable_on_success_match` | Run the command manually and confirm both conditions |

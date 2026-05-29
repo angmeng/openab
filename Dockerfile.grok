@@ -13,7 +13,7 @@ FROM debian:bookworm-slim
 RUN useradd -m -u 1000 agent
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl procps ripgrep tini git && \
+      ca-certificates curl procps ripgrep tini git unzip && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Grok Build CLI — pinned version with SHA256 checksum verification.

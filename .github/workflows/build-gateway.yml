@@ -115,6 +115,7 @@ jobs:
           cd /tmp/digests
           docker buildx imagetools create \
             -t ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }} \
+            -t ${{ env.IMAGE_NAME }}:v${{ steps.tag.outputs.version }} \
             -t ${{ env.IMAGE_NAME }}:latest \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
 

@@ -250,6 +250,46 @@ codex exec --dangerously-bypass-approvals-and-sandbox ...
 
 Do not use this flag on an untrusted host.
 
+### `bubblewrap is unavailable: no system bwrap was found on PATH`
+
+Codex's Linux sandbox modes (read-only / workspace-write) rely on `bwrap`
+(bubblewrap) to create an inner sandbox. If the runtime image does not include
+bubblewrap, even basic commands like `pwd` or `ls` will fail before execution
+with this error.
+
+This commonly happens in OpenAB deployments where Codex already runs inside an
+isolated container or VM — the outer runtime provides the desired isolation, so
+the inner sandbox is redundant.
+
+**Solution — Disable Codex's inner sandbox** (recommended when the outer OpenAB
+runtime already provides isolation):
+
+```toml
+# /home/node/.codex/config.toml
+[sandbox]
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+```
+
+Or launch with:
+
+```bash
+codex --sandbox danger-full-access
+```
+
+Or via Helm:
+
+```bash
+helm install openab openab/openab \
+  --set-json 'agents.codex.extraConfig={"sandbox":{"sandbox_mode":"danger-full-access","approval_policy":"on-request"}}'
+```
+
+> **Important:** `danger-full-access` disables only Codex's *inner* sandbox. It
+> does **not** remove the outer OpenAB container/VM isolation. The agent remains
+> confined by the runtime's own security boundary. Ensure the outer runtime is a
+> non-privileged container (no `--privileged` flag or excessive capabilities) for
+> this security model to hold.
+
 ### Imagegen appears to hang
 
 Check whether an image was generated even if the CLI has not returned yet:

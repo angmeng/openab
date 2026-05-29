@@ -29,6 +29,14 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $svcAcct := default $.Values.serviceAccountName $cfg.serviceAccountName }}
+      {{- if $svcAcct }}
+      serviceAccountName: {{ $svcAcct }}
+      {{- end }}
+      {{- with (default $.Values.imagePullSecrets $cfg.imagePullSecrets) }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $cfg.extraInitContainers }}
       initContainers:
         {{- toYaml . | nindent 8 }}
@@ -49,18 +57,18 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: discord-bot-token
             {{- end }}
-            {{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+            {{- if and ($cfg.slack).enabled (or ($cfg.slack).botToken ($cfg.slack).existingSecret) }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openab.agentFullname" $d }}
+                  name: {{ include "openab.slackSecretName" $d }}
                   key: slack-bot-token
             {{- end }}
-            {{- if and ($cfg.slack).enabled ($cfg.slack).appToken }}
+            {{- if and ($cfg.slack).enabled (or ($cfg.slack).appToken ($cfg.slack).existingSecret) }}
             - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openab.agentFullname" $d }}
+                  name: {{ include "openab.slackSecretName" $d }}
                   key: slack-app-token
             {{- end }}
             {{- if and ($cfg.stt).enabled ($cfg.stt).apiKey }}

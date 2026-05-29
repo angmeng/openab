@@ -47,7 +47,7 @@ jobs:
               await github.rest.issues.createComment({
                 ...context.repo,
                 issue_number: pr.number,
-                body: `🔒 Auto-closing: this PR has had the \`${label}\` label for more than ${staleDays} days without a Discord Discussion URL being added.\n\nFeel free to reopen after adding the discussion link to the PR body.`
+                body: `🔒 Auto-closing: this PR has had the \`${label}\` label for more than ${staleDays} days without activity from the author.\n\nIf you'd like to continue working on this, feel free to reopen and leave a comment.`
               });
 
               await github.rest.pulls.update({

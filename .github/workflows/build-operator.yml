@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      no_cache:
+        description: 'Build without Docker layer cache'
+        required: false
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -74,6 +79,9 @@ jobs:
           - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
           - { suffix: "-hermes", dockerfile: "Dockerfile.hermes", artifact: "hermes" }
           - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
+          - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
+          - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
+          - { suffix: "-native", dockerfile: "Dockerfile.native", artifact: "native" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -106,8 +114,8 @@ jobs:
           file: ${{ matrix.variant.dockerfile }}
           platforms: ${{ matrix.platform.os }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
-          cache-from: type=gha,scope=${{ matrix.variant.suffix }}-${{ matrix.platform.os }}
-          cache-to: type=gha,scope=${{ matrix.variant.suffix }}-${{ matrix.platform.os }},mode=max
+          cache-from: ${{ inputs.no_cache != true && format('type=gha,scope={0}-{1}', matrix.variant.suffix, matrix.platform.os) || '' }}
+          cache-to: ${{ inputs.no_cache != true && format('type=gha,scope={0}-{1},mode=max', matrix.variant.suffix, matrix.platform.os) || '' }}
 
       - name: Export digest
         if: inputs.dry_run != true
@@ -139,6 +147,9 @@ jobs:
           - { suffix: "-cursor", artifact: "cursor" }
           - { suffix: "-hermes", artifact: "hermes" }
           - { suffix: "-grok", artifact: "grok" }
+          - { suffix: "-antigravity", artifact: "antigravity" }
+          - { suffix: "-pi", artifact: "pi" }
+          - { suffix: "-native", artifact: "native" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -167,6 +178,7 @@ jobs:
           tags: |
             type=sha,prefix=
             type=semver,pattern={{version}},value=${{ needs.resolve-tag.outputs.tag }}
+            type=raw,value=beta
 
       - name: Create manifest list
         working-directory: /tmp/digests
@@ -191,6 +203,8 @@ jobs:
           - { suffix: "-cursor" }
           - { suffix: "-hermes" }
           - { suffix: "-grok" }
+          - { suffix: "-antigravity" }
+          - { suffix: "-pi" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -237,11 +251,12 @@ jobs:
           CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
           MAJOR_MINOR="${CHART_VERSION%.*}"
 
-          echo "Promoting ${IMAGE}:${PRERELEASE_VERSION} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest"
+          echo "Promoting ${IMAGE}:${PRERELEASE_VERSION} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest, stable"
           docker buildx imagetools create \
             -t "${IMAGE}:${CHART_VERSION}" \
             -t "${IMAGE}:${MAJOR_MINOR}" \
             -t "${IMAGE}:latest" \
+            -t "${IMAGE}:stable" \
             "${IMAGE}:${PRERELEASE_VERSION}"
 
   # ── Chart release (runs after either path) ───────────────────

@@ -22,18 +22,16 @@ jobs:
       operator: ${{ steps.filter.outputs.operator }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            core:
-              - 'src/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-            gateway:
-              - 'gateway/**'
-            operator:
-              - 'operator/**'
+          fetch-depth: 0
+      - id: filter
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
+          echo "core=$(echo "$CHANGED" | grep -qE '^(src/|Cargo\.(toml|lock))' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "gateway=$(echo "$CHANGED" | grep -q '^gateway/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "operator=$(echo "$CHANGED" | grep -q '^operator/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   check:
     needs: changes

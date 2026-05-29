@@ -8,6 +8,7 @@ mod dispatch;
 mod error_display;
 mod format;
 mod gateway;
+mod hooks;
 mod markdown;
 mod media;
 mod reactions;
@@ -125,6 +126,16 @@ async fn main() -> anyhow::Result<()> {
             "no adapter configured — add [discord], [slack], and/or [gateway] to config.toml"
         );
     }
+
+    // Validate and run pre_boot hook (before agent pool creation)
+    if let Some(ref hook) = cfg.hooks.pre_boot {
+        hooks::validate_hook("pre_boot", hook)?;
+        hooks::run_hook("pre_boot", hook).await?;
+    }
+    if let Some(ref hook) = cfg.hooks.pre_shutdown {
+        hooks::validate_hook("pre_shutdown", hook)?;
+    }
+    let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
@@ -415,7 +426,8 @@ async fn main() -> anyhow::Result<()> {
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids = parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -539,6 +551,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;
+    // Run pre_shutdown hook after pool shutdown to guarantee no active sessions are writing.
+    if let Some(ref hook) = shutdown_hook {
+        if let Err(e) = hooks::run_hook("pre_shutdown", hook).await {
+            error!(error = %e, "pre_shutdown hook failed");
+        }
+    }
     info!("openab shut down");
     Ok(())
 }
