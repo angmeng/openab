@@ -25,6 +25,13 @@ const FILE_SEND_MARKER_SUFFIX: &str = ">>";
 /// Slack's own per-file limit is 1 GB by default; we cap at 100 MB.
 const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Marker syntax for owner-triggered Slack channel creation. DM-only: only
+/// honored when the agent's reply is going to a DM channel (id starts with 'D'),
+/// so channel/relay chatter can never trigger it.
+/// `<<openab-create-channel name=<slug> [private] [topic="…"] [invite=@U…,@U…]>>`
+const CREATE_CHANNEL_MARKER_PREFIX: &str = "<<openab-create-channel ";
+const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
+
 const SLACK_API: &str = "https://slack.com/api";
 
 /// Map Unicode emoji to Slack short names for reactions API.
@@ -530,6 +537,63 @@ impl SlackAdapter {
             message_id: ts,
         })
     }
+
+    /// Create a Slack channel, then optionally set its topic and invite users.
+    ///
+    /// Required bot scopes: `channels:manage` (public) or `groups:write`
+    /// (private); those also cover setTopic + invite. Returns the new channel id.
+    /// `api_post` already turns a non-`ok` Slack response into an `Err` carrying
+    /// the Slack error code (e.g. `name_taken`, `missing_scope`), so the caller's
+    /// error arm surfaces it to the owner.
+    async fn create_channel_in_slack(&self, spec: &CreateChannelSpec) -> Result<String> {
+        let create_resp = self
+            .api_post(
+                "conversations.create",
+                serde_json::json!({
+                    "name": spec.name,
+                    "is_private": spec.is_private,
+                }),
+            )
+            .await?;
+
+        let channel_id = create_resp["channel"]["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("conversations.create returned no channel id"))?
+            .to_string();
+
+        info!(
+            channel_id = %channel_id,
+            name = %spec.name,
+            is_private = spec.is_private,
+            "slack: channel created"
+        );
+
+        if let Some(topic) = &spec.topic {
+            if let Err(e) = self
+                .api_post(
+                    "conversations.setTopic",
+                    serde_json::json!({ "channel": channel_id, "topic": topic }),
+                )
+                .await
+            {
+                warn!(channel_id = %channel_id, error = %e, "slack: setTopic failed (channel still created)");
+            }
+        }
+
+        if !spec.invite.is_empty() {
+            if let Err(e) = self
+                .api_post(
+                    "conversations.invite",
+                    serde_json::json!({ "channel": channel_id, "users": spec.invite.join(",") }),
+                )
+                .await
+            {
+                warn!(channel_id = %channel_id, error = %e, "slack: invite failed (channel still created)");
+            }
+        }
+
+        Ok(channel_id)
+    }
 }
 
 /// Parse outbound text for file-send markers `<<openab-send-file PATH>>`.
@@ -579,6 +643,116 @@ fn extract_file_send_markers(content: &str) -> Option<(String, Vec<String>)> {
         return None;
     }
     Some((kept_lines.join("\n"), paths))
+}
+
+/// Spec parsed from an `<<openab-create-channel …>>` marker.
+struct CreateChannelSpec {
+    name: String,
+    is_private: bool,
+    topic: Option<String>,
+    invite: Vec<String>,
+}
+
+/// Parse outbound text for a single owner-triggered channel-create marker.
+/// Line-anchored like the file-send marker (must occupy its own trimmed line).
+/// Returns `Some((text_without_marker, spec))` for the FIRST valid marker line;
+/// later marker lines are left as literal text. `None` if no marker present or
+/// the marker has no usable `name=`.
+fn extract_create_channel_marker(content: &str) -> Option<(String, CreateChannelSpec)> {
+    if !content.contains(CREATE_CHANNEL_MARKER_PREFIX) {
+        return None;
+    }
+
+    let mut spec: Option<CreateChannelSpec> = None;
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if spec.is_none()
+            && trimmed.starts_with(CREATE_CHANNEL_MARKER_PREFIX)
+            && trimmed.ends_with(CREATE_CHANNEL_MARKER_SUFFIX)
+        {
+            let inner = trimmed[CREATE_CHANNEL_MARKER_PREFIX.len()
+                ..trimmed.len() - CREATE_CHANNEL_MARKER_SUFFIX.len()]
+                .trim();
+            if let Some(parsed) = parse_create_channel_args(inner) {
+                spec = Some(parsed);
+                continue; // strip the marker line from output
+            }
+            // invalid marker (no name) — drop the line so we don't leak it
+            continue;
+        }
+        kept_lines.push(line);
+    }
+
+    spec.map(|s| (kept_lines.join("\n"), s))
+}
+
+/// Parse the inner args of a create-channel marker. Grammar:
+///   name=<slug>            (required)
+///   private                (optional bare flag)
+///   topic="<free text>"    (optional, quoted — may contain spaces)
+///   invite=@U1,@U2,...     (optional, comma-separated Slack user IDs)
+fn parse_create_channel_args(inner: &str) -> Option<CreateChannelSpec> {
+    // Pull out topic="..." first (it may contain spaces), then parse the rest
+    // as whitespace-separated tokens.
+    let mut rest = inner.to_string();
+    let mut topic: Option<String> = None;
+    if let Some(start) = rest.find("topic=\"") {
+        let after = start + "topic=\"".len();
+        if let Some(end_rel) = rest[after..].find('"') {
+            let t = rest[after..after + end_rel].trim().to_string();
+            if !t.is_empty() {
+                topic = Some(t);
+            }
+            let end = after + end_rel + 1;
+            rest.replace_range(start..end, " ");
+        }
+    }
+
+    let mut name: Option<String> = None;
+    let mut is_private = false;
+    let mut invite: Vec<String> = Vec::new();
+
+    for tok in rest.split_whitespace() {
+        if tok == "private" {
+            is_private = true;
+        } else if let Some(v) = tok.strip_prefix("name=") {
+            let slug = normalize_channel_name(v);
+            if !slug.is_empty() {
+                name = Some(slug);
+            }
+        } else if let Some(v) = tok.strip_prefix("invite=") {
+            for id in v.split(',') {
+                let id = id.trim().trim_start_matches('@');
+                if !id.is_empty() {
+                    invite.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    name.map(|name| CreateChannelSpec {
+        name,
+        is_private,
+        topic,
+        invite,
+    })
+}
+
+/// Normalize a requested channel name to Slack's rules: lowercase, only
+/// `a-z0-9` plus hyphen/underscore, spaces/`.`/`/`→hyphen, ≤80 chars.
+fn normalize_channel_name(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c == ' ' || c == '.' || c == '/' {
+            out.push('-');
+        }
+        // drop anything else
+    }
+    out.trim_matches('-').chars().take(80).collect()
 }
 
 /// Pull the share message timestamp out of a `files.completeUploadExternal`
@@ -633,6 +807,42 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        // Owner-triggered channel creation (DM-only). Runs before the file-send
+        // check so the marker line is stripped regardless of outcome.
+        if let Some((residual, spec)) = extract_create_channel_marker(content) {
+            if !channel.channel_id.starts_with('D') {
+                // Not a DM — channel creation is owner-DM-only. Strip the marker,
+                // forward any residual text, and note it was ignored.
+                let trimmed = residual.trim();
+                let notice = if trimmed.is_empty() {
+                    "⚠️ channel creation is owner-DM-only; ignored here.".to_string()
+                } else {
+                    format!("{trimmed}\n\n⚠️ (channel-create marker ignored: DM-only)")
+                };
+                return self.send_plain_text(channel, &notice).await;
+            }
+            let confirmation = match self.create_channel_in_slack(&spec).await {
+                Ok(cid) => {
+                    let mut parts = vec![format!("✅ Created <#{cid}|{}>", spec.name)];
+                    if spec.topic.is_some() {
+                        parts.push("topic set".to_string());
+                    }
+                    if !spec.invite.is_empty() {
+                        parts.push(format!("invited {}", spec.invite.len()));
+                    }
+                    parts.join(" · ")
+                }
+                Err(e) => format!("⚠️ Failed to create channel `{}`: {}", spec.name, e),
+            };
+            let residual = residual.trim();
+            let body = if residual.is_empty() {
+                confirmation
+            } else {
+                format!("{residual}\n\n{confirmation}")
+            };
+            return self.send_plain_text(channel, &body).await;
+        }
+
         // Scan for file-send markers <<openab:send-file:PATH>>. If found, intercept:
         // upload each file via Slack's files API, then send the remaining text (with
         // markers stripped). Returns the MessageRef of the last action performed.
