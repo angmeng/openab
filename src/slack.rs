@@ -1431,6 +1431,29 @@ pub async fn run_slack_adapter(
                                                                     continue;
                                                                 }
                                                             }
+                                                            AllowUsers::OwnerOrMentions => {
+                                                                if !has_thread {
+                                                                    continue;
+                                                                }
+                                                                let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                let (involved, _) = adapter
+                                                                    .bot_participated_in_thread(channel_id, thread_ts)
+                                                                    .await;
+                                                                if !involved {
+                                                                    debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    continue;
+                                                                }
+                                                                // Only the owner (allowed_users) gets a tag-free reply
+                                                                // in a shared thread; everyone else must @mention.
+                                                                // Keeps owner conversation frictionless while other
+                                                                // humans in the thread can't pull the bot in unasked.
+                                                                let is_owner = event_user_id
+                                                                    .is_some_and(|u| allowed_users.contains(u));
+                                                                if !is_owner && !mentions_bot {
+                                                                    debug!(channel_id, thread_ts, "non-owner without @mention, ignoring");
+                                                                    continue;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1562,18 +1585,11 @@ async fn handle_message(
 
     // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead)
     if !is_bot_msg && !allow_all_users && !allowed_users.contains(&user_id) {
-        tracing::info!(user_id, "denied Slack user, ignoring");
-        let msg_ref = MessageRef {
-            channel: ChannelRef {
-                platform: "slack".into(),
-                channel_id: channel_id.clone(),
-                thread_id: thread_ts.clone(),
-                parent_id: None,
-                origin_event_id: None,
-            },
-            message_id: ts.clone(),
-        };
-        let _ = adapter.add_reaction(&msg_ref, "🚫").await;
+        // 2026-06-03 (洺哥): silently ignore denied users — no 🚫 reaction. The
+        // reaction marked non-allowlisted senders in shared channels, but it
+        // surfaces the bot's presence to people it won't talk to, which reads as
+        // rude. Log-only denial is quieter; the user simply gets no response.
+        tracing::info!(user_id, "denied Slack user, ignoring (no reaction)");
         return;
     }
 

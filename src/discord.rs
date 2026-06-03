@@ -649,6 +649,29 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
+                AllowUsers::OwnerOrMentions => {
+                    // Mirrors Slack: in a thread the bot is involved in, only the
+                    // owner (allowed_users) gets a tag-free reply; other humans
+                    // must @mention. We're already inside `!is_mentioned`, so a
+                    // non-owner here has not mentioned the bot — ignore them.
+                    if !in_thread {
+                        return;
+                    }
+                    let (involved, _) = if bot_owns_thread {
+                        (true, false)
+                    } else {
+                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await
+                    };
+                    if !involved {
+                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        return;
+                    }
+                    if !self.allowed_users.contains(&msg.author.id.get()) {
+                        tracing::debug!(channel_id = %msg.channel_id, "non-owner without @mention, ignoring");
+                        return;
+                    }
+                }
             }
         }
 
@@ -2267,6 +2290,12 @@ fn should_process_user_message(
             }
             !other_bot_present
         }
+        // This pure helper models the mention/involvement dimension only; it has
+        // no sender/owner input. OwnerOrMentions additionally requires the sender
+        // to be an allowed user when not mentioned — that owner check is enforced
+        // at the real call site (EventHandler::message), not here. The
+        // involvement precondition it CAN model mirrors Involved.
+        AllowUsers::OwnerOrMentions => in_thread && involved,
     }
 }
 

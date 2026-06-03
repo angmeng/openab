@@ -255,12 +255,18 @@ fn default_max_batch_tokens() -> usize {
 /// - `Mentions`: always require @mention, even in threads the bot is participating in.
 /// - `MultibotMentions`: same as `Involved` in single-bot threads; falls back to `Mentions`
 ///   when other bots have also posted in the thread.
+/// - `OwnerOrMentions`: in threads the bot has participated in, respond only when the
+///   sender is an allowed user (owner) OR the message @mentions the bot. Other humans
+///   in the thread are ignored unless they @mention. Solves multi-human threads where
+///   `Involved`/`MultibotMentions` would reply to everyone (those gate on other *bots*,
+///   not other humans). 2026-06-03.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AllowUsers {
     #[default]
     Involved,
     Mentions,
     MultibotMentions,
+    OwnerOrMentions,
 }
 
 impl<'de> Deserialize<'de> for AllowUsers {
@@ -270,9 +276,10 @@ impl<'de> Deserialize<'de> for AllowUsers {
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
+            "owner_or_mentions" => Ok(Self::OwnerOrMentions),
             other => Err(serde::de::Error::unknown_variant(
                 other,
-                &["involved", "mentions", "multibot-mentions"],
+                &["involved", "mentions", "multibot-mentions", "owner-or-mentions"],
             )),
         }
     }
