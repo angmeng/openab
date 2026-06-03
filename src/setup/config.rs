@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_config_contains_sections() {
+    fn generate_config_contains_sections() {
         let config = generate_config(
             "my_token",
             "claude",
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_config_kiro_working_dir() {
+    fn generate_config_kiro_working_dir() {
         let config = generate_config("tok", "kiro", vec!["ch".to_string()], "/home/agent", 10, 24);
         assert!(config.contains(r#"working_dir = "/home/agent""#));
         assert!(config.contains("acp"));

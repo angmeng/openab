@@ -2,7 +2,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -42,12 +44,19 @@ struct SessionStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSession {
     conversation_id: Option<String>,
+    #[serde(default)]
+    prev_line_count: usize,
+    /// Hash of the last line at prev_line_count boundary; detects same-length rewrites.
+    #[serde(default)]
+    prev_last_line_hash: u64,
 }
 
 struct Session {
     conversation_id: Option<String>,
-    /// Full stdout from the previous turn for prefix-checked delta extraction
-    prev_output: String,
+    /// Number of lines already delivered to the caller; used for delta extraction.
+    prev_line_count: usize,
+    /// Hash of the last line at prev_line_count boundary.
+    prev_last_line_hash: u64,
 }
 
 struct Adapter {
@@ -80,6 +89,7 @@ impl Adapter {
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .ok()?;
         lock_file.lock_exclusive().ok()?;
@@ -100,18 +110,18 @@ impl Adapter {
         self.load_store_inner()
     }
 
-    /// Persist session store with exclusive lock and atomic write.
-    /// Try to restore conversation_id from persisted state.
-    fn restore_session(&self, session_id: &str) -> Option<String> {
+    /// Try to restore conversation_id, prev_line_count, and prev_last_line_hash from persisted state.
+    fn restore_session(&self, session_id: &str) -> Option<(String, usize, u64)> {
         let store = self.load_store();
-        store
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.conversation_id.clone())
+        store.sessions.get(session_id).and_then(|s| {
+            s.conversation_id
+                .clone()
+                .map(|cid| (cid, s.prev_line_count, s.prev_last_line_hash))
+        })
     }
 
     /// Persist a session binding (read-modify-write under single lock).
-    fn persist_session(&self, session_id: &str, conversation_id: Option<&str>) {
+    fn persist_session(&self, session_id: &str, conversation_id: Option<&str>, prev_line_count: usize, prev_last_line_hash: u64) {
         let Some(_lock) = self.lock_state_file() else {
             return;
         };
@@ -120,6 +130,8 @@ impl Adapter {
             session_id.to_string(),
             StoredSession {
                 conversation_id: conversation_id.map(String::from),
+                prev_line_count,
+                prev_last_line_hash,
             },
         );
         let tmp = self.state_file.with_extension("tmp");
@@ -163,18 +175,79 @@ impl Adapter {
         Some(created.remove(0).clone())
     }
 
-    fn extract_delta(prev_output: &str, full_text: &str, conversation_bound: bool) -> String {
-        if !conversation_bound || prev_output.is_empty() {
-            return full_text.to_string();
+    fn line_hash(line: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        line.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn extract_delta(full_text: &str, prev_line_count: usize, prev_last_line_hash: u64, conversation_bound: bool) -> (String, usize, u64) {
+        let lines: Vec<&str> = full_text.lines().collect();
+        let total = lines.len();
+        let last_hash = lines.last().map(|l| Self::line_hash(l)).unwrap_or(0);
+        if !conversation_bound || prev_line_count == 0 {
+            return (full_text.to_string(), total, last_hash);
         }
-        if let Some(delta) = full_text.strip_prefix(prev_output) {
-            return delta.trim_start_matches('\n').to_string();
+        if total < prev_line_count {
+            eprintln!(
+                "[agy-acp] WARN: agy stdout has fewer lines than expected ({total} < {prev_line_count}); \
+                 sending full output and resetting delta baseline"
+            );
+            return (full_text.to_string(), total, last_hash);
         }
-        eprintln!(
-            "[agy-acp] WARN: agy stdout was not append-only; \
-             sending full output and resetting delta baseline"
+        // Verify the boundary line hash to detect same-length rewrites
+        if total == prev_line_count {
+            if prev_last_line_hash != 0 && last_hash != prev_last_line_hash {
+                eprintln!(
+                    "[agy-acp] WARN: agy stdout has same line count but different content; \
+                     sending full output"
+                );
+                return (full_text.to_string(), total, last_hash);
+            }
+            // Same count, same hash — genuinely no new content
+            return (String::new(), total, last_hash);
+        }
+        // Verify that the line at prev boundary still matches
+        if prev_line_count > 0 && prev_last_line_hash != 0 {
+            let boundary_hash = Self::line_hash(lines[prev_line_count - 1]);
+            if boundary_hash != prev_last_line_hash {
+                eprintln!(
+                    "[agy-acp] WARN: agy stdout content changed at boundary; \
+                     sending full output and resetting delta baseline"
+                );
+                return (full_text.to_string(), total, last_hash);
+            }
+        }
+        let delta = lines[prev_line_count..].join("\n");
+        (delta, total, last_hash)
+    }
+
+    fn evict_if_needed(&mut self) {
+        const MAX_SESSIONS: usize = 64;
+        while self.sessions.len() >= MAX_SESSIONS {
+            if let Some(key) = self.sessions.keys().next().cloned() {
+                self.sessions.remove(&key);
+            }
+        }
+    }
+
+    fn restore_session_state(&mut self, session_id: &str) -> bool {
+        let Some((conversation_id, prev_line_count, prev_last_line_hash)) = self.restore_session(session_id) else {
+            return false;
+        };
+        // Evict only after confirming the restore target exists
+        if !self.sessions.contains_key(session_id) {
+            self.evict_if_needed();
+        }
+        self.sessions.insert(
+            session_id.to_string(),
+            Session {
+                conversation_id: Some(conversation_id),
+                prev_line_count,
+                prev_last_line_hash,
+            },
         );
-        full_text.to_string()
+        true
     }
 
     fn handle_initialize(&self, id: u64) -> JsonRpcResponse {
@@ -184,7 +257,7 @@ impl Adapter {
             result: Some(json!({
                 "protocolVersion": 1,
                 "agentInfo": { "name": "agy", "version": env!("CARGO_PKG_VERSION") },
-                "agentCapabilities": { "streaming": true, "loadSession": false },
+                "agentCapabilities": { "streaming": true, "loadSession": true },
             })),
             error: None,
         }
@@ -192,20 +265,14 @@ impl Adapter {
 
     fn handle_session_new(&mut self, id: u64) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
-        // Evict an arbitrary session if at capacity (prevent unbounded growth)
-        const MAX_SESSIONS: usize = 64;
-        while self.sessions.len() >= MAX_SESSIONS {
-            if let Some(key) = self.sessions.keys().next().cloned() {
-                self.sessions.remove(&key);
-            }
-        }
-        // Try to restore from persisted state (relevant if client reuses session IDs)
+        self.evict_if_needed();
         let conversation_id = None;
         self.sessions.insert(
             session_id.clone(),
             Session {
                 conversation_id,
-                prev_output: String::new(),
+                prev_line_count: 0,
+                prev_last_line_hash: 0,
             },
         );
         JsonRpcResponse {
@@ -213,6 +280,41 @@ impl Adapter {
             id,
             result: Some(json!({ "sessionId": session_id })),
             error: None,
+        }
+    }
+
+    fn handle_session_load(&mut self, id: u64, params: &Value) -> JsonRpcResponse {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if session_id.is_empty() {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(json!({"code":-32602,"message":"missing sessionId"})),
+            };
+        }
+
+        if self.restore_session_state(session_id) {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({ "sessionId": session_id })),
+                error: None,
+            };
+        }
+
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(json!({
+                "code": -32000,
+                "message": format!("unknown sessionId: {session_id}"),
+            })),
         }
     }
 
@@ -224,15 +326,7 @@ impl Adapter {
 
         // Restore evicted session from state file if needed
         if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
-            if let Some(conv_id) = self.restore_session(session_id) {
-                self.sessions.insert(
-                    session_id.to_string(),
-                    Session {
-                        conversation_id: Some(conv_id),
-                        prev_output: String::new(),
-                    },
-                );
-            }
+            let _ = self.restore_session_state(session_id);
         }
 
         let prompt_text = params
@@ -315,44 +409,51 @@ impl Adapter {
 
                 let full_text = String::from_utf8_lossy(&output.stdout).to_string();
 
-                let prev_output = self
+                let prev_line_count = self
                     .sessions
                     .get(session_id)
-                    .map(|s| s.prev_output.as_str())
-                    .unwrap_or("");
+                    .map(|s| s.prev_line_count)
+                    .unwrap_or(0);
+                let prev_last_line_hash = self
+                    .sessions
+                    .get(session_id)
+                    .map(|s| s.prev_last_line_hash)
+                    .unwrap_or(0);
                 let conversation_bound = self
                     .sessions
                     .get(session_id)
                     .map(|s| s.conversation_id.is_some())
                     .unwrap_or(false);
-                let new_text = Self::extract_delta(prev_output, &full_text, conversation_bound);
+                let (new_text, total_lines, last_hash) = Self::extract_delta(&full_text, prev_line_count, prev_last_line_hash, conversation_bound);
 
                 // Bind conversation from snapshot diff
                 let conv_id = snapshot
                     .as_ref()
                     .and_then(|before| self.new_conversation_id(before));
 
-                let mut persist_conv_id: Option<String> = None;
+                let mut should_persist = false;
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     let newly_bound = session.conversation_id.is_none() && conv_id.is_some();
                     if session.conversation_id.is_none() {
                         session.conversation_id = conv_id.clone();
                     }
                     if session.conversation_id.is_some() {
-                        session.prev_output = full_text;
-                        if newly_bound {
-                            persist_conv_id = session.conversation_id.clone();
-                        }
+                        session.prev_line_count = total_lines;
+                        session.prev_last_line_hash = last_hash;
+                        should_persist = true;
                     } else {
-                        session.prev_output.clear();
+                        session.prev_line_count = 0;
+                        session.prev_last_line_hash = 0;
                         eprintln!(
                             "[agy-acp] WARN: could not bind conversation ID; \
                              running in single-turn mode"
                         );
                     }
+                    let _ = newly_bound; // persist regardless — line count changed
                 }
-                if let Some(ref cid) = persist_conv_id {
-                    self.persist_session(session_id, Some(cid.as_str()));
+                if should_persist {
+                    let cid = self.sessions.get(session_id).and_then(|s| s.conversation_id.clone());
+                    self.persist_session(session_id, cid.as_deref(), total_lines, last_hash);
                 }
 
                 let notification = serde_json::to_string(&JsonRpcNotification {
@@ -429,6 +530,10 @@ async fn main() {
             Some("session/new") => {
                 vec![serde_json::to_string(&adapter.handle_session_new(id)).unwrap()]
             }
+            Some("session/load") => {
+                let params = req.params.unwrap_or(json!({}));
+                vec![serde_json::to_string(&adapter.handle_session_load(id, &params)).unwrap()]
+            }
             Some("session/prompt") => {
                 let params = req.params.unwrap_or(json!({}));
                 adapter.handle_session_prompt(id, &params).await
@@ -469,27 +574,139 @@ mod tests {
 
     #[test]
     fn test_extract_delta_returns_full_text_when_unbound() {
-        let result = Adapter::extract_delta("old", "oldnew", false);
-        assert_eq!(result, "oldnew");
+        let (result, count, _hash) = Adapter::extract_delta("old\nnew", 1, 0, false);
+        assert_eq!(result, "old\nnew");
+        assert_eq!(count, 2);
     }
 
     #[test]
-    fn test_extract_delta_strips_prefix_when_bound() {
-        let result =
-            Adapter::extract_delta("first response\n", "first response\nsecond response", true);
+    fn test_extract_delta_skips_previous_lines_when_bound() {
+        let (result, count, _hash) =
+            Adapter::extract_delta("first response\nsecond response", 1, 0, true);
         assert_eq!(result, "second response");
+        assert_eq!(count, 2);
     }
 
     #[test]
-    fn test_extract_delta_returns_full_when_not_append_only() {
-        let result = Adapter::extract_delta("old response", "fresh response", true);
-        assert_eq!(result, "fresh response");
+    fn test_extract_delta_returns_full_when_fewer_lines_than_expected() {
+        let (result, count, _hash) = Adapter::extract_delta("short", 5, 0, true);
+        assert_eq!(result, "short");
+        assert_eq!(count, 1);
     }
 
     #[test]
-    fn test_extract_delta_preserves_leading_spaces() {
-        let result = Adapter::extract_delta("hello\n", "hello\n  indented code", true);
+    fn test_extract_delta_preserves_indentation() {
+        let (result, count, _hash) = Adapter::extract_delta("hello\n  indented code", 1, 0, true);
         assert_eq!(result, "  indented code");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_extract_delta_detects_same_length_rewrite() {
+        let original = "line one\nline two";
+        let (_result, _count, hash) = Adapter::extract_delta(original, 0, 0, false);
+        // Now simulate same line count but different content
+        let rewritten = "line one\nline CHANGED";
+        let (result, count, _new_hash) = Adapter::extract_delta(rewritten, 2, hash, true);
+        // Should detect mismatch and send full output
+        assert_eq!(result, rewritten);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_extract_delta_boundary_hash_mismatch_sends_full() {
+        let original = "aaa\nbbb\nccc";
+        // Simulate: prev_line_count=2, hash of line "bbb" (the boundary)
+        let boundary_hash = Adapter::line_hash("bbb");
+        // Now content changed at boundary
+        let modified = "aaa\nXXX\nccc\nnew line";
+        let (result, count, _hash) = Adapter::extract_delta(modified, 2, boundary_hash, true);
+        // Should detect boundary mismatch and send full
+        assert_eq!(result, modified);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn test_initialize_advertises_load_session_support() {
+        let adapter = Adapter::new();
+        let response = adapter.handle_initialize(1);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|r| r.get("agentCapabilities"))
+                .and_then(|c| c.get("loadSession"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[ignore] // filesystem I/O — run with CHI_INTEG=1
+    fn test_session_load_restores_persisted_session() {
+        let root = std::env::temp_dir().join(format!("agy-acp-load-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+
+        let mut adapter = Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"),
+            state_file: root.join("sessions.json"),
+        };
+        adapter.persist_session("sess-1", Some("conv-abc"), 10, 12345);
+
+        let response = adapter.handle_session_load(7, &json!({"sessionId": "sess-1"}));
+        assert!(response.error.is_none());
+        assert_eq!(
+            adapter
+                .sessions
+                .get("sess-1")
+                .and_then(|s| s.conversation_id.as_deref()),
+            Some("conv-abc")
+        );
+        assert_eq!(
+            adapter
+                .sessions
+                .get("sess-1")
+                .map(|s| s.prev_line_count),
+            Some(10)
+        );
+        assert_eq!(
+            adapter
+                .sessions
+                .get("sess-1")
+                .map(|s| s.prev_last_line_hash),
+            Some(12345)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore] // filesystem I/O — run with CHI_INTEG=1
+    fn test_session_load_rejects_unknown_session() {
+        let root = std::env::temp_dir().join(format!("agy-acp-missing-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+
+        let mut adapter = Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"),
+            state_file: root.join("sessions.json"),
+        };
+
+        let response = adapter.handle_session_load(9, &json!({"sessionId": "missing"}));
+        assert!(response.result.is_none());
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str()),
+            Some("unknown sessionId: missing")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -552,9 +769,9 @@ mod tests {
             state_file: root.join("sessions.json"),
         };
 
-        adapter.persist_session("sess-1", Some("conv-abc"));
+        adapter.persist_session("sess-1", Some("conv-abc"), 7, 99999);
         let restored = adapter.restore_session("sess-1");
-        assert_eq!(restored, Some("conv-abc".to_string()));
+        assert_eq!(restored, Some(("conv-abc".to_string(), 7, 99999)));
 
         let missing = adapter.restore_session("sess-unknown");
         assert_eq!(missing, None);

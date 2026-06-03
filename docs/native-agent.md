@@ -86,10 +86,70 @@ Place an `AGENTS.md` file in the working directory (`cwd`). It will be prepended
 ├── .openab/
 │   └── agent/
 │       └── auth.json
+│   └── skills/      ← skill directories
+│       └── my-skill/
+│           └── SKILL.md
 └── (your project files)
 ```
 
-> **Note:** Skills and MCP servers are NOT supported yet. Only `AGENTS.md` at `cwd` is read. Skills and MCP support are planned for v0.2.
+## Skills
+
+openab-agent supports on-demand skills following the [Agent Skills standard](https://agentskills.io). Skills are directories containing a `SKILL.md` with YAML frontmatter.
+
+### Skill Locations
+
+Scanned in order (first occurrence of a name wins):
+
+1. `<working_dir>/.openab/skills/` — project-local skills
+2. `~/.openab/agent/skills/` — global skills
+
+### SKILL.md Format
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it
+---
+
+# Instructions
+
+Steps the agent should follow when using this skill.
+```
+
+### How It Works
+
+1. At session start, openab-agent scans skill directories
+2. Skill names and descriptions are injected into the system prompt
+3. When a task matches, the agent uses `read` to load the full SKILL.md
+4. The agent follows the instructions using its built-in tools (bash, read, write, edit)
+
+### Example
+
+```
+.openab/skills/
+└── brave-search/
+    ├── SKILL.md
+    └── search.sh
+```
+
+```markdown
+---
+name: brave-search
+description: Web search via Brave Search API. Use when the user needs current information from the web.
+---
+
+# Brave Search
+
+## Usage
+
+\`\`\`bash
+./search.sh "query"
+\`\`\`
+```
+
+### Compatibility
+
+Skills written for Pi (`~/.pi/agent/skills/`) or Claude Code (`~/.claude/skills/`) use the same SKILL.md format. Copy or symlink them into `~/.openab/agent/skills/` to reuse.
 
 ## Docker
 

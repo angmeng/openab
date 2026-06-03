@@ -86,6 +86,12 @@ Supported authentication methods:
 | ChatGPT Plus/Pro | OAuth via `pi /login` | ChatGPT subscription |
 | Any API key provider | `env = { OPENAI_API_KEY = "..." }` | Pay-per-token |
 
+## Local OpenAI-Compatible Vision Models
+
+OpenAB can pass inbound image attachments to Pi as ACP image content blocks, but Pi must also select a model declared as image-capable. For custom OpenAI-compatible providers, add `input: ["text", "image"]` to the model entry in `~/.pi/agent/models.json`.
+
+See [Local OpenAI-Compatible Vision Models](local-vision-models.md#pi-configuration) for the `llama-server` setup, `models.json` example, and local vision pitfalls.
+
 ## Steering Files
 
 Pi reads steering files in this order:

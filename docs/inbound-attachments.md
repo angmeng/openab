@@ -38,6 +38,10 @@ User sends media (photo/voice/file)
 4. Stored to `~/.openab/media/inbound/<uuid>`
 5. Core reads bytes → `ContentBlock::Image` → sent to LLM
 
+### Downstream Image Requirements
+
+OpenAB can create the ACP image block, but downstream coding agents and selected models must also support image input. For local `llama.cpp` examples, see [Local OpenAI-Compatible Vision Models](local-vision-models.md).
+
 ### Audio / Voice Messages
 
 1. Gateway downloads raw audio (ogg/m4a/mp3)
@@ -93,6 +97,7 @@ No additional configuration required. The filesystem store is always active when
 
 ## Related
 
+- [Local OpenAI-Compatible Vision Models](local-vision-models.md) — Local vision model setup for Pi and OpenCode
 - [Telegram](telegram.md) — Telegram-specific behavior and limitations
 - [Feishu](feishu.md) — Feishu image/file/audio handling
 - [Google Chat](google-chat.md) — Google Chat attachment support

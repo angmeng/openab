@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod auth;
 mod llm;
+mod skills;
 mod tools;
 
 use clap::{Parser, Subcommand};

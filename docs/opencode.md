@@ -82,6 +82,12 @@ To list all available models across configured providers:
 kubectl exec deployment/openab-opencode -- opencode models
 ```
 
+## Local OpenAI-Compatible Vision Models
+
+OpenAB can pass inbound image attachments to OpenCode as ACP image content blocks, but OpenCode must also select a model whose metadata declares image input support. For custom providers, that means `modalities.input: ["text", "image"]` in `opencode.json`.
+
+See [Local OpenAI-Compatible Vision Models](local-vision-models.md#opencode-configuration) for the `llama-server` setup, `opencode.json` example, and local vision pitfalls.
+
 ## Example: Ollama Cloud with gemini-3-flash-preview
 
 ### 1. Authenticate Ollama Cloud

@@ -47,14 +47,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_bot_token_ok() {
+    fn validate_bot_token_ok() {
         assert!(validate_bot_token("simple_token").is_ok());
         assert!(validate_bot_token("token.with-dashes_123").is_ok());
         assert!(validate_bot_token("***/efgh").is_ok());
     }
 
     #[test]
-    fn test_validate_bot_token_reject_invalid() {
+    fn validate_bot_token_reject_invalid() {
         assert!(validate_bot_token("").is_err());
         assert!(validate_bot_token("token\nnewline").is_err());
         assert!(validate_bot_token("token\ttab").is_err());
@@ -62,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_agent_command() {
+    fn validate_agent_command_known_and_unknown() {
         for agent in &["kiro", "claude", "codex", "gemini"] {
             assert!(validate_agent_command(agent).is_ok());
         }
@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_channel_id() {
+    fn validate_channel_id_accepts_numeric_rejects_invalid() {
         assert!(validate_channel_id("1492329565824094370").is_ok());
         assert!(validate_channel_id("").is_err());
         assert!(validate_channel_id("abc123").is_err());

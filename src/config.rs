@@ -205,6 +205,10 @@ pub struct DiscordConfig {
     /// the allowlist filters further. Empty = allow any bot (mode permitting).
     /// Only relevant when `allow_bot_messages` is `"mentions"` or `"all"`;
     /// ignored when `"off"` since all bot messages are rejected before this check.
+    ///
+    /// **Admission override**: a trusted bot that explicitly @mentions this bot
+    /// bypasses the `allow_bot_messages` mode entirely (treated as human @mention).
+    /// This allows trusted bots to pull this bot into threads regardless of mode.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
     #[serde(default)]

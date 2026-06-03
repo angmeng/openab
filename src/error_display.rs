@@ -92,78 +92,78 @@ mod tests {
     // ─── format_user_error tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_format_user_error_timeout() {
+    fn format_user_error_timeout() {
         let result = format_user_error("timeout waiting for session/new response");
         assert!(result.contains("Request Timeout"));
         assert!(result.contains("session/new"));
     }
 
     #[test]
-    fn test_format_user_error_connection_closed() {
+    fn format_user_error_connection_closed() {
         let result = format_user_error("connection closed");
         assert!(result.contains("Connection Lost"));
     }
 
     #[test]
-    fn test_format_user_error_channel_closed() {
+    fn format_user_error_channel_closed() {
         let result = format_user_error("channel closed");
         assert!(result.contains("Connection Lost"));
     }
 
     #[test]
-    fn test_format_user_error_failed_to_spawn() {
+    fn format_user_error_failed_to_spawn() {
         let result = format_user_error("failed to spawn /some/path: No such file");
         assert!(result.contains("Agent Not Found"));
         assert!(result.contains("the agent")); // generic, no provider name
     }
 
     #[test]
-    fn test_format_user_error_no_such_file() {
+    fn format_user_error_no_such_file() {
         let result = format_user_error("binary /usr/bin/nonexistent: no such file");
         assert!(result.contains("Agent Not Found"));
     }
 
     #[test]
-    fn test_format_user_error_pool_exhausted() {
+    fn format_user_error_pool_exhausted() {
         let result = format_user_error("pool exhausted (5 sessions)");
         assert!(result.contains("Service Busy"));
     }
 
     #[test]
-    fn test_format_user_error_invalid_api_key() {
+    fn format_user_error_invalid_api_key() {
         let result = format_user_error("invalid api key");
         assert!(result.contains("Unauthorized"));
     }
 
     #[test]
-    fn test_format_user_error_unauthorized() {
+    fn format_user_error_unauthorized() {
         let result = format_user_error("unauthorized: token rejected");
         assert!(result.contains("Unauthorized"));
     }
 
     #[test]
-    fn test_format_user_error_unknown() {
+    fn format_user_error_unknown() {
         let result = format_user_error("something went wrong");
         assert!(result.contains("Error"));
         assert!(result.contains("something went wrong"));
     }
 
     #[test]
-    fn test_format_user_error_empty() {
+    fn format_user_error_empty() {
         let result = format_user_error("");
         assert!(result.contains("Error"));
         assert!(result.contains("unknown"));
     }
 
     #[test]
-    fn test_format_user_error_case_insensitive() {
+    fn format_user_error_case_insensitive() {
         assert!(format_user_error("TIMEOUT WAITING FOR foo").contains("Timeout"));
         assert!(format_user_error("CONNECTION CLOSED").contains("Connection"));
         assert!(format_user_error("POOL EXHAUSTED").contains("Busy"));
     }
 
     #[test]
-    fn test_format_user_error_mixed_case_timeout() {
+    fn format_user_error_mixed_case_timeout() {
         // Case-insensitive matching should still extract method correctly
         let result = format_user_error("Timeout Waiting For custom/method");
         assert!(result.contains("Request Timeout"));
@@ -173,7 +173,7 @@ mod tests {
     // ─── format_coded_error tests ───────────────────────────────────────────
 
     #[test]
-    fn test_format_coded_error_401() {
+    fn format_coded_error_401() {
         let result = format_coded_error(401, "invalid token", None);
         assert!(result.contains("Unauthorized"));
         assert!(result.contains("401"));
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_coded_error_429() {
+    fn format_coded_error_429() {
         let result = format_coded_error(429, "", None);
         assert!(result.contains("Rate Limited"));
         assert!(result.contains("429"));
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_coded_error_503() {
+    fn format_coded_error_503() {
         let result = format_coded_error(503, "service unavailable", None);
         assert!(result.contains("Service Unavailable"));
         assert!(result.contains("503"));
@@ -197,28 +197,28 @@ mod tests {
     }
 
     #[test]
-    fn test_format_coded_error_json_rpc() {
+    fn format_coded_error_json_rpc() {
         let result = format_coded_error(-32602, "missing required parameter", None);
         assert!(result.contains("Invalid Params"));
         assert!(result.contains("-32602"));
     }
 
     #[test]
-    fn test_format_coded_error_server_error_range() {
+    fn format_coded_error_server_error_range() {
         let result = format_coded_error(-32050, "internal failure", None);
         assert!(result.contains("Server Error"));
         assert!(result.contains("-32050"));
     }
 
     #[test]
-    fn test_format_coded_error_connection_error() {
+    fn format_coded_error_connection_error() {
         let result = format_coded_error(-32000, "connection refused", None);
         assert!(result.contains("Server Error")); // -32000 falls in -32099..=-32000 range
         assert!(result.contains("-32000"));
     }
 
     #[test]
-    fn test_format_coded_error_unknown_code() {
+    fn format_coded_error_unknown_code() {
         let result = format_coded_error(999, "something happened", None);
         assert!(result.contains("Error"));
         assert!(result.contains("999"));
@@ -226,14 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn test_format_coded_error_with_data_message() {
+    fn format_coded_error_with_data_message() {
         let result = format_coded_error(-32603, "Internal error", Some("model not supported"));
         assert!(result.contains("Internal Error"));
         assert!(result.contains("model not supported"));
     }
 
     #[test]
-    fn test_format_coded_error_data_message_not_duplicated() {
+    fn format_coded_error_data_message_not_duplicated() {
         // If data_message is already in message, don't repeat it
         let result = format_coded_error(-32603, "model not supported", Some("model not supported"));
         assert_eq!(result.matches("model not supported").count(), 1);

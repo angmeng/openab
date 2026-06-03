@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
+use crate::skills;
 use crate::tools;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
@@ -55,20 +56,22 @@ impl Agent {
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
     fn build_system_prompt(working_dir: &str) -> String {
-        let agents_md = std::path::Path::new(working_dir).join("AGENTS.md");
+        let wd = std::path::Path::new(working_dir);
+        let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
-        if custom.is_empty() {
+
+        let base = if custom.is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
-            format!(
-                "{}
+            format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
+        };
 
----
-
-{}",
-                custom.trim(),
-                SYSTEM_PROMPT
-            )
+        let discovered = skills::discover_skills(wd);
+        if discovered.is_empty() {
+            base
+        } else {
+            info!("loaded {} skill(s)", discovered.len());
+            format!("{}{}", base, skills::format_skills_prompt(&discovered))
         }
     }
 

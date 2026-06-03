@@ -134,6 +134,8 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 
 Empty (default) = any bot can pass through (subject to the mode check).
 
+**Admission override:** A trusted bot that explicitly @mentions this bot bypasses the `allow_bot_messages` mode entirely — the mention is treated the same as a human @mention. This allows trusted bots to pull this bot into threads even when `allow_bot_messages = "off"`. Messages from trusted bots *without* @mention still follow normal gating.
+
 ### `allowed_role_ids`
 
 Role IDs that trigger the bot, same as a direct @mention. This enables users to invoke multiple bots simultaneously with a single role mention (e.g. `@AllBots review this`).
@@ -274,7 +276,33 @@ helm install openab openab/openab \
 ### Known limitations
 
 - **One thread per message:** when you @mention both bots in a single message, only the first bot creates a thread. The second bot's thread creation fails and the message is dropped. Workaround: @mention each bot in separate messages.
-- **Thread ownership:** a bot only responds in threads it owns or has participated in (`involved` mode). To have Bot B respond in Bot A's thread, use `mentions` mode and explicitly @mention Bot B.
+- **Thread ownership (involvement gate):** a bot only responds in threads it owns or has participated in. See the Involvement Gate section below for full details.
+
+### Involvement Gate
+
+In a multi-bot setup, every bot enforces an **involvement gate** before processing any message in a thread. This gate is evaluated before `allow_user_messages` or `allow_bot_messages` mode checks.
+
+**Rule:** A bot must be **involved** (thread owner or has previously replied) before it will process any message in that thread.
+
+**Key constraint:** Only a human @mention — or a @mention from a bot in `trusted_bot_ids` — can pull a bot into a thread for the first time. A @mention from an untrusted bot will be **silently dropped**.
+
+```
+Bot A's thread (Bot B not yet involved, Bot A NOT in Bot B's trusted_bot_ids):
+
+  Bot A: "@Bot_B please review this"     → ❌ dropped (Bot B not involved, Bot A untrusted)
+  Human: "@Bot_B please review this"     → ✅ Bot B replies, now involved
+  Bot A: "@Bot_B any updates?"           → ✅ processed (Bot B is involved)
+
+Bot A's thread (Bot B not yet involved, Bot A IS in Bot B's trusted_bot_ids):
+
+  Bot A: "@Bot_B please review this"     → ✅ treated as human @mention, Bot B becomes involved
+```
+
+**Why:** This prevents untrusted bots from pulling other bots into arbitrary threads without human consent, protects session pool resources, and eliminates cross-thread chain reactions. Trusted bots are explicitly authorized by the admin.
+
+**Workaround (without trusted_bot_ids):** Pre-involve all needed bots at thread creation by @mentioning them (or using a shared role via `allowed_role_ids`).
+
+> 📖 Full design details: [docs/messaging.md — Involvement Gate](messaging.md#involvement-gate)
 
 ### Recommended: `multibot-mentions` mode
 

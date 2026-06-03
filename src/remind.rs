@@ -211,83 +211,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_delay_minutes() {
+    fn parse_delay_minutes() {
         assert_eq!(parse_delay("5m").unwrap(), 300);
         assert_eq!(parse_delay("1m").unwrap(), 60);
     }
 
     #[test]
-    fn test_parse_delay_hours() {
+    fn parse_delay_hours() {
         assert_eq!(parse_delay("2h").unwrap(), 7200);
     }
 
     #[test]
-    fn test_parse_delay_days() {
+    fn parse_delay_days() {
         assert_eq!(parse_delay("1d").unwrap(), 86400);
         assert_eq!(parse_delay("30d").unwrap(), 2_592_000);
     }
 
     #[test]
-    fn test_parse_delay_combined() {
+    fn parse_delay_combined() {
         assert_eq!(parse_delay("1h30m").unwrap(), 5400);
         assert_eq!(parse_delay("1d12h").unwrap(), 129_600);
     }
 
     #[test]
-    fn test_parse_delay_bare_number_defaults_to_minutes() {
+    fn parse_delay_bare_number_defaults_to_minutes() {
         assert_eq!(parse_delay("10").unwrap(), 600);
     }
 
     #[test]
-    fn test_parse_delay_too_short() {
+    fn parse_delay_too_short() {
         assert!(parse_delay("0m").is_err());
         assert!(parse_delay("0h").is_err());
     }
 
     #[test]
-    fn test_parse_delay_too_long() {
+    fn parse_delay_too_long() {
         assert!(parse_delay("31d").is_err());
     }
 
     #[test]
-    fn test_format_delay() {
+    fn format_delay_basic() {
         assert_eq!(format_delay(3600), "1h");
         assert_eq!(format_delay(5400), "1h 30m");
         assert_eq!(format_delay(90000), "1d 1h");
     }
 
     #[test]
-    fn test_parse_delay_empty() {
+    fn parse_delay_empty() {
         assert!(parse_delay("").is_err());
         assert!(parse_delay("   ").is_err());
     }
 
     #[test]
-    fn test_parse_delay_invalid_unit() {
+    fn parse_delay_invalid_unit() {
         assert!(parse_delay("2x").is_err());
         assert!(parse_delay("abc").is_err());
         assert!(parse_delay("5s").is_err());
     }
 
     #[test]
-    fn test_parse_delay_case_insensitive() {
+    fn parse_delay_case_insensitive() {
         assert_eq!(parse_delay("2H").unwrap(), 7200);
         assert_eq!(parse_delay("1D30M").unwrap(), 88200);
     }
 
     #[test]
-    fn test_parse_delay_whitespace_trimmed() {
+    fn parse_delay_whitespace_trimmed() {
         assert_eq!(parse_delay(" 5m ").unwrap(), 300);
     }
 
     #[test]
-    fn test_parse_delay_bare_number_boundary() {
+    fn parse_delay_bare_number_boundary() {
         assert_eq!(parse_delay("1").unwrap(), 60); // 1 min
         assert_eq!(parse_delay("30").unwrap(), 1800); // 30 min
     }
 
     #[test]
-    fn test_parse_delay_exact_boundaries() {
+    fn parse_delay_exact_boundaries() {
         // Exactly 1m (minimum)
         assert_eq!(parse_delay("1m").unwrap(), 60);
         // Exactly 30d (maximum)
@@ -297,19 +297,19 @@ mod tests {
     }
 
     #[test]
-    fn test_format_delay_zero() {
+    fn format_delay_zero() {
         assert_eq!(format_delay(0), "< 1m");
     }
 
     #[test]
-    fn test_format_delay_pure_units() {
+    fn format_delay_pure_units() {
         assert_eq!(format_delay(86400), "1d");
         assert_eq!(format_delay(120), "2m");
         assert_eq!(format_delay(7200), "2h");
     }
 
     #[tokio::test]
-    async fn test_reminder_store_add_remove() {
+    async fn reminder_store_add_remove() {
         let dir = std::env::temp_dir().join(format!("remind_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("reminders.json");
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reminder_store_persists_across_reload() {
+    async fn reminder_store_persists_across_reload() {
         let dir = std::env::temp_dir().join(format!("remind_test2_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("reminders.json");
@@ -369,31 +369,31 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_message_strips_everyone_here() {
+    fn sanitize_message_strips_everyone_here() {
         assert_eq!(sanitize_message("hello @everyone"), "hello @\u{200b}everyone");
         assert_eq!(sanitize_message("hey @here check"), "hey @\u{200b}here check");
         assert_eq!(sanitize_message("@everyone @here"), "@\u{200b}everyone @\u{200b}here");
     }
 
     #[test]
-    fn test_sanitize_message_no_change() {
+    fn sanitize_message_no_change() {
         assert_eq!(sanitize_message("normal message"), "normal message");
         assert_eq!(sanitize_message("<@123> hello"), "<@123> hello");
     }
 
     #[test]
-    fn test_validate_message_ok() {
+    fn validate_message_ok() {
         assert!(validate_message("short message").is_ok());
         assert!(validate_message(&"a".repeat(1800)).is_ok());
     }
 
     #[test]
-    fn test_validate_message_too_long() {
+    fn validate_message_too_long() {
         assert!(validate_message(&"a".repeat(1801)).is_err());
     }
 
     #[test]
-    fn test_max_targets_constant() {
+    fn max_targets_constant() {
         assert_eq!(MAX_TARGETS, 10);
     }
 }

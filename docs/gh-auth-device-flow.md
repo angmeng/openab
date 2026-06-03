@@ -65,6 +65,43 @@ How it works:
 gh auth status
 ```
 
+## Enable raw `git` operations
+
+`gh auth status` only proves that GitHub CLI can call the GitHub API. It does
+not guarantee that raw Git commands can clone or fetch private repositories.
+Many coding agents call `git clone`, `git fetch`, or `git ls-remote` directly.
+In a headless pod, raw Git cannot prompt for a username/password, so private
+repo access can fail with:
+
+```text
+fatal: could not read Username for 'https://github.com': No such device or address
+```
+
+After `gh auth login` succeeds, wire Git to use the GitHub CLI credential
+helper:
+
+```bash
+gh auth setup-git --hostname github.com
+```
+
+Then verify both layers:
+
+```bash
+gh auth status --hostname github.com
+git config --global --get-all credential.https://github.com.helper
+git ls-remote https://github.com/OWNER/PRIVATE_REPO HEAD
+```
+
+Expected signal:
+
+- `gh auth status` shows an active GitHub account.
+- `git config` includes `gh auth git-credential`.
+- `git ls-remote` returns a commit hash for `HEAD`.
+
+If `gh auth status` passes but `git ls-remote` fails, run
+`gh auth setup-git --hostname github.com` again. This is especially important
+for Codex/ACP review workflows that need to fetch private forks or branches.
+
 ## Steering / prompt snippet (Kiro CLI only)
 
 > **Note:** This section applies only to [Kiro CLI](https://kiro.dev) agents. Other agent backends (Claude Code, Codex, Gemini) have their own prompt/config mechanisms.
