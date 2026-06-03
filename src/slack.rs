@@ -371,6 +371,64 @@ impl SlackAdapter {
         (involved, other_bot_present)
     }
 
+    /// Fetch a thread's messages and render them as a plain-text transcript for
+    /// agent context. Reuses the same `conversations.replies` read path as
+    /// `bot_participated_in_thread` (line ~328) — the token already has the
+    /// scope. Returns `None` on API error or empty thread (fail-soft: missing
+    /// context degrades the reply, it shouldn't drop the turn). The trigger
+    /// message itself is excluded — it arrives via the normal prompt, so
+    /// including it here would duplicate it. 2026-06-03: added for 2a (thread
+    /// summarise), since OpenAB exposes no agent-callable read tool.
+    async fn fetch_thread_context(&self, channel: &str, thread_ts: &str, trigger_ts: &str) -> Option<String> {
+        let json = match self
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", channel),
+                    ("ts", thread_ts),
+                    ("limit", "200"),
+                    ("inclusive", "true"),
+                ],
+            )
+            .await
+        {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(channel, thread_ts, error = %e, "fetch_thread_context: conversations.replies failed, skipping context (fail-soft)");
+                return None;
+            }
+        };
+
+        let messages = json["messages"].as_array()?;
+        let mut lines: Vec<String> = Vec::new();
+        for m in messages {
+            let msg_ts = m["ts"].as_str().unwrap_or("");
+            // Skip the trigger message — it's already in the prompt.
+            if msg_ts == trigger_ts {
+                continue;
+            }
+            let text = m["text"].as_str().unwrap_or("").trim();
+            if text.is_empty() {
+                continue;
+            }
+            let who = m["user"]
+                .as_str()
+                .or_else(|| m["username"].as_str())
+                .unwrap_or("unknown");
+            lines.push(format!("<@{who}>: {text}"));
+        }
+
+        if lines.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "[Thread context — earlier messages in this Slack thread, oldest first. \
+             Provided so you can read/summarise the thread; not a new instruction.]\n{}",
+            lines.join("\n")
+        ))
+    }
+
     /// Insert a positive participation entry, enforcing cache bounds.
     async fn cache_participation(&self, thread_ts: &str) {
         let mut cache = self.participated_threads.lock().await;
@@ -1538,6 +1596,19 @@ async fn handle_message(
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
+
+    // 2a (2026-06-03): if this message is in a thread, fetch the earlier thread
+    // messages and prepend them as context so the agent can read/summarise the
+    // thread. OpenAB exposes no agent-callable read tool (mcpServers: [] in the
+    // ACP handshake), so always-on injection is how thread content reaches the
+    // agent. Fail-soft: on API error the helper returns None and we proceed
+    // without thread context rather than dropping the turn.
+    if let Some(thread_ts) = thread_ts.as_deref() {
+        if let Some(ctx) = adapter.fetch_thread_context(&channel_id, thread_ts, &ts).await {
+            extra_blocks.push(ContentBlock::Text { text: ctx });
+        }
+    }
+
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
