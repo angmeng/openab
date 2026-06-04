@@ -204,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             s.allow_bot_messages,
             s.streaming,
             s.trusted_bot_ids.iter().cloned().collect(),
+            s.allowed_channels.iter().cloned().collect(),
         ))
     });
 
@@ -295,7 +296,6 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
-                slack_cfg.allowed_channels.into_iter().collect(),
                 slack_cfg.allowed_users.into_iter().collect(),
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),

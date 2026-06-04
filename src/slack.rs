@@ -103,6 +103,14 @@ pub struct SlackAdapter {
     /// each potentially containing the file-send marker. Without dedup we'd
     /// re-upload the same file dozens of times. Cleared once per session restart.
     file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
+    /// Channel allowlist (from `[slack].allowed_channels`), shared mutable so a
+    /// channel the bot CREATES (via the `<<openab-create-channel>>` marker) can
+    /// be added at runtime — otherwise the bot is deaf in its own ticket channels
+    /// until the next restart (observed 2026-06-04: @mention in a freshly-created
+    /// `at-2043-…` channel was dropped at the gate). The event loop reads a
+    /// snapshot per message; `create_channel_in_slack` inserts after a successful
+    /// create. `allow_all_channels` (separate flag) still bypasses this entirely.
+    allowed_channels: Arc<tokio::sync::RwLock<HashSet<String>>>,
 }
 
 impl SlackAdapter {
@@ -112,6 +120,7 @@ impl SlackAdapter {
         _allow_bot_messages: AllowBots,
         streaming: bool,
         trusted_bot_ids: HashSet<String>,
+        allowed_channels: HashSet<String>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -125,6 +134,7 @@ impl SlackAdapter {
             streaming,
             trusted_bot_ids,
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
+            allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
         }
     }
 
@@ -626,6 +636,18 @@ impl SlackAdapter {
             "slack: channel created"
         );
 
+        // Self-heal the allowlist: a channel the bot just created must be
+        // listenable immediately, or @mentions in it are dropped at the gate
+        // until the next restart (2026-06-04 fix). `allow_all_channels` makes
+        // the gate a no-op, so this is only meaningful when the allowlist is
+        // actually enforced — inserting unconditionally is still harmless.
+        {
+            let mut allowed = self.allowed_channels.write().await;
+            if allowed.insert(channel_id.clone()) {
+                info!(channel_id = %channel_id, "slack: added created channel to runtime allowlist");
+            }
+        }
+
         if let Some(topic) = &spec.topic {
             if let Err(e) = self
                 .api_post(
@@ -1112,7 +1134,6 @@ pub async fn run_slack_adapter(
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
-    allowed_channels: HashSet<String>,
     allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
@@ -1212,7 +1233,11 @@ pub async fn run_slack_adapter(
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
-                                                let allowed_channels = allowed_channels.clone();
+                                                // Snapshot the (runtime-mutable) allowlist per message. Cheap —
+                                                // a handful of channel IDs — and avoids holding the lock across
+                                                // handle_message's awaits. Picks up channels the bot just created.
+                                                let allowed_channels =
+                                                    adapter.allowed_channels.read().await.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
@@ -1301,7 +1326,7 @@ pub async fn run_slack_adapter(
                                                                     TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
                                                                 }
                                                                 let channel_allowed = allow_all_channels
-                                                                    || allowed_channels.contains(channel_id);
+                                                                    || adapter.allowed_channels.read().await.contains(channel_id);
                                                                 if !is_own_bot_msg && channel_allowed {
                                                                     let warn_channel = ChannelRef {
                                                                         platform: "slack".into(),
@@ -1464,7 +1489,11 @@ pub async fn run_slack_adapter(
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
-                                                let allowed_channels = allowed_channels.clone();
+                                                // Snapshot the (runtime-mutable) allowlist per message. Cheap —
+                                                // a handful of channel IDs — and avoids holding the lock across
+                                                // handle_message's awaits. Picks up channels the bot just created.
+                                                let allowed_channels =
+                                                    adapter.allowed_channels.read().await.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
@@ -2396,7 +2425,7 @@ mod tests {
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, HashSet::new());
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, HashSet::new(), HashSet::new());
 
         assert!(
             adapter.use_streaming(false),
@@ -2414,7 +2443,7 @@ mod tests {
     fn streaming_config_master_switch_off() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, HashSet::new());
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, HashSet::new(), HashSet::new());
 
         assert!(!adapter.use_streaming(false), "streaming=false must win even with no other bot");
         assert!(!adapter.use_streaming(true));
@@ -2429,7 +2458,7 @@ mod tests {
         let ttl = std::time::Duration::from_secs(300);
         let trusted = HashSet::from(["U0B6FQF0GTD".to_string()]);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, trusted);
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, trusted, HashSet::new());
 
         assert!(
             !adapter.use_streaming(false),
