@@ -111,6 +111,10 @@ pub struct SlackAdapter {
     /// snapshot per message; `create_channel_in_slack` inserts after a successful
     /// create. `allow_all_channels` (separate flag) still bypasses this entirely.
     allowed_channels: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Path to the on-disk config file, so runtime allowlist additions (a channel
+    /// the bot is invited into, or creates) can be PERSISTED — otherwise they're
+    /// lost on restart. None when the config came from a URL (can't write back).
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl SlackAdapter {
@@ -121,6 +125,7 @@ impl SlackAdapter {
         streaming: bool,
         trusted_bot_ids: HashSet<String>,
         allowed_channels: HashSet<String>,
+        config_path: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -135,6 +140,34 @@ impl SlackAdapter {
             trusted_bot_ids,
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
             allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
+            config_path,
+        }
+    }
+
+    /// Add a channel to the runtime allowlist AND persist it to the on-disk
+    /// config so it survives a restart. Idempotent. The runtime add is the part
+    /// that matters for *this* process (the gate reads it next message);
+    /// persistence is best-effort — if the config write fails (URL config, perms,
+    /// unexpected format) we log and keep the runtime add, never block listening.
+    /// `reason` is for the log line ("created" | "invited").
+    async fn allow_channel_now(&self, channel_id: &str, reason: &str) {
+        let newly_added = {
+            let mut allowed = self.allowed_channels.write().await;
+            allowed.insert(channel_id.to_string())
+        };
+        if newly_added {
+            info!(channel_id, reason, "slack: added channel to runtime allowlist");
+        }
+        if let Some(path) = &self.config_path {
+            match crate::config::persist_allowed_channel(path, channel_id) {
+                Ok(true) => info!(channel_id, "slack: persisted channel to config allowlist"),
+                Ok(false) => {} // already in config
+                Err(e) => warn!(
+                    channel_id, error = %e,
+                    "slack: could not persist channel to config (runtime add still active; \
+                     add it to [slack].allowed_channels by hand to survive restart)"
+                ),
+            }
         }
     }
 
@@ -638,15 +671,11 @@ impl SlackAdapter {
 
         // Self-heal the allowlist: a channel the bot just created must be
         // listenable immediately, or @mentions in it are dropped at the gate
-        // until the next restart (2026-06-04 fix). `allow_all_channels` makes
-        // the gate a no-op, so this is only meaningful when the allowlist is
-        // actually enforced — inserting unconditionally is still harmless.
-        {
-            let mut allowed = self.allowed_channels.write().await;
-            if allowed.insert(channel_id.clone()) {
-                info!(channel_id = %channel_id, "slack: added created channel to runtime allowlist");
-            }
-        }
+        // until the next restart (2026-06-04 fix). Runtime add + persist to
+        // config so it also survives a restart. `allow_all_channels` makes the
+        // gate a no-op, so this only matters when the allowlist is enforced —
+        // adding unconditionally is harmless.
+        self.allow_channel_now(&channel_id, "created").await;
 
         if let Some(topic) = &spec.topic {
             if let Err(e) = self
@@ -1283,6 +1312,20 @@ pub async fn run_slack_adapter(
                                                     text = msg_text,
                                                     "message event received"
                                                 );
+
+                                                // Bot invited into an existing channel: Slack emits a
+                                                // `channel_join` message whose `user` is the joiner. When that's
+                                                // the bot itself, self-heal the allowlist (runtime + persist) so
+                                                // the bot can hear that channel without a manual config edit +
+                                                // restart (2026-06-04 — symmetric with the create-channel path).
+                                                // Still falls through to skip_subtype below (no agent dispatch for
+                                                // a join notice).
+                                                if subtype == "channel_join"
+                                                    && bot_uid_opt.as_deref().is_some()
+                                                    && event_user_id == bot_uid_opt.as_deref()
+                                                {
+                                                    adapter.allow_channel_now(channel_id, "invited").await;
+                                                }
 
                                                 // Skip non-message subtypes
                                                 let skip_subtype = matches!(subtype,
@@ -2425,7 +2468,7 @@ mod tests {
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, HashSet::new(), HashSet::new());
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, HashSet::new(), HashSet::new(), None);
 
         assert!(
             adapter.use_streaming(false),
@@ -2443,7 +2486,7 @@ mod tests {
     fn streaming_config_master_switch_off() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, HashSet::new(), HashSet::new());
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, HashSet::new(), HashSet::new(), None);
 
         assert!(!adapter.use_streaming(false), "streaming=false must win even with no other bot");
         assert!(!adapter.use_streaming(true));
@@ -2458,7 +2501,7 @@ mod tests {
         let ttl = std::time::Duration::from_secs(300);
         let trusted = HashSet::from(["U0B6FQF0GTD".to_string()]);
         let adapter =
-            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, trusted, HashSet::new());
+            SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, trusted, HashSet::new(), None);
 
         assert!(
             !adapter.use_streaming(false),

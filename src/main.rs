@@ -197,6 +197,15 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
         });
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
+    // Local config path (for persisting runtime allowlist additions). None when
+    // the config came from a URL — can't write back to a remote.
+    let slack_config_path: Option<PathBuf> = if config_source.starts_with("http://")
+        || config_source.starts_with("https://")
+    {
+        None
+    } else {
+        Some(PathBuf::from(&config_source))
+    };
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
             s.bot_token.clone(),
@@ -205,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
             s.streaming,
             s.trusted_bot_ids.iter().cloned().collect(),
             s.allowed_channels.iter().cloned().collect(),
+            slack_config_path.clone(),
         ))
     });
 
