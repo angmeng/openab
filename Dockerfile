@@ -4,7 +4,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+# touch ALL sources (not just main.rs): COPY sets a fixed mtime, so cargo's
+# mtime fingerprint skipped recompiling non-main modules and reused the dummy-
+# build artifact (a relay-less binary slipped through this way 2026-06-06).
+RUN find src -name '*.rs' -exec touch {} + && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim

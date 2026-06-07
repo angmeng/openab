@@ -1,0 +1,13 @@
+# Binary-swap build: compile a fresh openab and drop it into the existing
+# openab:a-relay image (which already has gh + kiro-cli). Avoids re-running the
+# apt/gh-cli install step (which hit a transient GPG signature error 2026-06-07).
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+# touch ALL sources so cargo's mtime fingerprint recompiles every module.
+RUN find src -name '*.rs' -exec touch {} + && cargo build --release
+
+FROM openab:a-relay
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab

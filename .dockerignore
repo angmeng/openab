@@ -1,0 +1,5 @@
+target
+.git
+*.bak-*
+openab.binary.bak-*
+**/*.bak-*

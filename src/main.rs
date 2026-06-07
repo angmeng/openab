@@ -166,6 +166,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // persona display-name -> Discord id map (from [relay.discord_mentions]),
+    // shared with the Discord adapter so the agent's plain-text "@<name>" replies
+    // are rewritten into real <@id> mentions. Empty when no [relay] / no map.
+    let discord_mentions: Arc<std::collections::HashMap<String, u64>> = Arc::new(
+        relay_cfg
+            .as_ref()
+            .map(|r| r.discord_mentions.clone())
+            .unwrap_or_default(),
+    );
+
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -194,7 +204,8 @@ async fn main() -> anyhow::Result<()> {
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
         cfg.discord.as_ref().map(|dc| {
             let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+            Arc::new(discord::DiscordAdapter::new(http, discord_mentions.clone()))
+                as Arc<dyn adapter::ChatAdapter>
         });
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
     // Local config path (for persisting runtime allowlist additions). None when
@@ -492,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
                 discord_cfg.max_bot_turns,
             )),
             allow_dm: discord_cfg.allow_dm,
+            reply_in_channel: discord_cfg.reply_in_channel,
+            discord_mentions: discord_mentions.clone(),
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),

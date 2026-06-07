@@ -58,6 +58,14 @@ pub struct RelayConfig {
     pub prefix_template: String,
     #[serde(default)]
     pub aliases: HashMap<String, RelayAlias>,
+    /// Persona display-name -> Discord user id. For relays whose target platform
+    /// is `discord`, plain-text `@<name>` tokens in the body are rewritten into a
+    /// real `<@id>` mention. The origin platform flattens cross-platform mentions
+    /// to text, and discord.rs's mention gate only matches `<@id>` / parsed
+    /// mentions — so a relayed "@芙莉蓮" never pings unless rewritten here. Empty
+    /// by default → relay bodies pass through unchanged.
+    #[serde(default)]
+    pub discord_mentions: HashMap<String, u64>,
 }
 
 impl Default for RelayConfig {
@@ -66,6 +74,7 @@ impl Default for RelayConfig {
             enabled: false,
             prefix_template: default_prefix_template(),
             aliases: HashMap::new(),
+            discord_mentions: HashMap::new(),
         }
     }
 }
@@ -358,9 +367,43 @@ pub fn strip_file_send_markers(body: &str) -> String {
         .join("\n")
 }
 
+/// Rewrite plain-text `@<persona>` tokens into real Discord mention tokens
+/// `<@<id>>` for the names in `map`. Used for relays whose target platform is
+/// Discord: the origin platform (e.g. Slack) flattens a cross-platform mention
+/// to text, and discord.rs's inbound mention gate only fires on `<@id>` /
+/// Discord-parsed mentions — so without this rewrite a relayed "@芙莉蓮" never
+/// pings the target bot. No-op when `map` is empty or no name matches.
+pub fn resolve_discord_mentions(body: &str, map: &HashMap<String, u64>) -> String {
+    if map.is_empty() || !body.contains('@') {
+        return body.to_string();
+    }
+    let mut out = body.to_string();
+    for (name, id) in map {
+        if name.is_empty() {
+            continue;
+        }
+        out = out.replace(&format!("@{name}"), &format!("<@{id}>"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_discord_mentions_rewrites_known_names() {
+        let mut map = HashMap::new();
+        map.insert("芙莉蓮".to_string(), 1485122003261460501u64);
+        let body = "[via tifa from slack]\n@芙莉蓮 please review";
+        assert_eq!(
+            resolve_discord_mentions(body, &map),
+            "[via tifa from slack]\n<@1485122003261460501> please review",
+        );
+        // empty map and no-@ bodies are no-ops
+        assert_eq!(resolve_discord_mentions(body, &HashMap::new()), body);
+        assert_eq!(resolve_discord_mentions("no at sign", &map), "no at sign");
+    }
 
     // --- extract_relay_blocks: final-pass parser ---
 

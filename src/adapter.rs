@@ -1159,6 +1159,16 @@ async fn dispatch_relay_block(
     // targeting Slack. Stripped uniformly for audit consistency.
     let formatted = relay::strip_file_send_markers(&formatted);
 
+    // When relaying INTO Discord, rewrite plain-text @persona mentions (the
+    // origin platform flattens cross-platform mentions to text) into real
+    // <@id> mentions, so discord.rs's inbound mention gate actually fires for
+    // the target bot. No-op for other target platforms / empty map.
+    let formatted = if block.target_platform == "discord" {
+        relay::resolve_discord_mentions(&formatted, &ctx.config.discord_mentions)
+    } else {
+        formatted
+    };
+
     let target = ChannelRef {
         platform: block.target_platform.clone(),
         channel_id: alias.channel_id.clone(),
