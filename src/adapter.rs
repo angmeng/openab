@@ -501,6 +501,7 @@ impl AdapterRouter {
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
+        let reply_mode = self.reactions_config.reply_mode;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         // Hoist relay state into the closure: bool for the hot streaming path,
@@ -519,6 +520,13 @@ impl AdapterRouter {
                     reactions.set_thinking().await;
 
                     let mut text_buf = String::new();
+                    // reply_mode = post_tool_only: `post_tool_text` accumulates the text
+                    // block emitted after the most recent tool event; `last_nonempty_block`
+                    // is the fallback if that final block is empty. Only consulted when
+                    // reply_mode == PostToolOnly (see finalization below).
+                    let mut post_tool_text = String::new();
+                    let mut last_nonempty_block = String::new();
+                    let mut any_tool_ran = false;
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
                     // Track the latest usage_update for this prompt; used to
                     // append a context-usage footer to the final reply (Slack only).
@@ -665,6 +673,23 @@ impl AdapterRouter {
                             ) {
                                 last_activity = tokio::time::Instant::now();
                             }
+                            // post_tool_only block tracking: a tool event closes the
+                            // current text block (stashing it as last-non-empty) so
+                            // `post_tool_text` holds only the text emitted after the most
+                            // recent tool. Cuts on event boundaries, never mid-string, so
+                            // relay markers / output directives stay intact.
+                            match &event {
+                                AcpEvent::Text(t) => post_tool_text.push_str(t),
+                                AcpEvent::ToolStart { .. } | AcpEvent::ToolDone { .. } => {
+                                    any_tool_ran = true;
+                                    if !post_tool_text.trim().is_empty() {
+                                        last_nonempty_block = std::mem::take(&mut post_tool_text);
+                                    } else {
+                                        post_tool_text.clear();
+                                    }
+                                }
+                                _ => {}
+                            }
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
@@ -745,6 +770,20 @@ impl AdapterRouter {
                     conn.prompt_done().await;
                     // Stop the edit loop
                     drop(buf_tx);
+
+                    // reply_mode = post_tool_only: when a tool ran, keep only the final
+                    // text block (the answer emitted after the last tool call) and drop
+                    // inter-step narration. Single selection point, so the normal-end,
+                    // dropped-turn watchdog, and cancelled paths all share it. Fallback
+                    // chain: final block → last non-empty block → full buffer (never
+                    // silently empty). Lossy by design — see the 2026-06-09 note.
+                    let text_buf = select_reply_text(
+                        reply_mode,
+                        any_tool_ran,
+                        post_tool_text,
+                        last_nonempty_block,
+                        text_buf,
+                    );
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
@@ -902,6 +941,32 @@ impl AdapterRouter {
                 })
             })
             .await
+    }
+}
+
+/// Select which accumulated turn text to send, given the reply mode.
+///
+/// `post_tool_only` keeps only the final text block (text emitted after the last
+/// tool call) when a tool ran, dropping inter-step narration. Fallback chain so the
+/// reply is never silently emptied: final block → last non-empty block → full buffer.
+/// Lossy by design — a presentation heuristic, not a semantic "final answer" detector.
+fn select_reply_text(
+    mode: crate::config::ReplyMode,
+    any_tool_ran: bool,
+    post_tool: String,
+    last_nonempty: String,
+    full: String,
+) -> String {
+    if mode == crate::config::ReplyMode::PostToolOnly && any_tool_ran {
+        if !post_tool.trim().is_empty() {
+            post_tool
+        } else if !last_nonempty.trim().is_empty() {
+            last_nonempty
+        } else {
+            full
+        }
+    } else {
+        full
     }
 }
 
@@ -1220,6 +1285,70 @@ async fn dispatch_relay_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReplyMode;
+
+    #[test]
+    fn reply_mode_full_always_sends_full_text() {
+        let got = select_reply_text(
+            ReplyMode::Full,
+            true,
+            "post".into(),
+            "block".into(),
+            "FULL".into(),
+        );
+        assert_eq!(got, "FULL");
+    }
+
+    #[test]
+    fn post_tool_only_without_a_tool_sends_full_text() {
+        // No tool ran → nothing to trim, keep everything (e.g. a plain Q&A turn).
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            false,
+            String::new(),
+            String::new(),
+            "FULL ANSWER".into(),
+        );
+        assert_eq!(got, "FULL ANSWER");
+    }
+
+    #[test]
+    fn post_tool_only_keeps_final_block_after_last_tool() {
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            "the final answer".into(),
+            "earlier narration".into(),
+            "narration + the final answer".into(),
+        );
+        assert_eq!(got, "the final answer");
+    }
+
+    #[test]
+    fn post_tool_only_falls_back_to_last_nonempty_block_when_final_empty() {
+        // e.g. ...text... [tool] (no text after) → final block empty.
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            "   ".into(),
+            "the answer before the trailing tool".into(),
+            "full buffer".into(),
+        );
+        assert_eq!(got, "the answer before the trailing tool");
+    }
+
+    #[test]
+    fn post_tool_only_falls_back_to_full_when_no_blocks() {
+        // Degenerate: tool ran but both block buffers empty — never silently empty.
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            String::new(),
+            "  ".into(),
+            "full buffer".into(),
+        );
+        assert_eq!(got, "full buffer");
+    }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.

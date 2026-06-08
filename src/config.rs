@@ -492,6 +492,35 @@ impl<'de> Deserialize<'de> for ToolDisplay {
     }
 }
 
+/// Controls how much of a turn's assistant text is sent to chat.
+///
+/// - `full`: send all assistant text emitted during the turn (default, original behavior)
+/// - `post_tool_only`: when ≥1 tool ran, send only the final text block (the text
+///   emitted after the last tool call), dropping inter-step narration. Falls back to
+///   the last non-empty block, then full text, if the final block is empty. Lossy by
+///   design — a presentation heuristic, NOT a semantic "final answer" detector.
+///   See AI-Memory/shared/2026-06-09-openab-reasoning-leak-post-tool-only.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplyMode {
+    #[default]
+    Full,
+    PostToolOnly,
+}
+
+impl<'de> Deserialize<'de> for ReplyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "post_tool_only" | "post-tool-only" => Ok(Self::PostToolOnly),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "post_tool_only"],
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReactionsConfig {
     #[serde(default = "default_true")]
@@ -500,6 +529,8 @@ pub struct ReactionsConfig {
     pub remove_after_reply: bool,
     #[serde(default)]
     pub tool_display: ToolDisplay,
+    #[serde(default)]
+    pub reply_mode: ReplyMode,
     #[serde(default)]
     pub emojis: ReactionEmojis,
     #[serde(default)]
@@ -614,6 +645,7 @@ impl Default for ReactionsConfig {
             enabled: true,
             remove_after_reply: false,
             tool_display: ToolDisplay::default(),
+            reply_mode: ReplyMode::default(),
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
         }
