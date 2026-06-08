@@ -1447,7 +1447,24 @@ pub async fn run_slack_adapter(
 
                 loop {
                     tokio::select! {
-                        msg_result = read.next() => {
+                        // Wrap read.next() in a read deadline. Slack Socket Mode
+                        // sends a server ping every ~30-45s, so 70s of total
+                        // silence means the connection has gone half-open (peer
+                        // stopped sending without a FIN/RST — no read Err fires,
+                        // so without this the loop would block here forever and
+                        // never reconnect). On timeout, break to the existing
+                        // `reconnect in 5s` path below.
+                        timed = tokio::time::timeout(
+                            std::time::Duration::from_secs(70),
+                            read.next(),
+                        ) => {
+                            let msg_result = match timed {
+                                Ok(m) => m,
+                                Err(_) => {
+                                    warn!("Slack Socket Mode idle >70s (no server ping) — assuming half-open, reconnecting");
+                                    break;
+                                }
+                            };
                             let Some(msg_result) = msg_result else { break };
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
