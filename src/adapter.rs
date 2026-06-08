@@ -635,9 +635,6 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
-                        // Any notification = the agent is alive and producing;
-                        // reset the dropped-turn idle watchdog.
-                        last_activity = tokio::time::Instant::now();
                         if let Some(notification_id) = notification.id {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
@@ -654,6 +651,20 @@ impl AdapterRouter {
                         }
 
                         if let Some(event) = classify_notification(&notification) {
+                            // Reset the dropped-turn idle watchdog only on REAL
+                            // forward progress — reply text or tool activity — NOT on
+                            // empty keepalive thought-chunks. Those otherwise pin the
+                            // watchdog open and let a finished reply sit buffered until
+                            // the next inbound prompt flushes it. (2026-06-08 stuck-reply
+                            // bug — see AI-Memory/shared/2026-06-08-openab-buffered-reply-stuck-bug.md)
+                            if matches!(
+                                event,
+                                AcpEvent::Text(_)
+                                    | AcpEvent::ToolStart { .. }
+                                    | AcpEvent::ToolDone { .. }
+                            ) {
+                                last_activity = tokio::time::Instant::now();
+                            }
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
