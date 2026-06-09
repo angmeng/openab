@@ -1661,9 +1661,13 @@ pub async fn run_slack_adapter(
                                                 // Ignore own bot messages (after counting toward turns)
                                                 if is_own_bot_msg { continue; }
 
-                                                // Skip messages that @mention the bot — app_mention handles those
-                                                // (except in DMs where app_mention doesn't fire)
-                                                if mentions_bot && !is_dm { continue; }
+                                                // Skip messages that @mention the bot — app_mention handles those.
+                                                // EXCEPT bot-authored mentions: Slack never emits an app_mention
+                                                // event for a mention made by another bot/app, so deferring would
+                                                // drop a peer bot's @mention entirely (it never arrives via
+                                                // app_mention). Also except DMs, where app_mention doesn't fire.
+                                                // Let both fall through to the bot/user gating below.
+                                                if mentions_bot && !is_dm && !is_bot { continue; }
 
                                                 // --- Bot message gating ---
                                                 if is_bot {
