@@ -944,12 +944,37 @@ impl AdapterRouter {
     }
 }
 
+/// A trailing block that is wholly wrapped in a single pair of (half- or
+/// full-width) parentheses — a transient status note like
+/// "(background job still running, will report when done)". Under
+/// `post_tool_only` these displace the real finding the model emitted just
+/// before the last tool call, so they're recoverable rather than authoritative.
+fn is_status_aside(s: &str) -> bool {
+    let t = s.trim();
+    let first = t.chars().next();
+    let last = t.chars().last();
+    matches!(first, Some('(') | Some('（')) && matches!(last, Some(')') | Some('）'))
+}
+
+/// Heuristic for "this block carries real content, not a one-line narration
+/// fragment". 80 chars comfortably clears "收到", "我先看一下", "Let me check X"
+/// while admitting a genuine multi-sentence finding.
+fn is_substantive(s: &str) -> bool {
+    s.trim().chars().count() >= 80
+}
+
 /// Select which accumulated turn text to send, given the reply mode.
 ///
 /// `post_tool_only` keeps only the final text block (text emitted after the last
 /// tool call) when a tool ran, dropping inter-step narration. Fallback chain so the
 /// reply is never silently emptied: final block → last non-empty block → full buffer.
 /// Lossy by design — a presentation heuristic, not a semantic "final answer" detector.
+///
+/// One refinement: if the final block is *only* a transient status aside (e.g.
+/// "(背景驗證還在跑…)") and the block just before the last tool carries real
+/// content, prepend that content so the finding isn't silently replaced by the
+/// aside. Strictly additive — the aside is preserved, never the worst-case
+/// "answer vanished, only a parenthetical shown".
 fn select_reply_text(
     mode: crate::config::ReplyMode,
     any_tool_ran: bool,
@@ -959,7 +984,11 @@ fn select_reply_text(
 ) -> String {
     if mode == crate::config::ReplyMode::PostToolOnly && any_tool_ran {
         if !post_tool.trim().is_empty() {
-            post_tool
+            if is_status_aside(&post_tool) && is_substantive(&last_nonempty) {
+                format!("{}\n\n{}", last_nonempty.trim_end(), post_tool.trim_start())
+            } else {
+                post_tool
+            }
         } else if !last_nonempty.trim().is_empty() {
             last_nonempty
         } else {
@@ -1348,6 +1377,55 @@ mod tests {
             "full buffer".into(),
         );
         assert_eq!(got, "full buffer");
+    }
+
+    #[test]
+    fn post_tool_only_recovers_finding_displaced_by_trailing_status_aside() {
+        // Real failure mode (Frieren log, rc=124 turn): the model emits the
+        // finding, runs a final tool, then tacks on "(背景驗證還在跑…)". Naive
+        // post_tool_only would show ONLY the aside and silently drop the finding.
+        let finding = "止血改下去了，但驗證又掛了，這次是不同原因：rc=124 —— 那是 timeout 的退出碼。\
+            content script 裡的 timeout 220 gemini 在 220 秒把它砍了。flash 跑完整新聞 prompt\
+            （web search + 最多 15 條 + 查證日期）超過 220 秒沒跑完。換句話說 flash 本身能用，\
+            但接 grounding 抓 15 條新聞太慢撞到逾時，我量一下它到底要多久再決定拉長逾時還是砍工作量。";
+        let aside = "(背景測時跑著，最長 7 分鐘，完成自動回報)";
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            aside.into(),
+            finding.into(),
+            format!("{finding} [tool] {aside}"),
+        );
+        assert_eq!(got, format!("{finding}\n\n{aside}"));
+    }
+
+    #[test]
+    fn post_tool_only_keeps_aside_when_no_substantive_prior_block() {
+        // If the prior block is just narration ("我先看一下"), there's no finding
+        // to recover — keep the aside as-is rather than resurfacing narration.
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            "(背景跑著，等等回報)".into(),
+            "我先看一下".into(),
+            "我先看一下 [tool] (背景跑著，等等回報)".into(),
+        );
+        assert_eq!(got, "(背景跑著，等等回報)");
+    }
+
+    #[test]
+    fn post_tool_only_real_final_answer_is_never_demoted() {
+        // A substantive (non-parenthetical) final block is the answer — the
+        // aside-recovery path must not touch it even if a long prior block exists.
+        let answer = "結論：bridge 重啟成功，PID 50651，跑在新 binary 上，三處修正都生效了。";
+        let got = select_reply_text(
+            ReplyMode::PostToolOnly,
+            true,
+            answer.into(),
+            "收到，先讀 config 拿錨點，然後做三處編輯，重啟前嚴格驗證避免事後不能修。".into(),
+            "earlier narration ... ".to_string() + answer,
+        );
+        assert_eq!(got, answer);
     }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
