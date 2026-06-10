@@ -1430,18 +1430,35 @@ pub async fn run_slack_adapter(
             return Ok(());
         }
 
-        let ws_url = match get_socket_mode_url(&app_token).await {
-            Ok(url) => url,
-            Err(e) => {
+        // Bound the HTTP call. reqwest has no default timeout, so a hung TCP
+        // connect (e.g. waking from laptop sleep onto a not-yet-ready network)
+        // would block here forever and the reconnect loop would never retry —
+        // process alive, last log line "connecting…", no "connected", silent.
+        let ws_url = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            get_socket_mode_url(&app_token),
+        ).await {
+            Ok(Ok(url)) => url,
+            Ok(Err(e)) => {
                 error!("failed to get Socket Mode URL: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(_) => {
+                warn!("get_socket_mode_url timed out after 20s — retrying");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((ws_stream, _)) => {
+        // Bound the WebSocket handshake for the same reason — connect_async
+        // can otherwise hang indefinitely on a half-up network.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio_tungstenite::connect_async(&ws_url),
+        ).await {
+            Ok(Ok((ws_stream, _))) => {
                 info!("Slack Socket Mode connected");
                 let (mut write, mut read) = ws_stream.split();
 
@@ -1860,8 +1877,11 @@ pub async fn run_slack_adapter(
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("failed to connect to Slack Socket Mode: {e}");
+            }
+            Err(_) => {
+                warn!("connect_async timed out after 20s — retrying");
             }
         }
 
