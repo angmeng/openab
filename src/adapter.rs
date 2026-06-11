@@ -851,6 +851,15 @@ impl AdapterRouter {
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
+                    // A dispatched bot that emits empty output would otherwise post
+                    // "_(no response)_". In a multi-bot channel that placeholder is pure
+                    // noise — the agent legitimately chose to add nothing, and the dispatch
+                    // reaction (👀→✅) already signals "seen, done". Suppress the post there,
+                    // leaving only the reaction as the acknowledgment. Keep the placeholder in
+                    // DM / solo (no peer to spam; a useful "finished / nothing to say" signal).
+                    // Errors always surface regardless.
+                    let suppress_send =
+                        final_content.is_empty() && response_error.is_none() && other_bot_present;
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
@@ -877,7 +886,12 @@ impl AdapterRouter {
                         final_content
                     };
 
-                    let chunks = format::split_message(&final_content, message_limit);
+                    let chunks = if suppress_send {
+                        // Reaction-only ack (multi-bot channel, empty turn): post nothing.
+                        Vec::new()
+                    } else {
+                        format::split_message(&final_content, message_limit)
+                    };
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
