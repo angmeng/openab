@@ -3,6 +3,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A message in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +63,63 @@ pub trait LlmProvider: Send + Sync {
         messages: &'a [Message],
         tools: &'a [ToolDef],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>>;
+
+    /// Identifier of the model this provider talks to. Surfaced as
+    /// `CreateMessageResult.model` when serving MCP sampling so the requesting
+    /// server learns which model produced the response.
+    fn model(&self) -> &str;
+}
+
+/// Shared, cloneable handle to an `LlmProvider`. A newtype over
+/// `Arc<dyn LlmProvider>` purely so structs that hold one (the MCP runtime
+/// manager + per-connection client handler) can keep deriving `Debug` —
+/// `dyn LlmProvider` is not `Debug`, so the derive would otherwise fail.
+#[derive(Clone)]
+pub struct SharedLlmProvider(pub Arc<dyn LlmProvider>);
+
+impl std::fmt::Debug for SharedLlmProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedLlmProvider(..)")
+    }
+}
+
+impl std::ops::Deref for SharedLlmProvider {
+    type Target = dyn LlmProvider;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+/// Select an `LlmProvider` from an explicit `choice` (`anthropic` /
+/// `openai` / `codex`) or, for any other value, auto-detect (Anthropic API
+/// key first, then codex OAuth). Shared by the ACP session path and MCP
+/// sampling so both honor the same `OPENAB_AGENT_PROVIDER` selection and
+/// credential fallback.
+pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
+    match choice {
+        "anthropic" => Ok(Box::new(AnthropicProvider::from_env()?)),
+        "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
+        _ => match AnthropicProvider::from_env() {
+            Ok(p) => Ok(Box::new(p)),
+            Err(_) => match OpenAiProvider::from_auth_store() {
+                Ok(p) => Ok(Box::new(p)),
+                Err(e) => Err(format!(
+                    "No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"
+                )),
+            },
+        },
+    }
+}
+
+/// Build the default shared provider for non-session background use (MCP
+/// sampling). Honors `OPENAB_AGENT_PROVIDER`; returns `None` when no
+/// credentials are available so the caller can simply decline to advertise
+/// the `sampling` capability rather than fail.
+pub fn default_provider() -> Option<SharedLlmProvider> {
+    let choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
+    select_provider(&choice)
+        .ok()
+        .map(|b| SharedLlmProvider(Arc::from(b)))
 }
 
 /// Anthropic Claude provider.
@@ -90,6 +148,13 @@ impl AnthropicProvider {
                 .unwrap_or(8192),
             client: reqwest::Client::new(),
         })
+    }
+
+    /// Create provider with a specific model override.
+    pub fn from_env_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::from_env()?;
+        p.model = model.to_string();
+        Ok(p)
     }
 
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
@@ -151,6 +216,10 @@ impl AnthropicProvider {
 }
 
 impl LlmProvider for AnthropicProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -265,7 +334,7 @@ impl OpenAiProvider {
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
             model: std::env::var("OPENAB_AGENT_OPENAI_MODEL")
                 .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
-                .unwrap_or_else(|_| "gpt-4.1-nano".to_string()),
+                .unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -273,9 +342,20 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
         })
     }
+
+    /// Create provider with a specific model override.
+    pub fn from_auth_store_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::from_auth_store()?;
+        p.model = model.to_string();
+        Ok(p)
+    }
 }
 
 impl LlmProvider for OpenAiProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,

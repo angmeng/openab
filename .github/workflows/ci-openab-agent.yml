@@ -4,9 +4,11 @@ on:
   push:
     paths:
       - 'openab-agent/**'
+      - '.github/workflows/ci-openab-agent.yml'
   pull_request:
     paths:
       - 'openab-agent/**'
+      - '.github/workflows/ci-openab-agent.yml'
 
 jobs:
   check:

@@ -22,7 +22,7 @@
 
 A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Hermes, Grok Build, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
 
-🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/DmbhfDZjQS)** 🎉
+🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
@@ -97,7 +97,7 @@ See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 <details>
 <summary><strong>Slack</strong></summary>
 
-See [docs/slack-bot-howto.md](docs/slack-bot-howto.md) for a detailed step-by-step guide.
+See [docs/slack.md](docs/slack.md) for a detailed step-by-step guide.
 
 </details>
 
@@ -193,6 +193,28 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 
+## AgentCore Runtime
+
+Run any coding agent remotely on [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) — no CLI bundled in the OAB image.
+
+```
+┌─────────┐       ┌─────────┐        ┌───────────────┐         ┌──────────────────────────┐
+│ Discord │       │         │  ACP   │               │  AWS    │   AgentCore Runtime      │
+│  Slack  │──────▶│   OAB   │───────▶│ agentcore-acp │──────▶  │   ┌──────────────────┐   │
+│Telegram │       │         │ stdio  │   (adapter)   │  SDK    │   │ Firecracker μVM  │   │
+└─────────┘       └─────────┘        └───────────────┘         │   │  Kiro / Claude…  │   │
+                                                               │   │  /mnt/workspace  │   │
+                                                               │   └──────────────────┘   │
+                                                               └──────────────────────────┘
+```
+
+```toml
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+```
+
+Smaller image (~50MB), persistent filesystem, isolated microVMs, pay-per-use. See [docs/agentcore.md](docs/agentcore.md) for full setup.
+
 ## Configuration Reference
 
 > 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
@@ -210,10 +232,8 @@ allowed_channels = ["C0123456789"]   # channel ID allowlist (empty = allow all)
 # allowed_users = ["U0123456789"]    # user ID allowlist (empty = allow all)
 
 [agent]
-command = "kiro-cli"                  # CLI command
-args = ["acp", "--trust-all-tools"]   # ACP mode args
-working_dir = "/tmp"                  # agent working directory
-env = {}                              # extra env vars passed to the agent
+# command, args, and working_dir default from OPENAB_AGENT_COMMAND and $HOME
+# env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 [pool]
 max_sessions = 10                     # max concurrent sessions

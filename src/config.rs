@@ -65,11 +65,72 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
+    pub runtime_arn: String,
+    /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
+    #[serde(default = "default_agentcore_shell_command")]
+    pub shell_command: String,
+    /// Cancel strategy: "noop" or "stop" (default: stop)
+    #[serde(default = "default_agentcore_cancel_strategy")]
+    #[allow(dead_code)]
+    pub cancel_strategy: AgentCoreCancelStrategy,
+}
+
+fn default_agentcore_shell_command() -> String {
+    "kiro-cli acp --trust-all-tools".to_string()
+}
+
+impl AgentCoreConfig {
+    /// Extract region from ARN: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+    pub fn region(&self) -> String {
+        let parts: Vec<&str> = self.runtime_arn.split(':').collect();
+        if parts.len() >= 4 && !parts[3].is_empty() {
+            return parts[3].to_string();
+        }
+        "us-east-1".into() // fallback (should never hit with valid ARN)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentCoreCancelStrategy {
+    #[default]
+    Stop,
+    Noop,
+}
+
+impl<'de> Deserialize<'de> for AgentCoreCancelStrategy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "stop" => Ok(Self::Stop),
+            "noop" => Ok(Self::Noop),
+            other => Err(serde::de::Error::unknown_variant(other, &["stop", "noop"])),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentCoreCancelStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stop => write!(f, "stop"),
+            Self::Noop => write!(f, "noop"),
+        }
+    }
+}
+
+fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
+    AgentCoreCancelStrategy::Stop
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub agentcore: Option<AgentCoreConfig>,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -85,6 +146,56 @@ pub struct Config {
     pub relay: Option<crate::relay::RelayConfig>,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Workspace aliases: `name = "~/path/to/project"`
+    /// Used with `[[ws:@alias]]` control directives.
+    #[serde(default)]
+    pub aliases: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretsConfig {
+    /// AWS Secrets Manager configuration.
+    #[serde(default)]
+    pub aws: AwsSecretsConfig,
+    /// Exec provider configuration.
+    #[serde(default)]
+    pub exec: ExecSecretsConfig,
+    /// Secret references: key = "aws-sm://..." or "exec://..."
+    #[serde(default)]
+    pub refs: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AwsSecretsConfig {
+    /// Override AWS region (otherwise uses default credential chain).
+    pub region: Option<String>,
+    /// Override endpoint URL (for LocalStack or VPC endpoints).
+    pub endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecSecretsConfig {
+    /// Per-invocation timeout in seconds (default: 10).
+    #[serde(default = "default_exec_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for ExecSecretsConfig {
+    fn default() -> Self {
+        Self { timeout_seconds: 10 }
+    }
+}
+
+fn default_exec_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -338,6 +449,15 @@ pub struct SlackConfig {
     /// `trusted_bot_ids` are configured (multi-bot deployment).
     #[serde(default = "default_true")]
     pub streaming: bool,
+    /// Slack "AI app / Assistant" mode: stream replies via chat.startStream +
+    /// assistant.threads.setStatus instead of post+edit + emoji reactions.
+    /// Requires the Slack app to be an AI app (assistant feature enabled) with
+    /// the `assistant:write` scope. Default: true — set to false for Slack apps
+    /// that are not AI apps (no `assistant:write`) to keep emoji-reaction status.
+    /// Note: assistant_mode native streaming is suppressed when `streaming=false`
+    /// or when trusted bots are present (multi-bot send-once path).
+    #[serde(default = "default_true")]
+    pub assistant_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,17 +499,77 @@ fn default_gateway_platform() -> String {
     "telegram".into()
 }
 
+/// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
 #[derive(Debug, Deserialize)]
+#[serde(default)]
+struct AgentConfigRaw {
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    working_dir: String,
+    env: HashMap<String, String>,
+    inherit_env: Vec<String>,
+}
+
+impl Default for AgentConfigRaw {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: None,
+            working_dir: default_working_dir(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AgentConfig {
     pub command: String,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default = "default_working_dir")]
     pub working_dir: String,
-    #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
     pub inherit_env: Vec<String>,
+    /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
+    pub command_explicit: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: default_agent_command(),
+            args: default_agent_args(),
+            working_dir: default_working_dir(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+            command_explicit: false,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = AgentConfigRaw::deserialize(deserializer)?;
+        let cmd_explicit = raw.command.is_some();
+        let command = raw.command.unwrap_or_else(default_agent_command);
+        // If command was explicitly set but args was not, default args to []
+        // to avoid leaking env-var args into a custom command.
+        let args = match (cmd_explicit, raw.args) {
+            (_, Some(args)) => args,           // args explicitly set → use them
+            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (false, None) => default_agent_args(), // neither set → env var
+        };
+        Ok(AgentConfig {
+            command,
+            args,
+            working_dir: raw.working_dir,
+            env: raw.env,
+            inherit_env: raw.inherit_env,
+            command_explicit: cmd_explicit,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -572,7 +752,24 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_working_dir() -> String {
-    "/tmp".into()
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+}
+fn default_agent_command() -> String {
+    if let Ok(val) = std::env::var("OPENAB_AGENT_COMMAND") {
+        if let Some(cmd) = val.split_whitespace().next() {
+            return cmd.to_string();
+        }
+    }
+    "openab-agent".into()
+}
+fn default_agent_args() -> Vec<String> {
+    if let Ok(val) = std::env::var("OPENAB_AGENT_COMMAND") {
+        let parts: Vec<&str> = val.split_whitespace().collect();
+        if parts.len() > 1 {
+            return parts[1..].iter().map(|s| s.to_string()).collect();
+        }
+    }
+    Vec::new()
 }
 fn default_max_sessions() -> usize {
     10
@@ -702,13 +899,15 @@ fn expand_env_vars(raw: &str) -> String {
     .into_owned()
 }
 
-pub fn load_config(path: &Path) -> anyhow::Result<Config> {
+/// Load raw config text from a file path (env vars expanded but secrets NOT resolved).
+pub fn load_config_raw(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    parse_config(&raw, path.display().to_string().as_str())
+    Ok(expand_env_vars(&raw))
 }
 
-pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+/// Load raw config text from a URL (env vars expanded but secrets NOT resolved).
+pub async fn load_config_raw_from_url(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -725,7 +924,7 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
-    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
     if bytes.len() > MAX_CONFIG_BYTES {
         anyhow::bail!(
             "remote config from {url} exceeds 1 MiB limit ({} bytes)",
@@ -734,13 +933,115 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     }
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
+    Ok(expand_env_vars(&raw))
+}
+
+/// Parse config from already-expanded text.
+pub fn parse_config_str(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    parse_config_inner(expanded, source)
+}
+
+#[cfg(test)]
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
+    parse_config_inner(&expanded, source)
+}
+
+#[cfg(test)]
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+#[cfg(test)]
+async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch remote config from {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("remote config request to {url} returned HTTP {status}");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
     parse_config(&raw, url)
 }
 
-fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
-    let expanded = expand_env_vars(raw);
-    let config: Config = toml::from_str(&expanded)
+fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    // If [agentcore] is set and [agent] command was not explicitly provided,
+    // synthesize agent config to spawn the bundled agentcore-acp adapter.
+    if let Some(ref ac) = config.agentcore {
+        // Validate ARN format: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        let parts: Vec<&str> = ac.runtime_arn.split(':').collect();
+        anyhow::ensure!(
+            parts.len() >= 6
+                && parts[0] == "arn"
+                && parts[2] == "bedrock-agentcore"
+                && !parts[3].is_empty()
+                && parts[5].starts_with("runtime/"),
+            "agentcore.runtime_arn is not a valid AgentCore Runtime ARN \
+             (expected arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID, got \"{}\")",
+            ac.runtime_arn
+        );
+
+        if !config.agent.command_explicit {
+            // Use native Rust bridge (agentcore feature) or fall back to Python adapter
+            #[cfg(feature = "agentcore")]
+            let (cmd, args) = {
+                let self_exe = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "openab".to_string());
+                (
+                    self_exe,
+                    vec![
+                        "agentcore-bridge".into(),
+                        "--runtime-arn".into(),
+                        ac.runtime_arn.clone(),
+                        "--region".into(),
+                        ac.region(),
+                        "--command".into(),
+                        ac.shell_command.clone(),
+                    ],
+                )
+            };
+            #[cfg(not(feature = "agentcore"))]
+            let (cmd, args) = (
+                "uv".to_string(),
+                vec![
+                    "run".into(),
+                    "--script".into(),
+                    "/opt/agentcore/acp/agentcore_acp.py".into(),
+                    "--runtime-arn".into(),
+                    ac.runtime_arn.clone(),
+                    "--region".into(),
+                    ac.region(),
+                    "--cancel-strategy".into(),
+                    ac.cancel_strategy.to_string(),
+                ],
+            );
+            config.agent = AgentConfig {
+                command: cmd,
+                args,
+                working_dir: config.agent.working_dir.clone(),
+                env: config.agent.env.clone(),
+                inherit_env: config.agent.inherit_env.clone(),
+                command_explicit: true, // synthesized counts as explicit
+            };
+        }
+    }
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
@@ -1226,5 +1527,208 @@ allowed_channels = ["111"]"#));
         let f = write_tmp("[discord]\nallowed_channels = [\"111\"]\n");
         let r = persist_allowed_channel(f.path(), "C0NEW");
         assert!(r.is_err(), "no [slack] allowed_channels => error, not silent corruption");
+    }
+
+    #[test]
+    fn parse_secrets_config() {
+        let toml = r#"
+[discord]
+bot_token = "${secrets.discord_token}"
+
+[agent]
+command = "echo"
+
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+github_pat = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+endpoint_url = "http://localhost:4566"
+
+[secrets.exec]
+timeout_seconds = 15
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.secrets.refs.len(), 2);
+        assert_eq!(
+            cfg.secrets.refs.get("discord_token").unwrap(),
+            "aws-sm://openab/prod#discord_bot_token"
+        );
+        assert_eq!(
+            cfg.secrets.refs.get("github_pat").unwrap(),
+            "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+        );
+        assert_eq!(cfg.secrets.aws.region.as_deref(), Some("ap-northeast-1"));
+        assert_eq!(
+            cfg.secrets.aws.endpoint_url.as_deref(),
+            Some("http://localhost:4566")
+        );
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 15);
+    }
+
+    #[test]
+    fn parse_secrets_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.secrets.refs.is_empty());
+        assert!(cfg.secrets.aws.region.is_none());
+        assert!(cfg.secrets.aws.endpoint_url.is_none());
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 10);
+    }
+
+    #[test]
+    fn slack_assistant_mode_defaults_true_and_parses_false() {
+        let cfg: SlackConfig = toml::from_str("bot_token = \"x\"\napp_token = \"y\"\n").unwrap();
+        assert!(cfg.assistant_mode, "assistant_mode must default to true");
+
+        let cfg2: SlackConfig =
+            toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
+                .unwrap();
+        assert!(!cfg2.assistant_mode);
+    }
+
+    #[test]
+    fn agentcore_config_synthesizes_agent_command() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        #[cfg(feature = "agentcore")]
+        {
+            // With agentcore feature, spawns self with agentcore-bridge subcommand
+            assert!(cfg.agent.args.contains(&"agentcore-bridge".to_string()));
+        }
+        #[cfg(not(feature = "agentcore"))]
+        {
+            assert_eq!(cfg.agent.command, "uv");
+        }
+        assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
+        assert!(cfg
+            .agent
+            .args
+            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+    }
+
+    #[test]
+    fn agentcore_config_does_not_override_explicit_agent() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "my-custom-agent"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, "my-custom-agent");
+    }
+
+    #[test]
+    fn agentcore_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.region(), "us-east-1");
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "not-a-valid-arn"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_arn_wrong_service() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_arn_missing_runtime_prefix() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_cancel_strategy() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "stopp"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn agentcore_extracts_region_from_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/tokyo-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.args.contains(&"ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn agentcore_cancel_strategy_noop() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "noop"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
     }
 }

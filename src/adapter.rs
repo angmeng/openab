@@ -210,7 +210,9 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Platform name for logging and session key namespacing.
     fn platform(&self) -> &'static str;
 
-    /// Maximum message length for this platform (e.g. 2000 for Discord, 4000 for Slack).
+    /// Maximum message length (chars) for this platform; the router splits longer
+    /// replies into multiple messages at this bound. Platform-specific (e.g. 2000
+    /// for Discord; Slack uses its Block Kit `markdown` block cap).
     fn message_limit(&self) -> usize;
 
     /// Send a new message, returns a reference to the sent message.
@@ -248,10 +250,72 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
+    /// Rename the thread/channel title. Default: no-op (not all platforms support it).
+    async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.
     /// Default: edits to zero-width space (fallback for platforms without delete support).
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
         self.edit_message(msg, "\u{200b}").await
+    }
+
+    /// Whether this adapter streams via a native streaming API (Slack
+    /// chat.startStream) rather than the post+edit loop. Default: false.
+    /// `other_bot_present` lets adapters fall back to send-once in multi-bot
+    /// threads (mirrors `use_streaming`'s #534 rule).
+    fn uses_native_streaming(&self, _other_bot_present: bool) -> bool {
+        false
+    }
+
+    /// Begin a native stream. The returned MessageRef is the handle for
+    /// subsequent `stream_append` / `stream_finish`.
+    /// Default: delegate to send_message (only called when uses_native_streaming).
+    /// `recipient` is the per-turn `(user_id, team_id)` for platforms (Slack) that
+    /// need it for the native stream open; ignored by the default impl.
+    async fn stream_begin(
+        &self,
+        channel: &ChannelRef,
+        _recipient: Option<(String, String)>,
+    ) -> Result<MessageRef> {
+        self.send_message(channel, "…").await
+    }
+
+    /// Append an INCREMENTAL delta to a native stream.
+    /// Default: best-effort edit (only called when uses_native_streaming).
+    async fn stream_append(&self, msg: &MessageRef, delta: &str) -> Result<()> {
+        self.edit_message(msg, delta).await
+    }
+
+    /// Finish a native stream and write the COMPLETE final content.
+    /// Default: delegate to edit_message.
+    async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
+        self.edit_message(msg, final_content).await
+    }
+
+    /// Whether this adapter uses a status API (e.g. assistant.threads.setStatus)
+    /// instead of emoji reactions for thinking/tool indicators. Independent of
+    /// `uses_native_streaming` — status can work without content streaming.
+    /// Default: false.
+    fn uses_assistant_status(&self) -> bool {
+        false
+    }
+
+    /// Set an ephemeral status line (e.g. "Thinking…", "Using <tool>…").
+    /// Empty string clears it. Default: no-op (platforms without a status API).
+    async fn set_status(&self, _channel: &ChannelRef, _status: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether this platform renders Markdown tables natively. When `true`, the
+    /// router skips the `convert_tables` pre-pass (which rewrites tables into
+    /// code blocks / bullet lists for platforms that cannot render them) and
+    /// lets the platform render the raw Markdown table itself.
+    /// Default: `false` (keep converting). Overridden by Slack (Block Kit
+    /// `markdown` blocks / `markdown_text` stream chunks render tables natively).
+    fn renders_native_tables(&self) -> bool {
+        false
     }
 
     /// Whether this adapter should use streaming edit (true) or send-once (false).
@@ -277,6 +341,10 @@ pub struct AdapterRouter {
     liveness_check_interval: std::time::Duration,
     /// Cross-channel relay registry. `None` = relay disabled or not configured.
     relay_ctx: Option<Arc<RelayContext>>,
+    /// Workspace aliases from `[workspace.aliases]` config.
+    workspace_aliases: std::collections::HashMap<String, String>,
+    /// Bot home directory (security boundary for workspace directives).
+    bot_home: std::path::PathBuf,
 }
 
 /// Silence threshold for the dropped-turn watchdog. If the agent emits content
@@ -304,6 +372,8 @@ impl AdapterRouter {
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
         relay_ctx: Option<Arc<RelayContext>>,
+        workspace_aliases: std::collections::HashMap<String, String>,
+        bot_home: std::path::PathBuf,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -321,6 +391,8 @@ impl AdapterRouter {
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             relay_ctx,
+            workspace_aliases,
+            bot_home,
         }
     }
 
@@ -348,6 +420,16 @@ impl AdapterRouter {
     /// Access the reactions config (used by dispatch.rs).
     pub fn reactions_config(&self) -> &ReactionsConfig {
         &self.reactions_config
+    }
+
+    /// Workspace aliases for control directive resolution.
+    pub fn workspace_aliases_map(&self) -> std::collections::HashMap<String, String> {
+        self.workspace_aliases.clone()
+    }
+
+    /// Bot home path for workspace security boundary.
+    pub fn bot_home_path(&self) -> std::path::PathBuf {
+        self.bot_home.clone()
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
@@ -407,7 +489,7 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
+        if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
@@ -416,6 +498,11 @@ impl AdapterRouter {
             return Err(e);
         }
 
+        // In assistant-status mode (e.g. Slack assistant_mode), status is conveyed
+        // via assistant.threads.setStatus, so the emoji-reaction lifecycle is skipped
+        // entirely — mirrors dispatch_batch so per-message and batched modes agree.
+        let assistant_status = adapter.uses_assistant_status();
+
         let reactions = Arc::new(StatusReactionController::new(
             self.reactions_config.enabled,
             adapter.clone(),
@@ -423,7 +510,9 @@ impl AdapterRouter {
             self.reactions_config.emojis.clone(),
             self.reactions_config.timing.clone(),
         ));
-        reactions.set_queued().await;
+        if !assistant_status {
+            reactions.set_queued().await;
+        }
 
         let result = self
             .stream_prompt(
@@ -436,22 +525,24 @@ impl AdapterRouter {
             )
             .await;
 
-        match &result {
-            Ok(()) => reactions.set_done().await,
-            Err(_) => reactions.set_error().await,
-        }
+        if !assistant_status {
+            match &result {
+                Ok(()) => reactions.set_done().await,
+                Err(_) => reactions.set_error().await,
+            }
 
-        let hold_ms = if result.is_ok() {
-            self.reactions_config.timing.done_hold_ms
-        } else {
-            self.reactions_config.timing.error_hold_ms
-        };
-        if self.reactions_config.remove_after_reply {
-            let reactions = reactions;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-                reactions.clear().await;
-            });
+            let hold_ms = if result.is_ok() {
+                self.reactions_config.timing.done_hold_ms
+            } else {
+                self.reactions_config.timing.error_hold_ms
+            };
+            if self.reactions_config.remove_after_reply {
+                let reactions = reactions;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+                    reactions.clear().await;
+                });
+            }
         }
 
         if let Err(ref e) = result {
@@ -479,6 +570,9 @@ impl AdapterRouter {
             thread_channel,
             reactions,
             other_bot_present,
+            // handle_message path (e.g. cron) is never Slack assistant-mode native
+            // streaming, so no per-turn recipient — degrades to post+edit if it were.
+            None,
         )
         .await
     }
@@ -486,6 +580,7 @@ impl AdapterRouter {
     /// Drive one ACP turn with the given pre-packed ContentBlocks.
     /// Called by both `handle_message` (per-message mode) and `dispatch::dispatch_batch`
     /// (batched mode).
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_prompt_blocks(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
@@ -494,12 +589,22 @@ impl AdapterRouter {
         thread_channel: &ChannelRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
+        recipient: Option<(String, String)>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
-        let table_mode = self.table_mode;
+        let native = adapter.uses_native_streaming(other_bot_present);
+        let assistant_status = adapter.uses_assistant_status();
+        // Platforms that render Markdown tables natively (e.g. Slack Block Kit
+        // `markdown` blocks / `markdown_text` stream chunks) skip the
+        // table→code/bullets pre-pass so the raw table renders natively.
+        let table_mode = if adapter.renders_native_tables() {
+            TableMode::Off
+        } else {
+            self.table_mode
+        };
         let tool_display = self.reactions_config.tool_display;
         let reply_mode = self.reactions_config.reply_mode;
         let prompt_hard_timeout = self.prompt_hard_timeout;
@@ -517,7 +622,11 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
-                    reactions.set_thinking().await;
+                    if assistant_status {
+                        let _ = adapter.set_status(&thread_channel, "Thinking…").await;
+                    } else {
+                        reactions.set_thinking().await;
+                    }
 
                     let mut text_buf = String::new();
                     // reply_mode = post_tool_only: `post_tool_text` accumulates the text
@@ -536,8 +645,19 @@ impl AdapterRouter {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
                     }
 
+                    // Native streaming: defer stream_begin until first Text event
+                    // so the thinking phase only shows set_status (no placeholder msg).
+                    let mut native_msg: Option<MessageRef> = None;
+                    // Once stream_begin fails, stop retrying for this turn to avoid
+                    // hammering the API on transient failures.
+                    let mut stream_begin_failed = false;
+                    // Native delta coalescing state (used only when `native`).
+                    let mut native_pending = String::new();
+                    let mut native_last_flush = tokio::time::Instant::now();
+                    const NATIVE_FLUSH_MS: u128 = 400;
+
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming {
+                    let (buf_tx, placeholder_msg) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -693,8 +813,40 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    // OUR watchdog progress signal: the agent produced
+                                    // real text this turn (reset only on real progress).
                                     agent_emitted_text = true;
-                                    if let Some(tx) = &buf_tx {
+                                    if native {
+                                        // Upstream assistant_mode native streaming.
+                                        // Suppressed when other_bot_present / streaming
+                                        // disabled (see `native` computation), so the
+                                        // send-once finalization path still owns multi-bot.
+                                        // Lazy stream_begin: open the stream on first text.
+                                        if native_msg.is_none() && !stream_begin_failed {
+                                            match adapter.stream_begin(&thread_channel, recipient.clone()).await {
+                                                Ok(m) => { native_msg = Some(m); }
+                                                Err(e) => {
+                                                    tracing::error!(error = ?e, "stream_begin failed on first text; will not retry this turn");
+                                                    stream_begin_failed = true;
+                                                }
+                                            }
+                                        }
+                                        if let Some(msg) = &native_msg {
+                                            native_pending.push_str(&t);
+                                            if native_last_flush.elapsed().as_millis()
+                                                >= NATIVE_FLUSH_MS
+                                                && !native_pending.is_empty()
+                                            {
+                                                let _ = adapter
+                                                    .stream_append(msg, &native_pending)
+                                                    .await;
+                                                native_pending.clear();
+                                                native_last_flush = tokio::time::Instant::now();
+                                            }
+                                        }
+                                    } else if let Some(tx) = &buf_tx {
+                                        // OUR post+edit path: relay-aware masking via
+                                        // compose_streaming_display.
                                         let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
@@ -704,12 +856,35 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::Thinking => {
-                                    reactions.set_thinking().await;
+                                    if assistant_status {
+                                        let _ = adapter
+                                            .set_status(&thread_channel, "Thinking…")
+                                            .await;
+                                    } else {
+                                        reactions.set_thinking().await;
+                                    }
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
-                                    reactions.set_tool(&title).await;
+                                    // Live indicator: assistant status line vs emoji reaction.
+                                    if assistant_status {
+                                        let _ = adapter
+                                            .set_status(
+                                                &thread_channel,
+                                                &format!("Using {title}…"),
+                                            )
+                                            .await;
+                                    } else {
+                                        reactions.set_tool(&title).await;
+                                    }
+                                    // Record the tool in BOTH modes so the finalized message keeps
+                                    // a tool summary (compose_display, gated by tool_display). In
+                                    // assistant_mode the status line is transient and cleared before
+                                    // the reply, so without this the message would retain no record
+                                    // of which tools ran.
                                     let title = sanitize_title(&title);
-                                    if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                    if let Some(slot) =
+                                        tool_lines.iter_mut().find(|e| e.id == id)
+                                    {
                                         slot.title = title;
                                         slot.state = ToolState::Running;
                                     } else {
@@ -719,6 +894,7 @@ impl AdapterRouter {
                                             state: ToolState::Running,
                                         });
                                     }
+                                    // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
@@ -729,13 +905,24 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
-                                    reactions.set_thinking().await;
+                                    // Live indicator: assistant status line vs emoji reaction.
+                                    if assistant_status {
+                                        let _ = adapter
+                                            .set_status(&thread_channel, "Thinking…")
+                                            .await;
+                                    } else {
+                                        reactions.set_thinking().await;
+                                    }
+                                    // Update the tool's state in BOTH modes (see ToolStart) so the
+                                    // finalized message's tool summary reflects completion/failure.
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
                                         ToolState::Failed
                                     };
-                                    if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                    if let Some(slot) =
+                                        tool_lines.iter_mut().find(|e| e.id == id)
+                                    {
                                         if !title.is_empty() {
                                             slot.title = sanitize_title(&title);
                                         }
@@ -892,7 +1079,49 @@ impl AdapterRouter {
                     } else {
                         format::split_message(&final_content, message_limit)
                     };
-                    if let Some(msg) = placeholder_msg {
+                    // Clear the assistant status line before delivering the final message.
+                    if assistant_status {
+                        let _ = adapter.set_status(&thread_channel, "").await;
+                    }
+                    if native {
+                        // Upstream native-streaming finalization. `native` is false
+                        // whenever other_bot_present / streaming is disabled, so the
+                        // multi-bot send-once path below (with suppress_send) is
+                        // unaffected by this branch.
+                        if let Some(msg) = &native_msg {
+                            if !native_pending.is_empty() {
+                                let _ = adapter.stream_append(msg, &native_pending).await;
+                            }
+                            // Finalize the streamed message with the first chunk (full-replace),
+                            // then post any overflow chunks as new in-thread messages — mirrors
+                            // the post+edit path so long replies aren't truncated at message_limit.
+                            // NOTE: the reply_to directive is intentionally NOT honored in native
+                            // streaming mode — the streamed message is the in-thread reply.
+                            match chunks.first() {
+                                Some(first) => {
+                                    let _ = adapter.stream_finish(msg, first).await;
+                                    for chunk in chunks.iter().skip(1) {
+                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    }
+                                }
+                                None => {
+                                    let _ = adapter.stream_finish(msg, &final_content).await;
+                                }
+                            }
+                        } else {
+                            // native_msg is None — either no Text event ever arrived
+                            // (tool-only or empty turn) so lazy stream_begin never
+                            // fired, or stream_begin failed on the first Text event
+                            // and we stopped retrying for this turn. In both cases no
+                            // native stream was opened, so deliver the final content
+                            // (which may be the "_(no response)_" sentinel, or the
+                            // accumulated text_buf) as plain in-thread messages so
+                            // the turn is never silently dropped.
+                            for chunk in &chunks {
+                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                            }
+                        }
+                    } else if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
                             // Only delete if send succeeds — preserves placeholder on failure.
@@ -1487,6 +1716,9 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+        // renders_native_tables defaults to false: platforms that don't override
+        // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
+        assert!(!adapter.renders_native_tables());
     }
 
     #[test]

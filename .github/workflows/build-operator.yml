@@ -78,6 +78,7 @@ jobs:
           - { suffix: "-opencode", dockerfile: "Dockerfile.opencode", artifact: "opencode" }
           - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
           - { suffix: "-hermes", dockerfile: "Dockerfile.hermes", artifact: "hermes" }
+          - { suffix: "-agentcore", dockerfile: "Dockerfile.agentcore", artifact: "agentcore" }
           - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
           - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
           - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
@@ -147,6 +148,7 @@ jobs:
           - { suffix: "-opencode", artifact: "opencode" }
           - { suffix: "-cursor", artifact: "cursor" }
           - { suffix: "-hermes", artifact: "hermes" }
+          - { suffix: "-agentcore", artifact: "agentcore" }
           - { suffix: "-grok", artifact: "grok" }
           - { suffix: "-antigravity", artifact: "antigravity" }
           - { suffix: "-pi", artifact: "pi" }
@@ -204,6 +206,7 @@ jobs:
           - { suffix: "-opencode" }
           - { suffix: "-cursor" }
           - { suffix: "-hermes" }
+          - { suffix: "-agentcore" }
           - { suffix: "-grok" }
           - { suffix: "-antigravity" }
           - { suffix: "-pi" }

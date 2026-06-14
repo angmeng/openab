@@ -34,6 +34,11 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
 # max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
+# assistant_mode = true                # default true: native streaming (chat.startStream) +
+#                                       # assistant.threads.setStatus status line instead of
+#                                       # post+edit + emoji reactions. Requires the Slack app to be
+#                                       # an AI app with the `assistant:write` scope (plus chat:write).
+#                                       # Set false for non-AI Slack apps to keep emoji reactions.
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
@@ -46,6 +51,14 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_all_users = true                # true = any user; false = only allowed_users
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
+
+# --- AgentCore Runtime (alternative to [agent]) ---
+# When [agentcore] is set and [agent].command is not explicitly provided,
+# OAB auto-spawns the bundled agentcore-acp adapter. No manual wiring needed.
+# Region is auto-extracted from the ARN.
+# [agentcore]
+# runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+# cancel_strategy = "stop"       # "stop" (default) or "noop"
 
 [agent]
 command = "kiro-cli"
@@ -135,6 +148,11 @@ tables = "code"  # "code" (default) | "bullets" | "off"
                  # code: wrap tables in fenced code blocks with aligned columns
                  # bullets: convert each row into bullet points (• Header: Value)
                  # off: pass through unchanged
+                 # NOTE: ignored on Slack — Slack messages are sent as Block Kit
+                 # `markdown` blocks (and `markdown_text` stream chunks), which
+                 # render Markdown tables (and headings, lists, code fences)
+                 # natively. This setting applies to platforms that cannot render
+                 # tables (Discord and gateway integrations).
 
 [reactions]
 enabled = true
@@ -143,6 +161,7 @@ tool_display = "none"   # none (default) | compact | full
                         # none: hide tool calls — only the final agent reply is shown
                         # compact: one-line count summary, e.g. ✅ 3 · 🔧 1 tool(s)
                         # full: every tool call rendered inline (verbose; useful for debugging)
+                        # Applies to both assistant_mode and post+edit mode.
 
 [reactions.emojis]
 queued = "👀"
@@ -198,3 +217,12 @@ error_hold_ms = 2500
 # [relay.aliases]
 # "discord:swat-team" = { channel_id = "1485156316480803018" }
 # "slack:tifa-dm"     = { channel_id = "D0B4JKKM9PD" }
+
+# Workspace aliases for control directives: [[ws:@alias]]
+# Users can specify a workspace when starting a session, e.g.:
+#   @Bot [[ws:@openab]] help me debug the tests
+#
+# [workspace.aliases]
+# openab = "~/projects/openab"
+# infra  = "~/projects/infra-cdk"
+# web    = "~/projects/frontend"

@@ -51,15 +51,14 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "opencode"
-args = ["acp"]
-working_dir = "/home/node"
+# command and args default from OPENAB_AGENT_COMMAND="opencode acp"
+# Only override if you need non-default behavior
 ```
 
 ## Authentication
 
 ```bash
-kubectl exec -it deployment/openab-opencode -- opencode auth login
+kubectl exec -it deployment/openab-opencode -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the browser OAuth flow, then restart the pod:
@@ -180,3 +179,4 @@ kubectl rollout restart deployment/openab-opencode
 - **Tool authorization**: OpenCode handles tool authorization internally and never emits `session/request_permission` — all tools run without user confirmation, equivalent to `--trust-all-tools` on other backends.
 - **Model selection**: Set the default model via `opencode.json` in the working directory using the `provider/model` format (e.g. `ollama-cloud/gemini-3-flash-preview`).
 - **Frequent releases**: OpenCode releases very frequently (often daily). The pinned version in `Dockerfile.opencode` should be bumped via a dedicated PR when an update is needed.
+- **Minimum version for OpenRouter reasoning models**: Use `opencode-ai >= 1.17.3`. OpenCode 1.16.x (and likely earlier) ships an ACP regression where OpenRouter reasoning models — e.g. `openrouter/google/gemini-3-flash` — produce a complete assistant `text` part in OpenCode's internal session storage (visible via `opencode export <session_id>`) but the ACP server never emits a corresponding `agent_message_chunk` notification. OpenAB's ACP loop then sees only `usage_update` + a final `stopReason: end_turn` and renders `(no response)` because there is no message content to display. Fixed upstream by [sst/opencode#30332](https://github.com/sst/opencode/pull/30332) ("generate reasoning variants for all OpenRouter models"), released in OpenCode 1.17.0.

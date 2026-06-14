@@ -8,37 +8,7 @@ on:
       - 'Cargo.*'
 
 jobs:
-  build-binary:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build openab binary (once)
-        run: |
-          mkdir -p .binaries
-          DOCKER_BUILDKIT=1 docker build --target builder -t openab-builder -f Dockerfile .
-          CID=$(docker create openab-builder)
-          docker cp "$CID:/build/target/release/openab" .binaries/openab
-          docker rm "$CID"
-
-      - name: Build agy-acp adapter (for Dockerfile.antigravity)
-        run: |
-          if [ -f Dockerfile.antigravity ]; then
-            DOCKER_BUILDKIT=1 docker build --target adapter-builder -t agy-acp-builder -f Dockerfile.antigravity .
-            CID=$(docker create agy-acp-builder)
-            docker cp "$CID:/build/target/release/agy-acp" .binaries/agy-acp
-            docker rm "$CID"
-          fi
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: openab-binary
-          path: .binaries/
-          retention-days: 1
-
   smoke-test:
-    needs: build-binary
     strategy:
       fail-fast: false
       matrix:
@@ -59,39 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download pre-built binary
-        uses: actions/download-artifact@v4
-        with:
-          name: openab-binary
-          path: .pre-built
-
-      - name: Build image (skip Rust compilation)
-        run: |
-          chmod +x .pre-built/*
-          DF="${{ matrix.variant.dockerfile }}"
-
-          if grep -q "FROM rust" "$DF"; then
-            # Create fake builder context with pre-built binary at the expected path
-            mkdir -p .fake-builder/build/target/release
-            cp .pre-built/openab .fake-builder/build/target/release/openab
-
-            BUILD_CONTEXTS="--build-context builder=.fake-builder"
-
-            # Handle additional named Rust stages (e.g. adapter-builder)
-            grep -i '^FROM rust' "$DF" | sed -n 's/.*AS \([a-zA-Z0-9_-]*\).*/\1/p' | grep -v '^builder$' | while read stage; do
-              mkdir -p ".fake-${stage}/build/target/release"
-              cp .pre-built/* ".fake-${stage}/build/target/release/"
-              echo "--build-context ${stage}=.fake-${stage}"
-            done > /tmp/extra-contexts.txt
-
-            if [ -s /tmp/extra-contexts.txt ]; then
-              BUILD_CONTEXTS="$BUILD_CONTEXTS $(cat /tmp/extra-contexts.txt | tr '\n' ' ')"
-            fi
-
-            docker buildx build $BUILD_CONTEXTS -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
-          else
-            docker buildx build -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
-          fi
+      - name: Build image
+        run: docker build -t openab-test${{ matrix.variant.suffix }} -f ${{ matrix.variant.dockerfile }} .
 
       - name: Verify openab CMD does not crash
         run: |
@@ -109,6 +48,7 @@ jobs:
         run: |
           INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 
+          # Start agent in background, send init, capture output with timeout
           CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
           echo "$INIT" | docker attach --no-stdin=false "$CID" &
           sleep 5

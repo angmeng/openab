@@ -65,6 +65,12 @@ jobs:
                 continue;
               }
 
+              // Skip if closing-soon — don't override stale-close workflow
+              if (labels.includes('closing-soon')) {
+                console.log(`#${prNumber} — closing-soon, skipping`);
+                continue;
+              }
+
               // Check CI status on head commit
               const { data: status } = await github.rest.repos.getCombinedStatusForRef({
                 ...context.repo,
@@ -78,7 +84,21 @@ jobs:
               const ciRed = status.state === 'failure'
                 || checks.check_runs.some(c => c.conclusion === 'failure');
               if (ciRed) {
-                console.log(`#${prNumber} — CI failing, skipping`);
+                if (labels.includes(MAINTAINER)) {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo,
+                    issue_number: prNumber,
+                    name: MAINTAINER
+                  }).catch(() => {});
+                }
+                if (!labels.includes(CONTRIBUTOR)) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: prNumber,
+                    labels: [CONTRIBUTOR]
+                  });
+                }
+                console.log(`#${prNumber} — CI failing, flipped to ${CONTRIBUTOR}`);
                 continue;
               }
 
@@ -113,13 +133,6 @@ jobs:
                   ...context.repo,
                   issue_number: prNumber,
                   name: CONTRIBUTOR
-                }).catch(() => {});
-              }
-              if (labels.includes('closing-soon')) {
-                await github.rest.issues.removeLabel({
-                  ...context.repo,
-                  issue_number: prNumber,
-                  name: 'closing-soon'
                 }).catch(() => {});
               }
               console.log(`#${prNumber} — all clear, set ${MAINTAINER}`);

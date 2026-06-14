@@ -1,0 +1,31 @@
+# Dockerfile.agentcore — OAB + native AgentCore bridge (no bundled coding CLI).
+# The coding agent (Kiro, Claude, Codex, etc.) runs remotely in AgentCore Runtime.
+# Result: ~20MB image — single Rust binary, no Python/pip needed.
+
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --features agentcore && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release --features agentcore
+
+# --- Runtime stage ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1000 agent
+
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

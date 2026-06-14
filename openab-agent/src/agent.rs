@@ -1,20 +1,29 @@
 use anyhow::Result;
+use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
+use crate::mcp::{self, McpRuntimeManager};
 use crate::skills;
 use crate::tools;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
 
-You have 4 tools available:
+You have these core tools available (when MCP servers are configured, an `mcp` tool and their server tools are listed below in addition to these):
 - read: Read file contents or list a directory
 - write: Create or overwrite a file
 - edit: Replace a string in a file (first occurrence)
 - bash: Execute a shell command
 
 Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
+
+// The MCP system-prompt appendix is generated dynamically by
+// `mcp::format_system_prompt_appendix(manager)` so the LLM sees both the
+// `mcp` tool intro AND a server catalogue (PR #959 F1 discovery slice).
+// Previously a static const here, but that hid the configured server names
+// from the LLM and produced the "fs is disconnected, I give up" failure
+// mode observed in the F1 PoC.
 
 const MAX_TOOL_LOOPS: usize = 50;
 /// Maximum number of messages to keep in context. When exceeded, oldest
@@ -27,35 +36,72 @@ pub struct Agent {
     working_dir: PathBuf,
     system_prompt: String,
     tools: Vec<ToolDef>,
+    mcp_manager: Option<McpRuntimeManager>,
 }
 
 impl Agent {
     #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
-        let system_prompt = Self::build_system_prompt(&working_dir);
+        let system_prompt = Self::build_system_prompt(&working_dir, None);
         Self {
             provider: Box::new(provider),
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
             system_prompt,
             tools: tools::tool_definitions(),
+            mcp_manager: None,
         }
     }
 
-    pub fn new_boxed(provider: Box<dyn LlmProvider>, working_dir: String) -> Self {
-        let system_prompt = Self::build_system_prompt(&working_dir);
+    pub fn new_boxed(
+        provider: Box<dyn LlmProvider>,
+        working_dir: String,
+        mcp_manager: Option<McpRuntimeManager>,
+    ) -> Self {
+        let system_prompt = Self::build_system_prompt(&working_dir, mcp_manager.as_ref());
+        let tools = {
+            let mut t = tools::tool_definitions();
+            if mcp_manager.is_some() {
+                t.push(mcp::mcp_tool_def());
+            }
+            t
+        };
         Self {
             provider,
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
             system_prompt,
-            tools: tools::tool_definitions(),
+            tools,
+            mcp_manager,
         }
     }
 
-    /// Run the agent with a user prompt, executing tool calls until completion.
-    /// Returns the final text response.
-    fn build_system_prompt(working_dir: &str) -> String {
+    /// Replace the LLM provider while preserving conversation history.
+    pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
+        self.provider = provider;
+    }
+
+    /// Number of messages in the conversation (test helper).
+    #[cfg(test)]
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Push a message into the conversation (test helper).
+    #[cfg(test)]
+    pub fn push_message(&mut self, msg: Message) {
+        self.messages.push(msg);
+    }
+
+    /// Build the system prompt sent on every LLM call. Composition order:
+    ///   1. base prompt (`SYSTEM_PROMPT`, optionally prefixed by project-local
+    ///      `AGENTS.md`),
+    ///   2. MCP appendix — tool intro + server catalogue (PR #959 F1
+    ///      discovery slice); only when `mcp_manager` is `Some`,
+    ///   3. skills catalogue.
+    ///
+    /// Built once at `Agent::new*` time and reused on every `call_llm`.
+    fn build_system_prompt(working_dir: &str, mcp_manager: Option<&McpRuntimeManager>) -> String {
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
@@ -64,6 +110,12 @@ impl Agent {
             SYSTEM_PROMPT.to_string()
         } else {
             format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
+        };
+
+        let base = if let Some(mgr) = mcp_manager {
+            format!("{base}{}", mcp::format_system_prompt_appendix(mgr))
+        } else {
+            base
         };
 
         let discovered = skills::discover_skills(wd);
@@ -140,19 +192,19 @@ impl Agent {
             let mut tool_results: Vec<ContentBlock> = Vec::new();
             for (id, name, input) in &tool_calls {
                 info!("executing tool: {name}");
-                let result = tools::execute_tool(name, input, &self.working_dir).await;
+                let result = self.execute_tool_call(name, input).await;
                 match result {
-                    Ok(output) => {
+                    Ok((output, is_error)) => {
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: output,
-                            is_error: None,
+                            is_error,
                         });
                     }
                     Err(e) => {
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: format!("Error: {e}"),
+                            content: format!("Error: {}", crate::mcp::concise_error_message(&e)),
                             is_error: Some(true),
                         });
                     }
@@ -178,10 +230,37 @@ impl Agent {
     /// first user message and maintaining strict user/assistant alternation.
     fn truncate_context(&mut self) {
         while self.messages.len() > MAX_CONTEXT_MESSAGES {
-            // Drain in pairs (assistant + user) from index 1 to maintain alternation
-            let end = (1 + 2).min(self.messages.len());
+            // Remove the oldest assistant+user pair (indices 1 and 2), never
+            // touching messages[0] (the first user message). The `min` clamp
+            // means a trailing odd element still drains rather than panicking.
+            let end = 3.min(self.messages.len());
             self.messages.drain(1..end);
         }
+    }
+
+    /// Route the `mcp` meta-tool to the MCP runtime when configured;
+    /// everything else goes to the stateless `tools::execute_tool`. Keeping
+    /// the routing here (rather than inside `tools.rs`) lets `tools.rs` stay
+    /// stateless and free of MCP/feature plumbing.
+    async fn execute_tool_call(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<(String, Option<bool>)> {
+        if name == mcp::MCP_TOOL_NAME {
+            let Some(manager) = self.mcp_manager.as_ref() else {
+                return Err(anyhow::anyhow!(
+                    "mcp tool invoked but no McpRuntimeManager configured"
+                ));
+            };
+            let action = mcp::meta_tool::Action::deserialize(input)
+                .map_err(|e| anyhow::anyhow!("invalid mcp action payload: {e}"))?;
+            let (value, is_error) = mcp::meta_tool::dispatch(manager, action).await?;
+            return Ok((serde_json::to_string(&value)?, is_error));
+        }
+        tools::execute_tool(name, input, &self.working_dir)
+            .await
+            .map(|s| (s, None))
     }
 
     async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
@@ -213,6 +292,10 @@ mod tests {
     }
 
     impl LlmProvider for MockLlmProvider {
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+
         fn chat<'a>(
             &'a self,
             _system: &'a str,
@@ -296,6 +379,55 @@ mod tests {
             }
             _ => panic!("expected ToolResult"),
         }
+    }
+
+    #[test]
+    fn build_system_prompt_includes_mcp_catalogue_when_manager_provided() {
+        // PR #959 F1 discovery slice: when an MCP manager is wired in, the
+        // system prompt must surface the configured server catalogue so the
+        // LLM knows `list_tools` is worth calling (the "fs disconnected, I
+        // give up" failure mode the static const previously caused).
+        use crate::mcp::config::McpConfig;
+        let cfg: McpConfig = serde_json::from_str(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                    "linear": {
+                        "type": "http",
+                        "url": "https://mcp.linear.app/mcp",
+                        "oauth": { "provider": "linear" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = Agent::build_system_prompt(&tmp.path().to_string_lossy(), Some(&mgr));
+
+        assert!(
+            prompt.contains("## MCP tool"),
+            "missing MCP section:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("**fs** (stdio)"),
+            "missing fs catalogue entry:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("requires `mcp login linear`"),
+            "missing OAuth login hint:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_omits_mcp_section_when_no_manager() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = Agent::build_system_prompt(&tmp.path().to_string_lossy(), None);
+        assert!(
+            !prompt.contains("## MCP tool"),
+            "MCP section leaked into prompt without manager:\n{prompt}"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ name: Close Stale closing-soon PRs
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # daily at 09:00 UTC
+    - cron: '0 */6 * * *'  # every 6 hours
   workflow_dispatch:
 
 jobs:
@@ -16,7 +16,7 @@ jobs:
         with:
           script: |
             const label = 'closing-soon';
-            const staleDays = 3;
+            const staleDays = 1;
             const cutoff = new Date(Date.now() - staleDays * 24 * 60 * 60 * 1000);
 
             const prs = await github.rest.pulls.list({
@@ -47,7 +47,7 @@ jobs:
               await github.rest.issues.createComment({
                 ...context.repo,
                 issue_number: pr.number,
-                body: `🔒 Auto-closing: this PR has had the \`${label}\` label for more than ${staleDays} days without activity from the author.\n\nIf you'd like to continue working on this, feel free to reopen and leave a comment.`
+                body: `🔒 Auto-closing: this PR has had the \`${label}\` label for more than ${staleDays} days without activity from the author.\n\nIf you'd like to continue working on this, please submit a new PR and link to this one if necessary.`
               });
 
               await github.rest.pulls.update({

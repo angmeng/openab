@@ -1,3 +1,5 @@
+#[cfg(feature = "agentcore")]
+pub mod agentcore;
 pub mod connection;
 pub mod pool;
 pub mod protocol;
