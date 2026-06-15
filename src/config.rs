@@ -452,11 +452,16 @@ pub struct SlackConfig {
     /// Slack "AI app / Assistant" mode: stream replies via chat.startStream +
     /// assistant.threads.setStatus instead of post+edit + emoji reactions.
     /// Requires the Slack app to be an AI app (assistant feature enabled) with
-    /// the `assistant:write` scope. Default: true — set to false for Slack apps
-    /// that are not AI apps (no `assistant:write`) to keep emoji-reaction status.
+    /// the `assistant:write` scope.
     /// Note: assistant_mode native streaming is suppressed when `streaming=false`
     /// or when trusted bots are present (multi-bot send-once path).
-    #[serde(default = "default_true")]
+    ///
+    /// FORK DEFAULT: false (upstream defaults true). Our deployments rely on
+    /// emoji-reaction status (👀🔥✅) + send-once finalization that post_tool_only
+    /// / suppress_send depend on; enabling assistant_mode swaps to
+    /// assistant.threads.setStatus (needs `assistant:write` our apps may lack)
+    /// and native streaming. Set `assistant_mode = true` explicitly to opt in.
+    #[serde(default)]
     pub assistant_mode: bool,
 }
 
@@ -1584,14 +1589,19 @@ command = "echo"
     }
 
     #[test]
-    fn slack_assistant_mode_defaults_true_and_parses_false() {
+    fn slack_assistant_mode_defaults_false_and_parses_true() {
+        // FORK: default flipped to false (upstream defaults true) to preserve
+        // emoji-reaction status + send-once finalization across our deployments.
         let cfg: SlackConfig = toml::from_str("bot_token = \"x\"\napp_token = \"y\"\n").unwrap();
-        assert!(cfg.assistant_mode, "assistant_mode must default to true");
+        assert!(
+            !cfg.assistant_mode,
+            "fork default for assistant_mode must be false"
+        );
 
         let cfg2: SlackConfig =
-            toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
+            toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = true\n")
                 .unwrap();
-        assert!(!cfg2.assistant_mode);
+        assert!(cfg2.assistant_mode, "explicit opt-in must parse true");
     }
 
     #[test]

@@ -34,11 +34,12 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
 # max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
-# assistant_mode = true                # default true: native streaming (chat.startStream) +
-#                                       # assistant.threads.setStatus status line instead of
-#                                       # post+edit + emoji reactions. Requires the Slack app to be
-#                                       # an AI app with the `assistant:write` scope (plus chat:write).
-#                                       # Set false for non-AI Slack apps to keep emoji reactions.
+# assistant_mode = true                # FORK DEFAULT: false (upstream defaults true). When true:
+#                                       # native streaming (chat.startStream) + assistant.threads.setStatus
+#                                       # status line instead of post+edit + emoji reactions. Requires the
+#                                       # Slack app to be an AI app with `assistant:write` (plus chat:write).
+#                                       # Kept false in this fork to preserve emoji-reaction status +
+#                                       # send-once finalization (post_tool_only). Set true to opt in.
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
