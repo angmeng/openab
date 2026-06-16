@@ -44,6 +44,8 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `groups:history` | Read private channel messages (for thread context) |
 | `channels:read` | List public channels |
 | `groups:read` | List private channels |
+| `channels:manage` | Create public channels and edit their topic/description (e.g. record the working branch in the channel) |
+| `groups:write` | Same for private channels — create + edit topic/description (Atlas ticket channels are usually private) |
 | `reactions:write` | Add/remove emoji reactions |
 | `files:read` | Download file attachments (images, audio) |
 | `users:read` | Resolve user display names |
