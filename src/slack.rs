@@ -505,6 +505,15 @@ impl SlackAdapter {
             if text.is_empty() {
                 continue;
             }
+            // Strip leaked process-narration preambles from re-injected history
+            // so the model can't imitate its own (or a peer bot's) earlier leak.
+            // This is the second half of the fix in adapter.rs — see that fn's
+            // doc + 2026-06-16-tifa-meta-preamble-leak-rootcause.md.
+            let text = crate::adapter::strip_meta_preamble(text);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
             let who = m["user"]
                 .as_str()
                 .or_else(|| m["username"].as_str())

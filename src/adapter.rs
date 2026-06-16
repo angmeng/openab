@@ -972,6 +972,14 @@ impl AdapterRouter {
                         text_buf,
                     );
 
+                    // Strip a leading process-narration status line ("Now the
+                    // reply (channel → English, mrkdwn, grounded):", "Reply
+                    // in-thread:") that post_tool_only can't catch — it's glued
+                    // to the answer in one block. Also breaks the self-imitation
+                    // loop: a stripped preamble never lands in Slack, so it never
+                    // re-enters context as thread history to be copied next turn.
+                    let text_buf = strip_meta_preamble(&text_buf);
+
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
                     // before tool lines are composed into the display output.
@@ -1239,6 +1247,67 @@ fn select_reply_text(
         }
     } else {
         full
+    }
+}
+
+/// Openers that, when a reply *starts* with one AND the line ends in ':',
+/// mark a model-emitted process-narration preamble rather than real content
+/// (e.g. "Now the reply (channel → English, mrkdwn, grounded):" or
+/// "Reply in-thread:"). Kept tight + lower-cased; matched position-anchored so
+/// a reply that merely *mentions* these words later is never touched.
+const META_PREAMBLE_OPENERS: &[&str] = &[
+    "now the reply",
+    "now my reply",
+    "reply in-thread",
+    "reply in thread",
+    "here's the reply",
+    "here is the reply",
+];
+
+/// Strip a leading process-narration "status line" from a reply when it is the
+/// very first content — e.g. "Now the reply (channel → English, mrkdwn,
+/// grounded):" or "Reply in-thread:". Also drops a horizontal rule immediately
+/// following such a line. Position-sensitive, pure, and idempotent.
+///
+/// Why this exists (2026-06-16): the preamble both leaks reasoning into the
+/// channel AND, once posted, re-enters the model's context as thread history
+/// and gets imitated, so the leak compounds across a thread. `post_tool_only`
+/// can't catch it — the preamble is glued to the answer in one text block with
+/// no tool boundary, and it never cuts mid-string. Stripping it here (send
+/// time) and in re-injected thread context breaks the loop at both ends.
+/// Root-cause: AI-Memory/shared/2026-06-16-tifa-meta-preamble-leak-rootcause.md.
+///
+/// Fail-safe: if stripping would empty the message, the original is returned
+/// untouched (never silently blank a reply).
+pub(crate) fn strip_meta_preamble(text: &str) -> String {
+    let mut cur = text;
+    let mut stripped_any = false;
+    loop {
+        let s = cur.trim_start();
+        let line_end = s.find('\n').unwrap_or(s.len());
+        let first_line = s[..line_end].trim_end();
+        let lower = first_line.to_ascii_lowercase();
+        let is_preamble = first_line.ends_with(':')
+            && first_line.chars().count() <= 120
+            && META_PREAMBLE_OPENERS.iter().any(|op| lower.starts_with(op));
+        if !is_preamble {
+            break;
+        }
+        stripped_any = true;
+        // Advance past the preamble line.
+        cur = &s[line_end..];
+        // Optionally skip a single following horizontal rule (the model often
+        // inserts "---" between the preamble and the real answer).
+        let after = cur.trim_start();
+        let hr_end = after.find('\n').unwrap_or(after.len());
+        if matches!(after[..hr_end].trim(), "---" | "***" | "___") {
+            cur = &after[hr_end..];
+        }
+    }
+    if stripped_any && !cur.trim().is_empty() {
+        cur.trim_start().to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -1669,6 +1738,55 @@ mod tests {
             "earlier narration ... ".to_string() + answer,
         );
         assert_eq!(got, answer);
+    }
+
+    #[test]
+    fn strip_meta_preamble_removes_now_the_reply_line_and_hr() {
+        // The exact 2026-06-16 leak shape (preamble + "---" + answer in one block).
+        let got = strip_meta_preamble(
+            "Now the reply (channel → English, mrkdwn, grounded):\n\n---\n\nJaz is on leave, so I'm covering the backend.",
+        );
+        assert_eq!(got, "Jaz is on leave, so I'm covering the backend.");
+    }
+
+    #[test]
+    fn strip_meta_preamble_removes_reply_in_thread_line() {
+        let got = strip_meta_preamble("Reply in-thread:\n\nGot it — no ticket, scope locked.");
+        assert_eq!(got, "Got it — no ticket, scope locked.");
+    }
+
+    #[test]
+    fn strip_meta_preamble_leaves_normal_reply_untouched() {
+        // A real answer that just happens to mention "grounded" / "mrkdwn" later
+        // must be fully preserved — the ban is position-sensitive, not word-based.
+        let body = "Yes, this is grounded in the actual code. I formatted it for mrkdwn.";
+        assert_eq!(strip_meta_preamble(body), body);
+    }
+
+    #[test]
+    fn strip_meta_preamble_is_idempotent() {
+        let once = strip_meta_preamble("Reply in-thread:\n\nthe answer");
+        assert_eq!(strip_meta_preamble(&once), once);
+    }
+
+    #[test]
+    fn strip_meta_preamble_handles_stacked_preambles() {
+        let got = strip_meta_preamble("Now the reply:\nReply in-thread:\n\nthe answer");
+        assert_eq!(got, "the answer");
+    }
+
+    #[test]
+    fn strip_meta_preamble_keeps_original_if_only_preamble() {
+        // Degenerate: nothing but the preamble. Never silently blank the reply.
+        let only = "Reply in-thread:";
+        assert_eq!(strip_meta_preamble(only), only);
+    }
+
+    #[test]
+    fn strip_meta_preamble_does_not_match_preamble_words_mid_reply() {
+        // "reply in thread" appearing as prose, not as an opening status line.
+        let body = "I'll reply in thread so Jaz can follow it later.";
+        assert_eq!(strip_meta_preamble(body), body);
     }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
