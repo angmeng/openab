@@ -58,6 +58,13 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 3. Authorize the requested permissions
 4. Copy the **Bot User OAuth Token** (`xoxb-...`) — this is your `SLACK_BOT_TOKEN`
 
+> **Reinstalling only to add scopes?** The `xoxb-` bot token is stable across
+> reinstalls — adding scopes attaches them to the *same* token. You do **not**
+> need to copy a "new" token, edit `.env`, or restart the bridge: the running
+> token gains the new scopes server-side immediately. Steps 4 above only matter
+> on the *first* install. (Exceptions: you regenerated/revoked the token, or the
+> app has OAuth token rotation enabled — off by default for static-token bots.)
+
 ## 6. Configure openab
 
 > 📖 Full config options with defaults: [docs/config-reference.md](config-reference.md#slack)
