@@ -523,10 +523,23 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
-        let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
-            .await?;
+    pub async fn session_new(
+        &mut self,
+        cwd: &str,
+        system_prompt_append: Option<&str>,
+    ) -> Result<String> {
+        let mut params = json!({"cwd": cwd, "mcpServers": []});
+        if let Some(append) = system_prompt_append {
+            if !append.trim().is_empty() {
+                // claude-agent-acp reads `_meta.systemPrompt.append` and appends it on
+                // top of the `claude_code` preset (verified present in both the pinned
+                // 0.29.2 and the native 0.36.1 adapter). This is the team-wide rule
+                // injection point; when absent we send no `_meta` and the agent falls
+                // back to whatever it loads from cwd (CLAUDE.md / settings).
+                params["_meta"] = json!({ "systemPrompt": { "append": append } });
+            }
+        }
+        let resp = self.send_request("session/new", Some(params)).await?;
 
         let session_id = resp
             .result
