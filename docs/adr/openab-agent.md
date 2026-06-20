@@ -311,6 +311,7 @@ ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
 # Optional:
 OPENAB_AGENT_MAX_TOKENS = "8192"
 OPENAB_AGENT_TIMEOUT_SECS = "120"
+OPENAB_AGENT_MAX_TOOL_LOOPS = "50"       # max tool-call iterations per prompt (default 50)
 ```
 
 ### Steering Files

@@ -38,7 +38,7 @@ Discord adapter. Requires a Discord bot token.
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore all bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
 | `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention, can pull bot into threads). |
-| `allow_user_messages` | string | `"involved"` | `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread. |
+| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread (recommended for multi-bot deployments). `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. |
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
 | `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
 | `message_processing_mode` | string | `"per-message"` | Message dispatch mode: `"per-message"` (each message = own turn), `"per-thread"` (all messages in thread share one buffer), or `"per-lane"` (each sender gets own buffer). See [Message Dispatch Modes](message-dispatch-modes.md). |
@@ -61,7 +61,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `allowed_users` | string[] | `[]` | Slack user IDs (e.g. `U0123456789`). |
 | `allow_bot_messages` | string | `"off"` | Same as Discord. |
 | `trusted_bot_ids` | string[] | `[]` | Slack Bot User IDs (`U...`) or Bot IDs (`B...`). `U...` matching resolves event Bot IDs via Slack `bots.info`, so the bot token needs `users:read`. |
-| `allow_user_messages` | string | `"involved"` | Same as Discord. |
+| `allow_user_messages` | string | `"multibot-mentions"` | Same as Discord. |
 | `max_bot_turns` | u32 | `100` | Same as Discord. |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
@@ -84,6 +84,8 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+| `streaming` | bool | `false` | Enable streaming (typewriter) mode — requires the gateway platform to support message editing. |
+| `streaming_placeholder` | bool | `true` | Show "…" placeholder at streaming start. Set `false` for platforms using drafts (e.g. Telegram Rich Messages). |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |
@@ -325,6 +327,26 @@ Fine-tune reaction timing behavior (milliseconds).
 | `stall_hard_ms` | `30000` | Hard stall threshold — consider the agent stuck. |
 | `done_hold_ms` | `1500` | How long to show the done emoji before removing (if `remove_after_reply`). |
 | `error_hold_ms` | `2500` | How long to show the error emoji before removing. |
+
+### `[reactions.mapping]`
+
+Map emoji reactions to text commands. When a user reacts with a configured emoji on any message in a monitored channel, the bot treats it as if the user sent the corresponding text message.
+
+Keys can be unicode emoji or Discord/GitHub shortcodes (e.g. `:thumbsup:`). Shortcodes are resolved to unicode at config load time.
+
+```toml
+[reactions.mapping]
+"👍" = "OK"
+":thumbsdown:" = "不行"
+":arrows_counterclockwise:" = "重新 review"
+":white_check_mark:" = "approve"
+```
+
+**Requirements:**
+- Enable the `GUILD_MESSAGE_REACTIONS` intent in the Discord Developer Portal.
+- Only unicode emoji are supported (custom server emoji are ignored).
+- The bot's own reactions are always ignored (prevents feedback loops).
+- Channel/thread access control still applies — reactions in non-monitored channels are ignored.
 
 ---
 

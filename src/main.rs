@@ -1,8 +1,10 @@
 mod acp;
 mod adapter;
+mod allow_list;
 mod bot_turns;
 mod config;
 mod cron;
+mod ctl;
 mod directives;
 mod discord;
 mod dispatch;
@@ -12,6 +14,7 @@ mod gateway;
 mod hooks;
 mod markdown;
 mod media;
+mod multibot_cache;
 mod reactions;
 mod relay;
 mod remind;
@@ -92,6 +95,24 @@ enum Commands {
         #[arg(long, default_value = "kiro-cli acp --trust-all-tools")]
         command: String,
     },
+    /// Set a runtime value (e.g. thread.name)
+    Set {
+        /// Key to set (e.g. thread.name)
+        key: String,
+        /// Value to set
+        value: String,
+        /// Target thread/channel ID
+        #[arg(long)]
+        thread: Option<String>,
+    },
+    /// Get a runtime value
+    Get {
+        /// Key to get (e.g. thread.name)
+        key: String,
+        /// Target thread/channel ID
+        #[arg(long)]
+        thread: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -115,6 +136,38 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "agentcore")]
         Commands::AgentcoreBridge { runtime_arn, region, command } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
+        }
+        Commands::Set { key, value, thread } => {
+            let resp = ctl::send_request(&ctl::Request {
+                action: ctl::Action::Set,
+                key,
+                value: Some(value),
+                thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
+            })
+            .await?;
+            if resp.ok {
+                println!("✓ {}", resp.message);
+            } else {
+                eprintln!("✗ {}", resp.message);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Commands::Get { key, thread } => {
+            let resp = ctl::send_request(&ctl::Request {
+                action: ctl::Action::Get,
+                key,
+                value: None,
+                thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
+            })
+            .await?;
+            if resp.ok {
+                println!("{}", resp.value.unwrap_or_default());
+            } else {
+                eprintln!("✗ {}", resp.message);
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Commands::Run { config } => config,
     };
@@ -262,6 +315,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(PathBuf::from(&config_source))
     };
+
+    // Initialize multibot cache (persists to $HOME/.openab/cache/threads.json)
+    let multibot_cache_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".openab")
+        .join("cache")
+        .join("threads.json");
+    let multibot_cache = multibot_cache::MultibotCache::load(multibot_cache_path);
+
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
             s.bot_token.clone(),
@@ -272,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
             s.allowed_channels.iter().cloned().collect(),
             slack_config_path.clone(),
             s.assistant_mode,
+            multibot_cache.clone(),
         ))
     });
 
@@ -308,6 +372,33 @@ async fn main() -> anyhow::Result<()> {
         workspace_aliases,
         bot_home,
     ));
+
+    // Shared slot for Discord ShardMessenger (set in ready handler, used by ctl for agent.status)
+    let ctl_shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Thread registry: thread_id → platform. Populated on message dispatch.
+    let ctl_registry = ctl::new_registry();
+
+    // Spawn control socket server for `openab set/get` IPC
+    let ctl_handle = {
+        let mut adapters = std::collections::HashMap::new();
+        if let Some(ref a) = shared_discord_adapter {
+            adapters.insert("discord".into(), a.clone());
+        }
+        if let Some(ref a) = shared_slack_adapter {
+            adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        if adapters.is_empty() {
+            None
+        } else {
+            Some(ctl::spawn_server(Arc::new(ctl::RuntimeHandler::new(
+                adapters,
+                ctl_registry.clone(),
+                ctl_shard.clone(),
+            ))))
+        }
+    };
 
     // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
     let mut configured_platforms: Vec<&str> = Vec::new();
@@ -359,13 +450,19 @@ async fn main() -> anyhow::Result<()> {
             slack_idle,
         ));
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
+        let slack_ctl_registry = ctl_registry.clone();
+        let slack_allow_list: Arc<dyn allow_list::AllowListSource> =
+            Arc::new(allow_list::StaticAllowList::new(
+                slack_cfg.allowed_users.into_iter().collect(),
+            ));
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
-                slack_cfg.allowed_users.into_iter().collect(),
+                slack_cfg.allowed_channels.into_iter().collect(),
+                slack_allow_list,
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
@@ -373,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,
+                slack_ctl_registry,
             )
             .await
             {
@@ -416,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            streaming_placeholder: gw_cfg.streaming_placeholder,
             stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();
@@ -545,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_role_ids,
             participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            multibot_cache,
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
@@ -556,12 +656,15 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            ctl_shard: ctl_shard.clone(),
+            ctl_registry: ctl_registry.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT
             | GatewayIntents::GUILDS
-            | GatewayIntents::DIRECT_MESSAGES;
+            | GatewayIntents::DIRECT_MESSAGES
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS;
 
         let mut client = Client::builder(&discord_cfg.bot_token, intents)
             .event_handler(handler)
@@ -604,6 +707,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Cleanup
     cleanup_handle.abort();
+    if let Some(h) = ctl_handle {
+        h.abort();
+        let _ = std::fs::remove_file(ctl::socket_path());
+    }
     // Signal Slack adapter to shut down gracefully
     let _ = shutdown_tx.send(true);
     if let Some(handle) = slack_handle {

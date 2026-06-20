@@ -10,6 +10,12 @@ pub fn format_user_error(message: &str) -> String {
     let msg_lower = message.to_lowercase();
 
     // Startup / connection errors (code == 0 from anyhow)
+    if msg_lower.contains("session load timeout") {
+        return "**Session Load Timeout**\nCould not restore your previous session. Your message was not sent — send any message to retry, or use /reset to start fresh.".to_string();
+    }
+    if msg_lower.contains("session load connection lost") {
+        return "**Session Load Failed**\nThe agent connection was lost while restoring your session. Your message was not sent — send any message to retry, or use /reset to start fresh.".to_string();
+    }
     if msg_lower.contains("timeout waiting for") {
         // Use msg_lower for extraction to stay case-insistent with the match above.
         // msg_lower and message are the same length, so byte offsets are valid.
@@ -96,6 +102,22 @@ mod tests {
     use super::*;
 
     // ─── format_user_error tests ─────────────────────────────────────────────
+
+    #[test]
+    fn format_user_error_session_load_timeout() {
+        let result = format_user_error("session load timeout: could not restore previous session");
+        assert!(result.contains("Session Load Timeout"));
+        assert!(result.contains("not sent"));
+        assert!(result.contains("/reset"));
+    }
+
+    #[test]
+    fn format_user_error_session_load_connection_lost() {
+        let result = format_user_error("session load connection lost: could not restore previous session");
+        assert!(result.contains("Session Load Failed"));
+        assert!(result.contains("not sent"));
+        assert!(result.contains("/reset"));
+    }
 
     #[test]
     fn format_user_error_timeout() {

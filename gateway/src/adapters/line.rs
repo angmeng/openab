@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, IMAGE_MAX_DOWNLOAD};
+use crate::media::{format_bytes, resize_and_compress, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -192,6 +192,7 @@ async fn process_line_webhook_events(
     }
 }
 
+
 fn sanitize_line_external_url_for_log(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
@@ -234,32 +235,43 @@ async fn build_gateway_event_from_line_event(
                     external_content_host = %sanitize_line_external_url_for_log(original),
                     "LINE external image content is not supported yet"
                 );
+                attachments.push(Attachment {
+                    attachment_type: "image".into(),
+                    filename: format!("line_{}.jpg", msg.id),
+                    mime_type: "image/jpeg".into(),
+                    data: String::new(),
+                    size: 0,
+                    path: None,
+                    status: Some(
+                        "unsupported format: external content not supported"
+                            .into(),
+                    ),
+                });
             }
             _ => {
                 if let Some(access_token) = line_access_token {
-                    if let Some(attachment) =
-                        download_line_image(client, access_token, &msg.id, data_api_base).await
-                    {
-                        attachments.push(attachment);
-                    }
+                    attachments.push(
+                        download_line_image(client, access_token, &msg.id, data_api_base).await,
+                    );
                 } else {
                     warn!(message_id = %msg.id, "LINE image received but LINE_CHANNEL_ACCESS_TOKEN is not configured");
+                    attachments.push(Attachment {
+                        attachment_type: "image".into(),
+                        filename: format!("line_{}.jpg", msg.id),
+                        mime_type: "image/jpeg".into(),
+                        data: String::new(),
+                        size: 0,
+                        path: None,
+                        status: Some(
+                            "configuration error: service not configured".into(),
+                        ),
+                    });
                 }
             }
         }
     }
 
-    // Do not synthesize placeholder text for failed/unsupported image downloads.
-    // Core treats content.text as the user's prompt, so a fake marker would create
-    // a misleading turn instead of preserving the actual image content.
     let event_text = text;
-
-    if msg.message_type == "image" && event_text.trim().is_empty() && attachments.is_empty() {
-        info!(
-            message_id = %msg.id,
-            "LINE image event produced no attachment; skipping without synthesizing placeholder text"
-        );
-    }
 
     if event_text.trim().is_empty() && attachments.is_empty() {
         return None;
@@ -347,7 +359,17 @@ pub async fn download_line_image(
     access_token: &str,
     message_id: &str,
     api_base: &str,
-) -> Option<Attachment> {
+) -> Attachment {
+    let rejected = |size: u64, reason: String| Attachment {
+        attachment_type: "image".into(),
+        filename: format!("line_{}.jpg", message_id),
+        mime_type: "image/jpeg".into(),
+        data: String::new(),
+        size,
+        path: None,
+        status: Some(reason),
+    };
+
     let mut resp = match client
         .get(format!(
             "{}/v2/bot/message/{}/content",
@@ -360,20 +382,25 @@ pub async fn download_line_image(
         Ok(resp) => resp,
         Err(e) => {
             warn!(message_id, error = %e, "LINE image download failed");
-            return None;
+            return rejected(0, "download failed: network error".into());
         }
     };
 
     if !resp.status().is_success() {
+        let http_status = resp.status().as_u16();
         warn!(message_id, status = %resp.status(), "LINE image download failed");
-        return None;
+        return rejected(0, format!("download failed: HTTP {http_status}"));
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(message_id, size, "LINE image Content-Length exceeds limit");
-                return None;
+                return rejected(size, format!(
+                    "size exceeded: {} exceeds {}",
+                    format_bytes(size),
+                    format_bytes(IMAGE_MAX_DOWNLOAD)
+                ));
             }
         }
     }
@@ -385,13 +412,18 @@ pub async fn download_line_image(
             Ok(None) => break,
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image download failed while reading body");
-                return None;
+                return rejected(0, "download failed: body read error".into());
             }
         };
         body.extend_from_slice(&chunk);
         if body.len() as u64 > IMAGE_MAX_DOWNLOAD {
-            warn!(message_id, size = body.len(), "LINE image exceeds limit");
-            return None;
+            let body_size = body.len() as u64;
+            warn!(message_id, size = body_size, "LINE image exceeds limit");
+            return rejected(body_size, format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(body_size),
+                format_bytes(IMAGE_MAX_DOWNLOAD)
+            ));
         }
     }
 
@@ -400,23 +432,30 @@ pub async fn download_line_image(
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!(message_id, error = %e, "LINE image resize/compress failed");
-                return None;
+                return rejected(0, "processing failed: image encoding error".into());
             }
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image processing task failed");
-                return None;
+                return rejected(0, "processing failed: image encoding error".into());
             }
         };
-    let path = store::store_media(&compressed).await?;
+    let path = match store::store_media(&compressed).await {
+        Some(p) => p,
+        None => {
+            warn!(message_id, "LINE image store failed");
+            return rejected(0, "processing failed: storage error".into());
+        }
+    };
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
-    Some(Attachment {
+    Attachment {
         attachment_type: "image".into(),
         filename: format!("line_{}.{}", message_id, ext),
         mime_type: mime,
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
-    })
+        status: None,
+    }
 }
 
 // --- Reply handler (hybrid Reply/Push dispatch) ---
@@ -545,13 +584,13 @@ mod tests {
             "msg123",
             &server.uri(),
         )
-        .await
-        .expect("attachment should be downloaded");
+        .await;
 
         assert_eq!(attachment.attachment_type, "image");
         assert!(attachment.filename.starts_with("line_msg123."));
         assert!(attachment.path.is_some());
         assert!(attachment.size > 0);
+        assert!(attachment.status.is_none());
 
         let path = attachment.path.unwrap();
         let stored = tokio::fs::read(&path).await.unwrap();
@@ -603,10 +642,9 @@ mod tests {
         assert_eq!(gateway_event.content.text, "");
         assert_eq!(gateway_event.content.attachments.len(), 1);
 
-        let path = gateway_event.content.attachments[0]
-            .path
-            .clone()
-            .expect("path should be stored");
+        let att = &gateway_event.content.attachments[0];
+        assert!(att.status.is_none(), "successful download should have no status");
+        let path = att.path.clone().expect("path should be stored");
         let _ = tokio::fs::remove_file(path).await;
     }
 
@@ -634,7 +672,72 @@ mod tests {
         )
         .await;
 
-        assert!(attachment.is_none());
+        assert!(attachment.status.is_some());
+        let reason = attachment.status.unwrap();
+        assert!(reason.contains("size exceeded"), "expected size exceeded reason, got: {reason}");
+        assert!(reason.contains("exceeds"), "expected size limit message, got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn external_image_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_ext",
+                "type": "image",
+                "contentProvider": {
+                    "type": "external",
+                    "originalContentUrl": "https://example.com/photo.jpg"
+                }
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("external image event should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert!(att.status.is_some(), "external image should have status set");
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("unsupported format"), "got: {reason}");
+        assert!(reason.contains("external"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn missing_access_token_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_notoken",
+                "type": "image",
+                "contentProvider": {"type": "line"}
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None, // no access token
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("image event with missing token should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert!(att.status.is_some(), "missing token should have status set");
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("configuration error"), "got: {reason}");
     }
 
     #[tokio::test]
@@ -643,6 +746,7 @@ mod tests {
         let state = Arc::new(crate::AppState {
             telegram_bot_token: None,
             telegram_secret_token: None,
+            telegram_rich_messages: false,
             line_channel_secret: None,
             line_access_token: None,
             teams: None,

@@ -22,6 +22,7 @@ on:
           - gemini
           - grok
           - hermes
+          - mimocode
           - native
           - opencode
           - pi

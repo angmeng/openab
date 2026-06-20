@@ -81,7 +81,7 @@ https://your-gateway-host/webhook/feishu
 | — | `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list of known bots |
 | — | `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel before suppression |
 | — | `FEISHU_SESSION_TTL_HOURS` | `24` | How long the bot remembers thread participation (hours). After expiry, @mention is required again. |
-| — | `FEISHU_ALLOW_USER_MESSAGES` | `involved` | Thread response mode: `involved` / `mentions` / `multibot-mentions`. See below. |
+| — | `FEISHU_ALLOW_USER_MESSAGES` | `multibot-mentions` | Thread response mode: `multibot-mentions` / `involved` / `mentions`. See below. |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
 | `gateway.streaming` | — | `false` | Enable streaming (typewriter) mode |
 
@@ -111,8 +111,8 @@ When `FEISHU_ALLOW_USER_MESSAGES=multibot-mentions`, the bot detects when anothe
 
 | Mode | Behavior |
 |------|----------|
-| `involved` (default) | Bot responds in participated threads without @mention. All participated bots respond. |
-| `multibot-mentions` | Same as `involved`, but once another bot is @mentioned in the thread, require @mention for all bots. |
+| `multibot-mentions` (default) | Like `involved`, but requires @mention once another bot has posted in the thread. |
+| `involved` | Bot responds in participated threads without @mention. All participated bots respond. |
 | `mentions` | Always require @mention, even in participated threads. |
 
 **Multi-bot detection** (how the gateway identifies "another bot"):

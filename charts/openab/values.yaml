@@ -309,13 +309,13 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions"
+      # allowUserMessages: "multibot-mentions" (default) | "involved" | "mentions"
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
       # "multibot-mentions" = same as "involved" in single-bot threads; require @mention
       #                      only when another bot has also posted in the thread
       #                      (recommended for multi-bot deployments)
-      allowUserMessages: "involved"
+      allowUserMessages: "multibot-mentions"
       # maxBotTurns: soft cap on consecutive bot turns per thread before
       # the bot stops auto-replying. A human message resets the counter.
       # Default 100 (Rust-side `default_max_bot_turns()`). Raise for long

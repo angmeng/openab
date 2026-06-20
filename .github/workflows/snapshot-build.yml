@@ -1,0 +1,163 @@
+name: Snapshot Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (default: main)'
+        required: false
+        type: string
+        default: 'main'
+      variants:
+        description: 'Variants to build (comma-separated, or "all")'
+        required: false
+        type: string
+        default: 'all'
+      tag:
+        description: 'Image tag (default: snapshot-<short-sha>)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ALL_VARIANTS: 'default,agentcore,antigravity,claude,codex,copilot,cursor,gemini,grok,hermes,mimocode,native,opencode,pi'
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.resolve.outputs.variants }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Resolve matrix and tag
+        id: resolve
+        run: |
+          # Resolve variants
+          if [ "${{ inputs.variants }}" = "all" ] || [ -z "${{ inputs.variants }}" ]; then
+            VARIANTS="${{ env.ALL_VARIANTS }}"
+          else
+            VARIANTS="${{ inputs.variants }}"
+          fi
+          # Convert to JSON array
+          JSON=$(echo "$VARIANTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+          echo "variants=${JSON}" >> "$GITHUB_OUTPUT"
+
+          # Resolve tag
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            SHA=$(git rev-parse --short HEAD)
+            echo "tag=snapshot-${SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.matrix.outputs.variants) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve Dockerfile
+        id: df
+        run: |
+          if [ "${{ matrix.variant }}" = "default" ]; then
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=Dockerfile.${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+            echo "suffix=-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.df.outputs.file }}
+          platforms: ${{ matrix.platform.os }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=snapshot-${{ matrix.variant }}-${{ matrix.platform.os }}
+          cache-to: type=gha,scope=snapshot-${{ matrix.variant }}-${{ matrix.platform.os }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.platform.runner }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: [matrix, build]
+    strategy:
+      matrix:
+        variant: ${{ fromJson(needs.matrix.outputs.variants) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve suffix
+        id: df
+        run: |
+          if [ "${{ matrix.variant }}" = "default" ]; then
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "suffix=-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.matrix.outputs.tag }}" \
+            $(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+
+      - name: Summary
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }}"
+          echo "### 📦 \`${IMAGE}:${{ needs.matrix.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"

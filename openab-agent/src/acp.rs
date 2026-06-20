@@ -242,6 +242,10 @@ impl AcpServer {
             let output = match req.method.as_deref() {
                 Some("initialize") => vec![self.handle_initialize(id)],
                 Some("session/new") => vec![self.handle_session_new(id).await],
+                Some("session/load") => {
+                    let params = req.params.unwrap_or(json!({}));
+                    vec![self.handle_session_load(id, &params).await]
+                }
                 Some("session/prompt") => {
                     let params = req.params.unwrap_or(json!({}));
                     self.handle_session_prompt(id, &params).await
@@ -278,7 +282,7 @@ impl AcpServer {
                 },
                 "agentCapabilities": {
                     "streaming": false,
-                    "loadSession": false
+                    "loadSession": true
                 }
             })),
             error: None,
@@ -369,6 +373,8 @@ impl AcpServer {
                     "gpt-5.4-mini".to_string()
                 }
             });
+        self.active_model = Some(model_name.clone());
+        self.active_provider = Some(active_provider.to_string());
         self.model_options = Self::available_models().await;
 
         let resp = JsonRpcResponse {
@@ -388,6 +394,59 @@ impl AcpServer {
             error: None,
         };
         serde_json::to_string(&resp).unwrap()
+    }
+
+    async fn handle_session_load(&mut self, id: u64, params: &Value) -> String {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if session_id.is_empty() {
+            return self.error_response(id, -32602, "missing sessionId");
+        }
+
+        if !self.sessions.contains_key(session_id) {
+            return self.error_response(id, -32000, &format!("unknown sessionId: {session_id}"));
+        }
+
+        // Update working directory if caller provides cwd
+        if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
+            if !cwd.is_empty() {
+                self.working_dir = cwd.to_string();
+                if let Some(agent) = self.sessions.get_mut(session_id) {
+                    agent.set_working_dir(cwd.to_string());
+                }
+            }
+        }
+
+        // Ensure model list is populated
+        if self.model_options.is_empty() {
+            self.model_options = Self::available_models().await;
+        }
+
+        let model_name = self.active_model.clone().unwrap_or_else(|| {
+            if self.active_provider.as_deref() == Some("openai") {
+                "gpt-5.4-mini".to_string()
+            } else {
+                "claude-sonnet-4-20250514".to_string()
+            }
+        });
+
+        self.ok_response(
+            id,
+            json!({
+                "sessionId": session_id,
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "enum",
+                    "currentValue": model_name,
+                    "options": self.model_options
+                }]
+            }),
+        )
     }
 
     /// List available models based on configured credentials.
@@ -890,5 +949,56 @@ mod tests {
             server.active_provider, None,
             "active_provider must not change on failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_load_returns_config_options() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        let mut server = AcpServer::new();
+
+        // Create a session first
+        let new_resp_str = server.handle_session_new(10).await;
+        let new_resp: Value = serde_json::from_str(&new_resp_str).unwrap();
+        let session_id = new_resp["result"]["sessionId"].as_str().unwrap();
+
+        // Load the session
+        let load_resp_str = server
+            .handle_session_load(11, &json!({"sessionId": session_id, "cwd": "/tmp"}))
+            .await;
+        let load_resp: Value = serde_json::from_str(&load_resp_str).unwrap();
+
+        assert_eq!(load_resp["id"], 11);
+        assert!(load_resp["error"].is_null());
+        assert_eq!(load_resp["result"]["sessionId"], session_id);
+
+        // configOptions must be present with model info
+        let opts = load_resp["result"]["configOptions"].as_array().unwrap();
+        assert!(!opts.is_empty());
+        assert_eq!(opts[0]["id"], "model");
+        assert_eq!(opts[0]["category"], "model");
+        assert!(!opts[0]["currentValue"].as_str().unwrap().is_empty());
+        assert!(!opts[0]["options"].as_array().unwrap().is_empty());
+
+        // working_dir should be updated
+        assert_eq!(server.working_dir, "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_session_load_unknown_session_returns_error() {
+        let mut server = AcpServer::new();
+
+        // Unknown session → -32000
+        let resp_str = server
+            .handle_session_load(12, &json!({"sessionId": "nonexistent"}))
+            .await;
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp["error"].is_object());
+        assert_eq!(resp["error"]["code"], -32000);
+
+        // Missing sessionId → -32602
+        let resp_str = server.handle_session_load(13, &json!({})).await;
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
     }
 }

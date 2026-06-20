@@ -36,6 +36,11 @@ fn resume_expired(now: u64, last_seen: Option<u64>, ttl_secs: u64) -> bool {
     }
 }
 
+/// Error substrings produced by `AcpConnection::send_request` that indicate a
+/// transient failure worth preserving the session ID for retry, as opposed to
+/// a permanent agent-side rejection.
+const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"];
+
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
 struct PoolState {
@@ -325,6 +330,7 @@ impl SessionPool {
         new_conn.initialize().await?;
 
         let mut resumed = false;
+        let mut load_failed: Option<&str> = None;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
                 match new_conn.session_load(sid, &effective_workdir).await {
@@ -333,10 +339,31 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
-                        warn!(thread_id, session_id = %sid, error = %e, "session/load failed, creating new session");
+                        let err_str = e.to_string();
+                        let is_transient = TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
+                        if is_transient {
+                            warn!(thread_id, session_id = %sid, error = %e,
+                                "session/load failed transiently, preserving session ID for retry");
+                            load_failed = Some(if err_str.contains("timeout waiting for") {
+                                "timeout"
+                            } else {
+                                "connection lost"
+                            });
+                        } else {
+                            warn!(thread_id, session_id = %sid, error = %e,
+                                "session/load failed, creating new session");
+                        }
                     }
                 }
             }
+        }
+
+        if let Some(reason) = load_failed {
+            // session/load failed transiently. The original session ID is already
+            // in state.persisted (we haven't touched it), so the next message will
+            // retry session/load automatically. Return an error so the current message
+            // is not processed against a context-free session.
+            return Err(anyhow!("session load {reason}: could not restore previous session"));
         }
 
         if !resumed {
@@ -366,6 +393,7 @@ impl SessionPool {
             // session id. In both cases the caller is continuing after an
             // unexpected session loss.
             if had_existing || saved_session_id.is_some() {
+                // Genuine session loss (agent died, session file gone, etc.).
                 new_conn.session_reset = true;
             }
         }

@@ -1,0 +1,140 @@
+name: PR Review (Scheduled)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: pr-review-poller
+  cancel-in-progress: true
+
+permissions:
+  statuses: write
+  issues: write
+  pull-requests: read
+
+jobs:
+  poll-and-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Find PRs needing review
+        id: poll
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+
+          # Collect eligible open PRs (non-draft, no review-limit-reached label)
+          # Include safe-to-review labeled PRs regardless of author_association
+          # Note: --paginate with array jq emits one array per page; stream objects then collect
+          PRS=$(gh api --paginate "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
+            --jq '.[] | select(
+              .draft == false and
+              (any(.labels[]; .name == "review-limit-reached") | not) and
+              (
+                (.author_association | IN("OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR")) or
+                any(.labels[]; .name == "safe-to-review")
+              )
+            ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+
+          TARGETS="[]"
+          while IFS= read -r ROW; do
+            NUMBER=$(echo "$ROW" | jq -r '.number')
+            SHA=$(echo "$ROW" | jq -r '.sha')
+            LABELS=$(echo "$ROW" | jq -c '.labels')
+
+            # Get latest status for this SHA (single API call)
+            STATUS_JSON=$(gh api "repos/${{ github.repository }}/commits/${SHA}/statuses" \
+              --jq '[.[] | select(.context == "OpenAB PR Review")] | sort_by(.created_at) | last | {state, created_at} // empty')
+            STATE=$(echo "$STATUS_JSON" | jq -r '.state // empty')
+
+            # Skip if still pending, UNLESS pending > 30 min (stale)
+            if [ "$STATE" = "pending" ]; then
+              PENDING_AT=$(echo "$STATUS_JSON" | jq -r '.created_at // empty')
+              if [ -n "$PENDING_AT" ]; then
+                PENDING_TS=$(date -d "$PENDING_AT" +%s 2>/dev/null || date -u +%s)
+                NOW_TS=$(date -u +%s)
+                ELAPSED=$(( NOW_TS - PENDING_TS ))
+                if [ "$ELAPSED" -lt 1800 ]; then
+                  echo "PR #${NUMBER}: still pending (${ELAPSED}s), skipping"
+                  continue
+                fi
+                echo "PR #${NUMBER}: pending stale (${ELAPSED}s > 30m), re-triggering"
+              fi
+            fi
+
+            # Skip if already reviewed this exact SHA (success or failure)
+            # failure = CHANGES REQUESTED — only re-review when new commits are pushed (new SHA)
+            if [ "$STATE" = "success" ] || [ "$STATE" = "failure" ]; then
+              echo "PR #${NUMBER}: already reviewed on HEAD (${STATE}), skipping"
+              continue
+            fi
+
+            # Trigger review: no status yet, or error (webhook failure), or stale pending
+            echo "PR #${NUMBER}: needs review (state=${STATE:-none})"
+            TARGETS=$(echo "$TARGETS" | jq --argjson row "$ROW" '. + [$row]')
+          done < <(echo "$PRS" | jq -c '.[]')
+
+          echo "targets=$(echo "$TARGETS" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "count=$(echo "$TARGETS" | jq 'length')" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger reviews
+        if: fromJSON(steps.poll.outputs.count) > 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.OAB_REVIEW_ACTION_WEBHOOK }}
+          BOT_UID: ${{ secrets.OAB_REVIEW_ACTION_BOT_UID }}
+          TARGETS: ${{ steps.poll.outputs.targets }}
+        run: |
+          set -eo pipefail
+
+          while IFS= read -r ROW; do
+            NUMBER=$(echo "$ROW" | jq -r '.number')
+            SHA=$(echo "$ROW" | jq -r '.sha')
+            LABELS=$(echo "$ROW" | jq -c '.labels')
+
+            # Circuit breaker check
+            COUNT=$(gh api --paginate "repos/${{ github.repository }}/pulls/${NUMBER}/commits" \
+              --jq '.[].sha' | while read -r C_SHA; do
+                gh api "repos/${{ github.repository }}/commits/${C_SHA}/statuses" \
+                  --paginate --jq '[.[] | select(.context == "OpenAB PR Review" and .state == "pending")] | length'
+              done | awk '{s+=$1} END {print s+0}')
+
+            if [ "${COUNT}" -ge 30 ]; then
+              gh api "repos/${{ github.repository }}/issues/${NUMBER}/labels" \
+                --method POST -f "labels[]=review-limit-reached"
+              gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+                -f state="error" \
+                -f context="OpenAB PR Review" \
+                -f description="Circuit breaker: exceeded 30 review cycles"
+              echo "::error::PR #${NUMBER}: circuit breaker triggered"
+              continue
+            fi
+
+            # Set pending status
+            gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+              -f state="pending" \
+              -f context="OpenAB PR Review" \
+              -f description="Review in progress..." \
+              -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+            # Trigger Discord webhook
+            PR_URL="https://github.com/${{ github.repository }}/pull/${NUMBER}"
+            MODE=""
+            if echo "$LABELS" | jq -e 'any(. == "auto-fix")' > /dev/null 2>&1; then
+              MODE="\n__mode: auto-fix__"
+            fi
+            PAYLOAD=$(printf '<@%s> review %s\n\n__commit: %s__%s' "$BOT_UID" "$PR_URL" "$SHA" "$MODE" | jq -Rs '{content: .}')
+            if ! curl -sS --fail-with-body --max-time 10 -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" -d "$PAYLOAD"; then
+              gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+                -f state="error" \
+                -f context="OpenAB PR Review" \
+                -f description="Failed to trigger review — webhook error"
+              echo "::warning::PR #${NUMBER}: webhook failed"
+            fi
+
+            echo "PR #${NUMBER}: review triggered"
+          done < <(echo "$TARGETS" | jq -c '.[]')

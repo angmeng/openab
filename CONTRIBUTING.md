@@ -1,8 +1,54 @@
 # Contributing to OpenAB
 
-Thanks for your interest in contributing! This guide covers what we expect in pull requests.
+Thanks for your interest in contributing! This guide covers what we expect in issues and pull requests.
 
-For the full rationale behind these guidelines, see the [PR Contribution Guidelines ADR](/docs/adr/pr-contribution-guidelines.md).
+For the full rationale behind the PR guidelines, see the [PR Contribution Guidelines ADR](/docs/adr/pr-contribution-guidelines.md).
+
+## Issue Guidelines
+
+The fastest way to file an issue is to use the [issue templates](https://github.com/openabdev/openab/issues/new/choose) — they auto-apply the correct labels and pass automated validation.
+
+### Issue Types
+
+| Type | Template | Required Sections |
+|------|----------|-------------------|
+| Bug | [bug.yml](/.github/ISSUE_TEMPLATE/bug.yml) | Description, Steps to Reproduce, Expected Behavior |
+| Feature | [feature.yml](/.github/ISSUE_TEMPLATE/feature.yml) | Description, Use Case |
+| Documentation | [documentation.yml](/.github/ISSUE_TEMPLATE/documentation.yml) | Description |
+| Guidance | [guidance.yml](/.github/ISSUE_TEMPLATE/guidance.yml) | Question |
+| RFC | [rfc.yml](/.github/ISSUE_TEMPLATE/rfc.yml) | Proposal (free-form, no heading validation) |
+
+### Filing Without a Template
+
+If you file an issue via CLI or API (bypassing the template UI), keep these rules in mind:
+
+1. **Title prefix helps auto-detection.** The following prefixes are recognized:
+   - `fix(...)` or `bug(...)` → Bug
+   - `feat(...)` or `feature(...)` → Feature
+   - `docs(...)` or `documentation(...)` → Documentation
+   - `RFC:` → RFC
+
+2. **Use the required headings** (as `##` or `###`). Common synonyms are accepted:
+
+   | Required Field | Accepted Synonyms |
+   |----------------|-------------------|
+   | Description | Problem, Summary, Overview, Background, What happened, Bug description |
+   | Steps to Reproduce | Reproduction, How to reproduce, Repro steps, Steps to replicate, Repro |
+   | Expected Behavior | Expected result, What should happen, Expected behaviour, Expected outcome |
+   | Use Case | Motivation, Why, Rationale, Use cases, Why it matters, Benefits, Proposal |
+   | Question | (no synonyms) |
+
+3. **Headings must have content.** An empty heading or `_No response_` does not count.
+
+### Automated Validation
+
+A GitHub Action ([issue-check.yml](/.github/workflows/issue-check.yml)) runs on every issue open, edit, and label event:
+
+- **Missing type label + unrecognizable format** → `incomplete` label is added, a bot comment asks you to wait for a maintainer to apply a type label.
+- **Type is known but required sections are missing** → `incomplete` label is added, a bot comment lists exactly what's missing.
+- **All required sections present** → `incomplete` label is automatically removed.
+
+To fix an `incomplete` issue, simply edit the issue body to add the missing sections — no need to close and re-open.
 
 ## Pull Request Guidelines
 

@@ -13,7 +13,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
 # allowed_role_ids = []        # role IDs that trigger the bot (same as direct @mention)
                                # note: if multiple bots share the same role, all will respond simultaneously
-# allow_user_messages = "involved"  # "involved" (default) | "mentions"
+# allow_user_messages = "multibot-mentions"  # "multibot-mentions" (default) | "involved" | "mentions"
                                      # "involved" = reply in threads bot owns or has participated in
                                      # "mentions" = always require @mention
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
@@ -28,7 +28,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
 # allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
 # trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
-# allow_user_messages = "involved"     # "involved" (default) | "mentions" | "multibot-mentions"
+# allow_user_messages = "multibot-mentions"     # "multibot-mentions" (default) | "involved" | "mentions"
                                         # "involved" = reply in threads bot has participated in
                                         # "mentions" = always require @mention
                                         # "multibot-mentions" = like "involved", but require @mention
@@ -52,6 +52,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_all_users = true                # true = any user; false = only allowed_users
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
+# streaming = true                      # enable streaming (typewriter) mode
+# streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
 
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
@@ -112,6 +114,15 @@ working_dir = "/home/agent"
 # # session/request_permission — all tools run without user confirmation,
 # # equivalent to --trust-all-tools on other backends.
 # # Run `opencode auth login` once before starting openab.
+
+# [agent]
+# command = "mimo"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # MiMo-Code (Xiaomi fork of OpenCode) with persistent memory, subagents,
+# # and MiMo Auto (free channel). Same ACP protocol as OpenCode.
+# # Install: npm install -g @mimo-ai/cli
+# # Auth: kubectl exec -it <pod> -- mimo auth login
 
 # [agent]
 # command = "cursor-agent"
@@ -179,6 +190,17 @@ stall_soft_ms = 10000
 stall_hard_ms = 30000
 done_hold_ms = 1500
 error_hold_ms = 2500
+
+# --- Emoji reaction mapping ---
+# Map emoji reactions to text commands. Reacting with a mapped emoji
+# is equivalent to sending the corresponding text message.
+# Requires GUILD_MESSAGE_REACTIONS intent enabled in Discord Developer Portal.
+# Keys can be unicode emoji or Discord shortcodes (e.g. :thumbsup:).
+# [reactions.mapping]
+# "👍" = "OK"
+# ":thumbsdown:" = "不行"
+# ":arrows_counterclockwise:" = "重新 review"
+# ":white_check_mark:" = "approve"
 
 # --- Scheduled messages (config-driven cron) ---
 # Everything cron-related lives under [cron].

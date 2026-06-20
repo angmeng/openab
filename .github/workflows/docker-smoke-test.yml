@@ -20,6 +20,7 @@ jobs:
           - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
           - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
           - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }
+          - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp" }
           - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "" }
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio" }
           - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "" }

@@ -77,6 +77,8 @@ allow_bot_messages = "mentions"  # recommended
 
 Use `"all"` only when bots need to react to each other's messages without explicit mentions (e.g. monitoring bots). A hard cap of 10 consecutive bot-to-bot turns prevents infinite loops.
 
+> **💡 User messages in multi-bot threads:** The default `allow_user_messages = "multibot-mentions"` already handles the user→bot side — once multiple bots are in a thread, users must @mention the specific bot they want to respond. No extra config needed.
+
 ### Example: Code Review → Deploy handoff
 
 ```

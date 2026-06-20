@@ -69,7 +69,7 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["123456789"]      # channel ID allowlist (empty = all)
 allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
-allow_user_messages = "involved"      # involved | mentions
+allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
 ```
 
@@ -103,9 +103,9 @@ Controls whether the bot requires @mention in threads.
 
 | Value | Behavior |
 |---|---|
-| `"involved"` (default) | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
+| `"involved"` | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
-| `"multibot-mentions"` | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
+| `"multibot-mentions"` (default) | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
 
 #### Comparison
 
@@ -201,7 +201,8 @@ To help the LLM know who each UID refers to, provide a UID→name mapping via sy
 
 When you @mention the bot in a channel, it creates a **thread** from your message and responds there. After that:
 
-- **`involved` mode (default):** just type in the thread — no @mention needed
+- **`multibot-mentions` mode (default):** just type in single-bot threads — no @mention needed; in multi-bot threads, @mention required
+- **`involved` mode:** just type in the thread — no @mention needed
 - **`mentions` mode:** @mention required for every message, even in threads
 
 Each thread gets its own agent session. Sessions are cleaned up after `session_ttl_hours` (default: 24h).

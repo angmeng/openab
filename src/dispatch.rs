@@ -788,7 +788,7 @@ async fn dispatch_batch(
                 if let Some(ref title) = title_to_apply {
                     if !title.is_empty() {
                         if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-                            warn!(session_key, error = %e, "failed to apply title directive");
+                            debug!(session_key, error = %e, "rename_thread not applied (platform may not support it)");
                         }
                     }
                 }

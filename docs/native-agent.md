@@ -36,6 +36,7 @@ env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 | `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens |
 | `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom OAuth client ID |
+| `OPENAB_AGENT_MAX_TOOL_LOOPS` | `50` | Max tool-call iterations per prompt before the agent gives up |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (alternative to OAuth) |
 
 ## Authentication

@@ -1,5 +1,6 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::allow_list::AllowListSource;
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -95,6 +96,8 @@ pub struct SlackAdapter {
     /// Positive-only cache: thread_ts → cached_at for threads where other bots have posted.
     /// Like participation, a thread becoming multi-bot is irreversible (bot messages don't disappear).
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Persistent disk cache for multibot thread detection (survives restarts).
+    multibot_cache: crate::multibot_cache::MultibotCache,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
     /// Config `[slack].streaming`. When false, streaming (typewriter) edits are
@@ -143,15 +146,22 @@ impl SlackAdapter {
         allowed_channels: HashSet<String>,
         config_path: Option<std::path::PathBuf>,
         assistant_mode: bool,
+        multibot_cache: crate::multibot_cache::MultibotCache,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Bound every Slack Web API call; an unbounded inline gating call in the
+            // read loop could otherwise stall the Socket Mode idle-timeout watchdog.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             bot_token,
             bot_user_id: tokio::sync::OnceCell::new(),
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
+            multibot_cache,
             session_ttl,
             streaming,
             trusted_bot_ids,
@@ -199,11 +209,15 @@ impl SlackAdapter {
     /// event loop when a bot message arrives, so multibot detection doesn't
     /// depend on fetching thread history. Idempotent.
     async fn note_other_bot_in_thread(&self, thread_ts: &str) {
-        let mut cache = self.multibot_threads.lock().await;
-        cache
-            .entry(thread_ts.to_string())
-            .or_insert_with(tokio::time::Instant::now);
-        enforce_cache_bounds(&mut cache, self.session_ttl);
+        {
+            let mut cache = self.multibot_threads.lock().await;
+            cache
+                .entry(thread_ts.to_string())
+                .or_insert_with(tokio::time::Instant::now);
+            enforce_cache_bounds(&mut cache, self.session_ttl);
+        }
+        // Persist to disk — multibot is irreversible
+        self.multibot_cache.mark_multibot(thread_ts).await;
     }
 
 
@@ -401,7 +415,7 @@ impl SlackAdapter {
             cache
                 .get(thread_ts)
                 .is_some_and(|ts| ts.elapsed() < self.session_ttl)
-        };
+        } || self.multibot_cache.is_multibot(thread_ts);
 
         // Eager multibot detection from message events populates the cache
         // before this runs. When already involved and cached, skip the fetch.
@@ -448,18 +462,12 @@ impl SlackAdapter {
         let bot_posted = messages.iter().any(|m| m["user"].as_str() == Some(bot_id));
 
         let involved = parent_mentions_bot || bot_posted;
-        let other_bot_present = cached_multibot
-            || messages.iter().any(|m| {
-                let is_bot_msg =
-                    m["bot_id"].is_string() || m["subtype"].as_str() == Some("bot_message");
-                is_bot_msg && m["user"].as_str() != Some(bot_id)
-            });
+        // other_bot_present relies solely on early detection + disk cache;
+        // no longer scanned from fetched messages (200-msg window was unreliable).
+        let other_bot_present = cached_multibot;
 
         if involved {
             self.cache_participation(thread_ts).await;
-        }
-        if other_bot_present && !cached_multibot {
-            self.note_other_bot_in_thread(thread_ts).await;
         }
 
         (involved, other_bot_present)
@@ -1403,6 +1411,28 @@ impl ChatAdapter for SlackAdapter {
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
 const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
+/// Socket Mode keepalive. Slack's inbound WebSocket can go half-open (e.g. a NAT
+/// idle-timeout silently drops inbound frames with no Close/FIN), which leaves
+/// `read.next()` blocked forever, so the reconnect loop never fires and the bot
+/// goes deaf while still showing as connected. We proactively ping and force a
+/// reconnect when no inbound frame (including Slack's own pings) has arrived
+/// within the idle window. Reconnect backoff mirrors the gateway adapter.
+const PING_INTERVAL_SECS: u64 = 30;
+const IDLE_TIMEOUT_SECS: u64 = 75;
+const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
+fn next_backoff(cur: u64) -> u64 {
+    (cur * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// The socket is considered dead (half-open) when no inbound frame has arrived
+/// within `timeout`; Slack sends periodic pings, so silence past the window
+/// means the inbound path is gone.
+fn socket_idle(since_last_inbound: std::time::Duration, timeout: std::time::Duration) -> bool {
+    since_last_inbound >= timeout
+}
+
 /// Run the Slack adapter using Socket Mode (persistent WebSocket, no public URL needed).
 /// Reconnects automatically on disconnect.
 #[allow(clippy::too_many_arguments)]
@@ -1411,7 +1441,8 @@ pub async fn run_slack_adapter(
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
-    allowed_users: HashSet<String>,
+    allowed_channels: HashSet<String>,
+    allowed_users: Arc<dyn AllowListSource>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
@@ -1419,9 +1450,14 @@ pub async fn run_slack_adapter(
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    ctl_registry: crate::ctl::ThreadRegistry,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    // Warm the bot-user-id cache once so the per-message path never does the
+    // cold-cache `auth.test` inline in the read loop.
+    let _ = adapter.get_bot_user_id().await;
+    let mut backoff_secs = 1u64;
 
     loop {
         // Check for shutdown before (re)connecting
@@ -1430,58 +1466,34 @@ pub async fn run_slack_adapter(
             return Ok(());
         }
 
-        // Bound the HTTP call. reqwest has no default timeout, so a hung TCP
-        // connect (e.g. waking from laptop sleep onto a not-yet-ready network)
-        // would block here forever and the reconnect loop would never retry —
-        // process alive, last log line "connecting…", no "connected", silent.
-        let ws_url = match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            get_socket_mode_url(&app_token),
-        ).await {
-            Ok(Ok(url)) => url,
-            Ok(Err(e)) => {
-                error!("failed to get Socket Mode URL: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
-            Err(_) => {
-                warn!("get_socket_mode_url timed out after 20s — retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let ws_url = match get_socket_mode_url(&app_token).await {
+            Ok(url) => url,
+            Err(e) => {
+                error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    _ = shutdown_rx.changed() => { return Ok(()); }
+                }
+                backoff_secs = next_backoff(backoff_secs);
                 continue;
             }
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        // Bound the WebSocket handshake for the same reason — connect_async
-        // can otherwise hang indefinitely on a half-up network.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            tokio_tungstenite::connect_async(&ws_url),
-        ).await {
-            Ok(Ok((ws_stream, _))) => {
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws_stream, _)) => {
                 info!("Slack Socket Mode connected");
+                backoff_secs = 1; // reset on success
                 let (mut write, mut read) = ws_stream.split();
+                let mut ping_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+                ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_inbound = std::time::Instant::now();
 
                 loop {
                     tokio::select! {
-                        // Wrap read.next() in a read deadline. Slack Socket Mode
-                        // sends a server ping every ~30-45s, so 70s of total
-                        // silence means the connection has gone half-open (peer
-                        // stopped sending without a FIN/RST — no read Err fires,
-                        // so without this the loop would block here forever and
-                        // never reconnect). On timeout, break to the existing
-                        // `reconnect in 5s` path below.
-                        timed = tokio::time::timeout(
-                            std::time::Duration::from_secs(70),
-                            read.next(),
-                        ) => {
-                            let msg_result = match timed {
-                                Ok(m) => m,
-                                Err(_) => {
-                                    warn!("Slack Socket Mode idle >70s (no server ping) — assuming half-open, reconnecting");
-                                    break;
-                                }
-                            };
+                        msg_result = read.next() => {
+                            last_inbound = std::time::Instant::now();
                             let Some(msg_result) = msg_result else { break };
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
@@ -1549,9 +1561,10 @@ pub async fn run_slack_adapter(
                                                 // handle_message's awaits. Picks up channels the bot just created.
                                                 let allowed_channels =
                                                     adapter.allowed_channels.read().await.clone();
-                                                let allowed_users = allowed_users.clone();
+                                                let allowed_users = allowed_users.allowed_users();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let ctl_registry = ctl_registry.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
@@ -1568,6 +1581,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        &ctl_registry,
                                                     )
                                                     .await;
                                                 });
@@ -1644,34 +1658,47 @@ pub async fn run_slack_adapter(
                                                 } else {
                                                     format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
                                                 };
-                                                {
+                                                // Classify under the lock (order-sensitive, kept in the read
+                                                // loop), but run any warning send AFTER releasing it; holding
+                                                // the tracker mutex across `chat.postMessage` would stall turn
+                                                // tracking for every thread, not just this one.
+                                                let turn_action = {
                                                     let mut tracker = bot_turns.lock().await;
                                                     if is_bot {
-                                                        match tracker.classify_bot_message(&turn_key) {
-                                                            TurnAction::Continue => {}
-                                                            TurnAction::SilentStop => continue,
-                                                            TurnAction::WarnAndStop { severity, turns, user_message } => {
-                                                                match severity {
-                                                                    TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
-                                                                    TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
-                                                                }
-                                                                let channel_allowed = allow_all_channels
-                                                                    || adapter.allowed_channels.read().await.contains(channel_id);
-                                                                if !is_own_bot_msg && channel_allowed {
-                                                                    let warn_channel = ChannelRef {
-                                                                        platform: "slack".into(),
-                                                                        channel_id: channel_id.to_string(),
-                                                                        thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
-                                                                        parent_id: None,
-                                                                        origin_event_id: None,
-                                                                    };
-                                                                    let _ = adapter.send_message(&warn_channel, &user_message).await;
-                                                                }
-                                                                continue;
-                                                            }
+                                                        tracker.classify_bot_message(&turn_key)
+                                                    } else {
+                                                        if is_plain_user_message(subtype, msg_text) {
+                                                            tracker.on_human_message(&turn_key);
                                                         }
-                                                    } else if is_plain_user_message(subtype, msg_text) {
-                                                        tracker.on_human_message(&turn_key);
+                                                        TurnAction::Continue
+                                                    }
+                                                };
+                                                match turn_action {
+                                                    TurnAction::Continue => {}
+                                                    TurnAction::SilentStop => continue,
+                                                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+                                                        match severity {
+                                                            TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
+                                                            TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
+                                                        }
+                                                        let channel_allowed = allow_all_channels
+                                                            || allowed_channels.contains(channel_id);
+                                                        if !is_own_bot_msg && channel_allowed {
+                                                            let warn_channel = ChannelRef {
+                                                                platform: "slack".into(),
+                                                                channel_id: channel_id.to_string(),
+                                                                thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                parent_id: None,
+                                                                origin_event_id: None,
+                                                            };
+                                                            let adapter = adapter.clone();
+                                                            tokio::spawn(async move {
+                                                                if let Err(e) = adapter.send_message(&warn_channel, &user_message).await {
+                                                                    warn!(error = %e, "failed to send bot turn limit warning");
+                                                                }
+                                                            });
+                                                        }
+                                                        continue;
                                                     }
                                                 }
 
@@ -1806,8 +1833,9 @@ pub async fn run_slack_adapter(
                                                                 // in a shared thread; everyone else must @mention.
                                                                 // Keeps owner conversation frictionless while other
                                                                 // humans in the thread can't pull the bot in unasked.
+                                                                let owner_set = allowed_users.allowed_users();
                                                                 let is_owner = event_user_id
-                                                                    .is_some_and(|u| allowed_users.contains(u));
+                                                                    .is_some_and(|u| owner_set.contains(u));
                                                                 if !is_owner && !mentions_bot {
                                                                     debug!(channel_id, thread_ts, "non-owner without @mention, ignoring");
                                                                     continue;
@@ -1832,9 +1860,10 @@ pub async fn run_slack_adapter(
                                                 // handle_message's awaits. Picks up channels the bot just created.
                                                 let allowed_channels =
                                                     adapter.allowed_channels.read().await.clone();
-                                                let allowed_users = allowed_users.clone();
+                                                let allowed_users = allowed_users.allowed_users();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let ctl_registry = ctl_registry.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -1847,6 +1876,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        &ctl_registry,
                                                     )
                                                     .await;
                                                 });
@@ -1869,6 +1899,22 @@ pub async fn run_slack_adapter(
                                 _ => {}
                             }
                         }
+                        _ = ping_interval.tick() => {
+                            if socket_idle(
+                                last_inbound.elapsed(),
+                                std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+                            ) {
+                                warn!(
+                                    idle_secs = last_inbound.elapsed().as_secs(),
+                                    "Slack Socket Mode idle past timeout (likely half-open), forcing reconnect"
+                                );
+                                break;
+                            }
+                            if let Err(e) = write.send(tungstenite::Message::Ping(Vec::new())).await {
+                                warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
+                                break;
+                            }
+                        }
                         _ = shutdown_rx.changed() => {
                             info!("Slack adapter received shutdown signal");
                             let _ = write.send(tungstenite::Message::Close(None)).await;
@@ -1877,16 +1923,17 @@ pub async fn run_slack_adapter(
                     }
                 }
             }
-            Ok(Err(e)) => {
-                error!("failed to connect to Slack Socket Mode: {e}");
-            }
-            Err(_) => {
-                warn!("connect_async timed out after 20s — retrying");
+            Err(e) => {
+                error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
             }
         }
 
-        warn!("reconnecting to Slack Socket Mode in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        warn!(backoff = backoff_secs, "reconnecting to Slack Socket Mode");
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            _ = shutdown_rx.changed() => { return Ok(()); }
+        }
+        backoff_secs = next_backoff(backoff_secs);
     }
 }
 
@@ -1922,6 +1969,7 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    ctl_registry: &crate::ctl::ThreadRegistry,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -2285,7 +2333,10 @@ async fn handle_message(
                 .get(ts)
                 .is_some_and(|inst| inst.elapsed() < adapter.session_ttl)
         })
-    };
+    } || thread_channel
+        .thread_id
+        .as_deref()
+        .is_some_and(|ts| adapter.multibot_cache.is_multibot(ts));
 
     // Best-effort echo before the agent reply so the user can verify STT.
     crate::stt::post_echo(
@@ -2314,6 +2365,9 @@ async fn handle_message(
         other_bot_present,
         recipient: stream_recipient,
     };
+    // Register thread for ctl routing
+    let ctl_thread_id = thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id);
+    crate::ctl::register_thread(ctl_registry, ctl_thread_id, "slack").await;
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
         .await
@@ -2653,6 +2707,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
         adapter.streams.lock().await.insert(
             "TS".into(),
@@ -2972,6 +3027,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
 
         assert!(
@@ -2998,6 +3054,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
 
         assert!(!adapter.use_streaming(false), "streaming=false must win even with no other bot");
@@ -3021,6 +3078,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
 
         assert!(
@@ -3119,6 +3177,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
         assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
         assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
@@ -3134,6 +3193,7 @@ mod tests {
             HashSet::new(),
             None,
             false,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
         assert!(!adapter2.uses_assistant_status());
         assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
@@ -3200,6 +3260,7 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
@@ -3271,7 +3332,40 @@ mod tests {
             HashSet::new(),
             None,
             true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
         );
         assert!(adapter.renders_native_tables());
+    }
+}
+
+#[cfg(test)]
+mod socket_keepalive_tests {
+    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS};
+    use std::time::Duration;
+
+    /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let mut b = 1u64;
+        let seq: Vec<u64> = (0..8)
+            .map(|_| {
+                let cur = b;
+                b = next_backoff(b);
+                cur
+            })
+            .collect();
+        assert_eq!(seq, vec![1, 2, 4, 8, 16, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS]);
+        assert_eq!(next_backoff(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
+    }
+
+    /// A half-open socket (no inbound past the window) is detected; an active one
+    /// (recent inbound, e.g. a Slack ping) is not. This is the deaf-socket guard.
+    #[test]
+    fn idle_detects_half_open_at_boundary() {
+        let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
+        assert!(!socket_idle(Duration::from_secs(0), timeout));
+        assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
+        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
+        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
     }
 }

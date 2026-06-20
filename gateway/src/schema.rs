@@ -57,6 +57,45 @@ pub struct Attachment {
     /// Path format: ~/.openab/media/inbound/<uuid> (no extension, MIME in mime_type).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Absent = attachment delivered normally (path/data available).
+    /// Present = attachment could not be delivered; value is a human-readable reason.
+    ///
+    /// **Contract** — value format: `"<category>: <detail>"`.
+    /// Category values and their meanings:
+    ///   - `"size exceeded"` — file size exceeds the platform limit
+    ///   - `"unsupported format"` — file type or content provider not supported
+    ///   - `"download failed"` — attachment could not be retrieved
+    ///   - `"processing failed"` — attachment retrieved but could not be processed
+    ///   - `"configuration error"` — required service configuration is missing
+    ///   - `"invalid content"` — content failed validation (e.g. encoding)
+    ///   - `"security rejected"` — request blocked for security reasons
+    ///
+    /// When set, `data` and `path` are empty; `filename`, `mime_type`, and `size`
+    /// (original file size, before processing) are preserved as metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl Attachment {
+    /// Create a rejected attachment carrying a human-readable status reason.
+    /// `size` should be the original file size in bytes (0 if unknown).
+    pub fn rejected(
+        attachment_type: &str,
+        filename: impl Into<String>,
+        mime_type: &str,
+        size: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            attachment_type: attachment_type.into(),
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            data: String::new(),
+            size,
+            path: None,
+            status: Some(reason.into()),
+        }
+    }
 }
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---

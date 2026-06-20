@@ -45,6 +45,8 @@ pub struct AppState {
     pub telegram_bot_token: Option<String>,
     /// Telegram webhook secret token for request validation
     pub telegram_secret_token: Option<String>,
+    /// Use sendRichMessage for complex content (Bot API 10.1+)
+    pub telegram_rich_messages: bool,
     /// LINE channel secret for signature validation
     pub line_channel_secret: Option<String>,
     /// LINE channel access token for reply API
@@ -138,6 +140,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                         &client,
                                         &state_for_recv.event_tx,
                                         &reaction_state,
+                                        state_for_recv.telegram_rich_messages,
                                     )
                                     .await;
                                 } else {
@@ -241,6 +244,9 @@ async fn main() -> Result<()> {
     // Telegram adapter
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
     let telegram_secret_token = std::env::var("TELEGRAM_SECRET_TOKEN").ok();
+    let telegram_rich_messages = std::env::var("TELEGRAM_RICH_MESSAGES")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     if telegram_bot_token.is_some() {
         let webhook_path =
             std::env::var("TELEGRAM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/telegram".into());
@@ -378,6 +384,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
+        telegram_rich_messages,
         line_channel_secret,
         line_access_token,
         teams,

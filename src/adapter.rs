@@ -250,9 +250,14 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
-    /// Rename the thread/channel title. Default: no-op (not all platforms support it).
+    /// Rename the thread/channel title. Default: unsupported error.
     async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
-        Ok(())
+        Err(anyhow::anyhow!("rename_thread not supported on this platform"))
+    }
+
+    /// Archive or unarchive a thread. Default: unsupported error.
+    async fn archive_thread(&self, _channel: &ChannelRef, _archived: bool) -> Result<()> {
+        Err(anyhow::anyhow!("archive_thread not supported on this platform"))
     }
 
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.
@@ -326,6 +331,13 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Whether to send the "…" placeholder message before streaming starts.
+    /// Default: true. Platforms using drafts (e.g. Telegram Rich Messages) can
+    /// return false to suppress the placeholder.
+    fn show_streaming_placeholder(&self) -> bool {
+        true
+    }
 }
 
 // --- AdapterRouter ---
@@ -657,20 +669,35 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming && !native {
+                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
                             "…".to_string()
                         };
-                        let msg = adapter.send_message(&thread_channel, &initial).await?;
+                        let msg = if adapter.show_streaming_placeholder() {
+                            adapter.send_message(&thread_channel, &initial).await?
+                        } else {
+                            // Dummy ref for edit loop — gateway uses drafts, doesn't need real msg_id
+                            MessageRef {
+                                message_id: "draft".to_string(),
+                                channel: thread_channel.clone(),
+                            }
+                        };
                         let (tx, rx) = tokio::sync::watch::channel(initial);
                         let edit_adapter = adapter.clone();
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
-                        tokio::spawn(async move {
+                        let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
+                            // Track consecutive edit failures so we can abort cosmetic
+                            // streaming when the platform stops accepting edits (e.g.
+                            // Feishu's 20-edits-per-message hard cap, errcode 230072).
+                            // Once aborted, the final delivery path still runs and the
+                            // user sees the complete content at turn end.
+                            let mut consecutive_failures: u32 = 0;
+                            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                                 if buf_rx.has_changed().unwrap_or(false) {
@@ -684,9 +711,37 @@ impl AdapterRouter {
                                         } else {
                                             content.clone()
                                         };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
-                                        last = content;
+                                        match edit_adapter
+                                            .edit_message(&edit_msg, &display)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                consecutive_failures = 0;
+                                                last = content;
+                                            }
+                                            Err(e) => {
+                                                consecutive_failures += 1;
+                                                tracing::debug!(
+                                                    message_id = %edit_msg.message_id,
+                                                    platform = %edit_msg.channel.platform,
+                                                    error = ?e,
+                                                    consecutive_failures,
+                                                    "mid-stream cosmetic edit failed"
+                                                );
+                                                if consecutive_failures
+                                                    >= MAX_CONSECUTIVE_FAILURES
+                                                {
+                                                    tracing::warn!(
+                                                        message_id = %edit_msg.message_id,
+                                                        platform = %edit_msg.channel.platform,
+                                                        consecutive_failures,
+                                                        "mid-stream cosmetic edit aborted; \
+                                                         final content will be delivered at turn end"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if buf_rx.has_changed().is_err() {
@@ -694,9 +749,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(msg), Some(edit_handle))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -955,8 +1010,28 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    // Stop the edit loop
+                    // Stop the cosmetic edit loop before the finalize write path
+                    // issues its authoritative edit. Dropping buf_tx closes the watch
+                    // channel so the loop breaks on its next check, but it may be
+                    // mid-edit (a single edit can now block up to the gateway response
+                    // timeout). Without an explicit abort+join, a cosmetic edit issued
+                    // just before close could land *after* the finalize edit and
+                    // overwrite it with stale, mid-stream content (#1122 review NEW-1).
+                    //
+                    // abort() cancels any cosmetic edit that has not yet been put on
+                    // the wire and interrupts the inter-flush sleep immediately; the
+                    // await confirms the task is gone before we proceed. This narrows
+                    // the race to near zero — it does NOT fully eliminate it: a PUT
+                    // already flushed microseconds before abort cannot be recalled,
+                    // and if finalize's PUT travels a different pooled connection the
+                    // server-side arrival order is not strictly guaranteed. That
+                    // residual window is display-only (stale tail briefly shown) and
+                    // far narrower than before this join existed.
                     drop(buf_tx);
+                    if let Some(handle) = edit_handle {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // reply_mode = post_tool_only: when a tool ran, keep only the final
                     // text block (the answer emitted after the last tool call) and drop
@@ -1084,9 +1159,22 @@ impl AdapterRouter {
                     let chunks = if suppress_send {
                         // Reaction-only ack (multi-bot channel, empty turn): post nothing.
                         Vec::new()
+                    } else if adapter.platform() == "discord" {
+                        let mentions = extract_mentions(&final_content);
+                        let mention_reserve = mention_footer_len(&mentions);
+                        let chunks = format::split_message(
+                            &final_content,
+                            message_limit.saturating_sub(mention_reserve),
+                        );
+                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
                     } else {
                         format::split_message(&final_content, message_limit)
                     };
+                    // Track delivery health across all final write paths. Any failure
+                    // here means the user's view is incomplete; we propagate Err at the
+                    // end of the closure so dispatch surfaces set_error (❌) instead of
+                    // silently calling set_done (🆗) over a half-delivered turn.
+                    let mut delivery_failed = false;
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
@@ -1098,7 +1186,12 @@ impl AdapterRouter {
                         // unaffected by this branch.
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
-                                let _ = adapter.stream_append(msg, &native_pending).await;
+                                if let Err(e) =
+                                    adapter.stream_append(msg, &native_pending).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native finalize stream_append failed");
+                                    delivery_failed = true;
+                                }
                             }
                             // Finalize the streamed message with the first chunk (full-replace),
                             // then post any overflow chunks as new in-thread messages — mirrors
@@ -1107,13 +1200,26 @@ impl AdapterRouter {
                             // streaming mode — the streamed message is the in-thread reply.
                             match chunks.first() {
                                 Some(first) => {
-                                    let _ = adapter.stream_finish(msg, first).await;
+                                    if let Err(e) = adapter.stream_finish(msg, first).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish failed");
+                                        delivery_failed = true;
+                                    }
                                     for chunk in chunks.iter().skip(1) {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        if let Err(e) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native overflow chunk send failed");
+                                            delivery_failed = true;
+                                        }
                                     }
                                 }
                                 None => {
-                                    let _ = adapter.stream_finish(msg, &final_content).await;
+                                    if let Err(e) =
+                                        adapter.stream_finish(msg, &final_content).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish (no chunks) failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                         } else {
@@ -1126,7 +1232,12 @@ impl AdapterRouter {
                             // accumulated text_buf) as plain in-thread messages so
                             // the turn is never silently dropped.
                             for chunk in &chunks {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "native fallback chunk send failed");
+                                    delivery_failed = true;
+                                }
                             }
                         }
                     } else if let Some(msg) = placeholder_msg {
@@ -1144,26 +1255,94 @@ impl AdapterRouter {
                                     ).await {
                                         Ok(_) => { send_ok = true; }
                                         Err(e) => {
-                                            tracing::warn!(error = ?e, "reply_to send failed; preserving placeholder");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to send failed; preserving placeholder");
+                                            delivery_failed = true;
                                         }
                                     }
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                } else if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to overflow chunk send failed");
+                                    delivery_failed = true;
                                 }
                                 first = false;
                             }
                             if send_ok {
                                 if let Err(e) = adapter.delete_message(&msg).await {
-                                    tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
                                 }
                             }
-                        } else {
-                            // Normal streaming: edit first chunk into placeholder, send rest
+                        } else if adapter.platform() == "discord"
+                            && contains_bot_mention(&final_content)
+                        {
+                            // Discord-specific: bot mention detected. Delete placeholder
+                            // and send as new message so Discord emits MESSAGE_CREATE —
+                            // otherwise the mentioned bot won't receive the gateway
+                            // event since MESSAGE_UPDATE skips notifications (#1110).
+                            let mut send_ok = false;
                             if let Some(first) = chunks.first() {
-                                let _ = adapter.edit_message(&msg, first).await;
+                                match adapter.send_message(&thread_channel, first).await {
+                                    Ok(_) => {
+                                        send_ok = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "discord bot-mention first chunk send failed");
+                                        delivery_failed = true;
+                                    }
+                                }
                             }
                             for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
+                                    delivery_failed = true;
+                                }
+                            }
+                            if send_ok {
+                                let _ = adapter.delete_message(&msg).await;
+                            }
+                        } else {
+                            // Normal streaming: edit first chunk into placeholder, send rest.
+                            // If placeholder is a dummy "draft" ref (no real message), send as
+                            // new message instead — the gateway will persist via sendRichMessage.
+                            if msg.message_id == "draft" {
+                                for chunk in &chunks {
+                                    if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "draft placeholder fallback chunk send failed");
+                                        delivery_failed = true;
+                                    }
+                                }
+                            } else if let Some(first) = chunks.first() {
+                                // If the placeholder edit fails (e.g. Feishu's
+                                // 20-edits-per-message cap was hit during
+                                // cosmetic streaming and the gateway reports
+                                // edit_cap_reached), fall back to deleting the
+                                // half-edited placeholder and sending the first
+                                // chunk as a fresh message so the user sees the
+                                // complete reply without overlap. If delete
+                                // fails the placeholder simply remains — same
+                                // UX as pre-recovery, not a hard failure.
+                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "final streaming edit failed; deleting placeholder and sending fresh");
+                                    if let Err(de) = adapter.delete_message(&msg).await {
+                                        tracing::warn!(error = ?de, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; user will see overlap");
+                                    }
+                                    if let Err(e2) =
+                                        adapter.send_message(&thread_channel, first).await
+                                    {
+                                        tracing::error!(error = ?e2, platform = %thread_channel.platform, message_id = %msg.message_id, "fallback send_message also failed");
+                                        delivery_failed = true;
+                                    }
+                                }
+                                for chunk in chunks.iter().skip(1) {
+                                    if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
+                                        delivery_failed = true;
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -1173,22 +1352,37 @@ impl AdapterRouter {
                         for chunk in &chunks {
                             if first {
                                 if let Some(ref reply_id) = directives.reply_to {
-                                    let _ = adapter.send_message_with_reply(
+                                    if let Err(e) = adapter.send_message_with_reply(
                                         &thread_channel,
                                         chunk,
                                         reply_id,
-                                    ).await;
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    ).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once reply_to first chunk failed");
+                                        delivery_failed = true;
+                                    }
+                                } else if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once first chunk failed");
+                                    delivery_failed = true;
                                 }
-                            } else {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                            } else if let Err(e) =
+                                adapter.send_message(&thread_channel, chunk).await
+                            {
+                                tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once subsequent chunk failed");
+                                delivery_failed = true;
                             }
                             first = false;
                         }
                     }
 
-                    Ok(())
+                    if delivery_failed {
+                        Err(anyhow::anyhow!(
+                            "streaming finalization had delivery failures; user view is incomplete"
+                        ))
+                    } else {
+                        Ok(())
+                    }
                 })
             })
             .await
@@ -1309,6 +1503,154 @@ pub(crate) fn strip_meta_preamble(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Extract all Discord mentions (`<@123>`, `<@!123>`, `<@&123>`) from content,
+/// skipping mentions inside fenced code blocks (``` ... ```).
+/// Normalizes `<@!UID>` to `<@UID>` for deduplication (same user).
+/// Returns deduplicated list in appearance order.
+fn extract_mentions(content: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut in_fence = false;
+
+    for line in content.split('\n') {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+                let (prefix_end, is_role) = if i + 2 < bytes.len() && bytes[i + 2] == b'&' {
+                    (i + 3, true)
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'!' {
+                    (i + 3, false)
+                } else {
+                    (i + 2, false)
+                };
+                if prefix_end < bytes.len() && bytes[prefix_end].is_ascii_digit() {
+                    if let Some(end) = line[prefix_end..].find('>') {
+                        if line[prefix_end..prefix_end + end]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                        {
+                            // Normalize: <@!UID> → <@UID>, keep <@&RoleID> as-is
+                            let uid = &line[prefix_end..prefix_end + end];
+                            let normalized = if is_role {
+                                format!("<@&{uid}>")
+                            } else {
+                                format!("<@{uid}>")
+                            };
+                            if !mentions.contains(&normalized) {
+                                mentions.push(normalized);
+                            }
+                            i = prefix_end + end + 1;
+                            continue;
+                        }
+                    }
+                }
+                i = prefix_end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    mentions
+}
+
+/// Compute the char length of the mention footer that will be appended.
+/// Returns 0 if no mentions or only 1 chunk would be produced.
+fn mention_footer_len(mentions: &[String]) -> usize {
+    if mentions.is_empty() {
+        return 0;
+    }
+    // "\n" + mentions joined by " "
+    1 + mentions.iter().map(|m| m.len()).sum::<usize>() + mentions.len().saturating_sub(1)
+}
+
+/// Append mentions to split chunks that don't already contain them.
+/// Ensures every chunk carries all mentions from the original content so
+/// receiving bots under `allow_bot_messages = "mentions"` gate accept all pieces.
+/// `limit` is the hard message limit (e.g. 2000) — chunks that would exceed it
+/// after appending are left unchanged (they already fit within split_message's
+/// reduced limit, so the mention_reserve guarantees space in normal cases).
+fn propagate_mentions_to_chunks(
+    chunks: Vec<String>,
+    mentions: &[String],
+    limit: usize,
+) -> Vec<String> {
+    if mentions.is_empty() || chunks.len() <= 1 {
+        return chunks;
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let missing: Vec<&String> = mentions
+                .iter()
+                .filter(|m| !chunk_contains_mention(&chunk, m))
+                .collect();
+            if missing.is_empty() {
+                chunk
+            } else {
+                let footer = format!(
+                    "\n{}",
+                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+                );
+                if chunk.chars().count() + footer.chars().count() <= limit {
+                    format!("{chunk}{footer}")
+                } else {
+                    // Safety: don't exceed limit; chunk already passes gate
+                    // if it contained the mention from the original content.
+                    chunk
+                }
+            }
+        })
+        .collect()
+}
+
+/// Check if a chunk contains an exact mention.
+/// Since mentions are formatted as `<@DIGITS>` (terminated by `>`), a simple
+/// substring search is sufficient — `<@123>` cannot match inside `<@1234>`
+/// because the `>` acts as an exact boundary delimiter.
+fn chunk_contains_mention(chunk: &str, mention: &str) -> bool {
+    chunk.contains(mention)
+}
+
+/// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
+/// or a role mention (`<@&123>`).
+/// Used to detect cross-bot mentions so the streaming path can switch from
+/// edit (MESSAGE_UPDATE, no mention notification) to delete+send (MESSAGE_CREATE).
+fn contains_bot_mention(content: &str) -> bool {
+    let mut i = 0;
+    let bytes = content.as_bytes();
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+            // Skip optional '!' (nickname mention) or '&' (role mention)
+            let start = if i + 2 < bytes.len()
+                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
+            {
+                i + 3
+            } else {
+                i + 2
+            };
+            if start < bytes.len() && bytes[start].is_ascii_digit() {
+                if let Some(end) = content[start..].find('>') {
+                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+            i = start;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
@@ -1998,6 +2340,214 @@ mod tests {
         assert_eq!(format_token_count(999_999), "1000k");
         assert_eq!(format_token_count(1_000_000), "1M");
         assert_eq!(format_token_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn contains_bot_mention_user() {
+        assert!(contains_bot_mention("hello <@1234567890> world"));
+    }
+
+    #[test]
+    fn contains_bot_mention_nickname() {
+        assert!(contains_bot_mention("hey <@!9876543210>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_role() {
+        assert!(contains_bot_mention("calling <@&1496247626675257384>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_no_match() {
+        assert!(!contains_bot_mention("hello world"));
+        assert!(!contains_bot_mention("email user@example.com"));
+        assert!(!contains_bot_mention("<@not_a_number>"));
+        assert!(!contains_bot_mention("<#123456>")); // channel mention
+    }
+
+    #[test]
+    fn contains_bot_mention_embedded() {
+        assert!(contains_bot_mention("請問 <@1501788608439386172> 1+1=?"));
+    }
+
+    #[test]
+    fn extract_mentions_basic() {
+        let mentions = extract_mentions("hello <@123> and <@&456> world");
+        assert_eq!(mentions, vec!["<@123>", "<@&456>"]);
+    }
+
+    #[test]
+    fn extract_mentions_dedup() {
+        let mentions = extract_mentions("<@123> foo <@123> bar");
+        assert_eq!(mentions, vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_normalizes_nickname() {
+        // <@!789> should be normalized to <@789>
+        let mentions = extract_mentions("hey <@!789>");
+        assert_eq!(mentions, vec!["<@789>"]);
+    }
+
+    #[test]
+    fn extract_mentions_dedup_after_normalize() {
+        // <@123> and <@!123> are the same user
+        let mentions = extract_mentions("<@123> and <@!123>");
+        assert_eq!(mentions, vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_skips_code_blocks() {
+        let content = "hello <@111>\n```\n<@222>\n```\nworld <@333>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@111>", "<@333>"]);
+    }
+
+    #[test]
+    fn extract_mentions_none() {
+        let mentions = extract_mentions("no mentions here");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn mention_footer_len_empty() {
+        assert_eq!(mention_footer_len(&[]), 0);
+    }
+
+    #[test]
+    fn mention_footer_len_single() {
+        // "\n<@123>" = 1 + 6 = 7
+        assert_eq!(mention_footer_len(&["<@123>".to_string()]), 7);
+    }
+
+    #[test]
+    fn mention_footer_len_multiple() {
+        // "\n<@123> <@456>" = 1 + 6 + 1 + 6 = 14
+        let mentions = vec!["<@123>".to_string(), "<@456>".to_string()];
+        assert_eq!(mention_footer_len(&mentions), 14);
+    }
+
+    #[test]
+    fn propagate_mentions_single_chunk() {
+        let chunks = vec!["hello <@123>".to_string()];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &["<@123>".to_string()], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn propagate_mentions_appends_to_all_chunks() {
+        let chunks = vec![
+            "first chunk no mention".to_string(),
+            "second chunk".to_string(),
+            "third chunk".to_string(),
+        ];
+        let result = propagate_mentions_to_chunks(chunks, &["<@123>".to_string()], 2000);
+        assert!(result[0].ends_with("\n<@123>"));
+        assert!(result[1].ends_with("\n<@123>"));
+        assert!(result[2].ends_with("\n<@123>"));
+    }
+
+    #[test]
+    fn propagate_mentions_skips_already_present() {
+        let chunks = vec![
+            "hello <@123>".to_string(),
+            "world <@123>".to_string(),
+        ];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &["<@123>".to_string()], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn propagate_mentions_respects_limit() {
+        // Chunk at exactly limit - no room to append
+        let chunk = "x".repeat(2000);
+        let chunks = vec!["short <@123>".to_string(), chunk.clone()];
+        let result = propagate_mentions_to_chunks(chunks, &["<@123>".to_string()], 2000);
+        // Second chunk unchanged (would exceed limit)
+        assert_eq!(result[1], chunk);
+    }
+
+    #[test]
+    fn propagate_mentions_multiple() {
+        let chunks = vec![
+            "<@111> and <@222> start".to_string(),
+            "middle".to_string(),
+        ];
+        let mentions = vec!["<@111>".to_string(), "<@222>".to_string()];
+        let result = propagate_mentions_to_chunks(chunks, &mentions, 2000);
+        assert_eq!(result[1], "middle\n<@111> <@222>");
+    }
+
+    #[test]
+    fn propagate_mentions_empty() {
+        let chunks = vec!["hello".to_string(), "world".to_string()];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &[], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn chunk_contains_mention_exact() {
+        assert!(chunk_contains_mention("hello <@123> world", "<@123>"));
+        assert!(chunk_contains_mention("<@123>", "<@123>"));
+    }
+
+    #[test]
+    fn chunk_contains_mention_not_substring() {
+        // <@123> ends with > so it won't match inside <@1234>
+        // because <@1234> is "<@1234>" not "<@123>4"
+        assert!(!chunk_contains_mention("hello <@1234> world", "<@123>"));
+    }
+
+    #[test]
+    fn pipeline_split_then_propagate() {
+        // End-to-end: split a message that exceeds limit, then propagate mentions.
+        use crate::format::split_message;
+        let mention = "<@99999>";
+        let body = "x".repeat(80);
+        let content = format!("{mention} {body}");
+        let limit: usize = 50;
+        let mentions = extract_mentions(&content);
+        let reserve = mention_footer_len(&mentions);
+        let chunks = split_message(&content, limit.saturating_sub(reserve));
+        let result = propagate_mentions_to_chunks(chunks, &mentions, limit);
+        // Every chunk must carry the mention and fit within limit.
+        for chunk in &result {
+            assert!(chunk.contains(mention), "chunk missing mention: {chunk}");
+            assert!(chunk.chars().count() <= limit, "chunk exceeds limit");
+        }
+    }
+
+    #[test]
+    fn extract_mentions_unclosed_fence() {
+        // Unclosed code fence — everything after it is "inside" fence, so no mentions extracted.
+        let content = "hello <@111>\n```\n<@222>\n<@333>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@111>"]);
+    }
+
+    #[test]
+    fn saturating_sub_large_reserve() {
+        // When mention_reserve exceeds the limit, saturating_sub yields 0.
+        // split_message with limit=0 puts nothing in first chunk but must not panic.
+        use crate::format::split_message;
+        let mentions = vec!["<@111111111111111111>".to_string(); 200];
+        let reserve = mention_footer_len(&mentions);
+        let limit: usize = 100;
+        // saturating_sub → 0
+        let effective = limit.saturating_sub(reserve);
+        assert_eq!(effective, 0);
+        let chunks = split_message("short", effective);
+        // Should not panic; propagation returns chunks unchanged when they'd exceed limit.
+        let result = propagate_mentions_to_chunks(chunks, &mentions, limit);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn role_vs_user_mention_distinction() {
+        // <@&123> (role) and <@123> (user) are distinct mentions.
+        let content = "<@123> hello <@&123>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@123>", "<@&123>"]);
     }
 }
 

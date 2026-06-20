@@ -654,6 +654,7 @@ mod tests {
         Arc::new(crate::AppState {
             telegram_bot_token: None,
             telegram_secret_token: None,
+            telegram_rich_messages: false,
             line_channel_secret: None,
             line_access_token: None,
             teams: Some(TeamsAdapter::new(make_config(vec![]))),

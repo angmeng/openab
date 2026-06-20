@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
 use crate::mcp::{self, McpRuntimeManager};
@@ -25,7 +25,33 @@ Be direct and concise. Execute tasks immediately rather than explaining what you
 // from the LLM and produced the "fs is disconnected, I give up" failure
 // mode observed in the F1 PoC.
 
-const MAX_TOOL_LOOPS: usize = 50;
+const DEFAULT_MAX_TOOL_LOOPS: usize = 50;
+
+fn max_tool_loops() -> usize {
+    let raw = match std::env::var("OPENAB_AGENT_MAX_TOOL_LOOPS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    "OPENAB_AGENT_MAX_TOOL_LOOPS={val:?} is not valid ({e}), \
+                     falling back to {DEFAULT_MAX_TOOL_LOOPS}"
+                );
+                DEFAULT_MAX_TOOL_LOOPS
+            }
+        },
+        Err(_) => DEFAULT_MAX_TOOL_LOOPS,
+    };
+    if raw == 0 {
+        warn!(
+            "OPENAB_AGENT_MAX_TOOL_LOOPS=0 would prevent the agent from running; \
+             using minimum value of 1"
+        );
+        1
+    } else {
+        raw
+    }
+}
+
 /// Maximum number of messages to keep in context. When exceeded, oldest
 /// messages (excluding the first user message) are dropped.
 const MAX_CONTEXT_MESSAGES: usize = 100;
@@ -79,6 +105,12 @@ impl Agent {
     /// Replace the LLM provider while preserving conversation history.
     pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
         self.provider = provider;
+    }
+
+    /// Update working directory and rebuild system prompt.
+    pub fn set_working_dir(&mut self, cwd: String) {
+        self.system_prompt = Self::build_system_prompt(&cwd, self.mcp_manager.as_ref());
+        self.working_dir = PathBuf::from(cwd);
     }
 
     /// Number of messages in the conversation (test helper).
@@ -137,8 +169,14 @@ impl Agent {
         });
 
         let mut final_text = String::new();
+        let max_loops = max_tool_loops();
+        if max_loops != DEFAULT_MAX_TOOL_LOOPS {
+            info!("max_tool_loops={max_loops} (overridden)");
+        } else {
+            debug!("max_tool_loops={max_loops}");
+        }
 
-        for iteration in 0..MAX_TOOL_LOOPS {
+        for iteration in 0..max_loops {
             debug!("agent loop iteration {iteration}");
 
             // Truncate context to prevent unbounded growth / token limit
@@ -219,7 +257,7 @@ impl Agent {
 
         if final_text.is_empty() {
             return Err(anyhow::anyhow!(
-                "agent exceeded maximum tool loop iterations ({MAX_TOOL_LOOPS})"
+                "agent exceeded maximum tool loop iterations ({max_loops})"
             ));
         }
 
@@ -465,5 +503,33 @@ mod tests {
         // Verify file was actually written
         let content = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn test_max_tool_loops_default() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", None::<&str>, || {
+            assert_eq!(max_tool_loops(), DEFAULT_MAX_TOOL_LOOPS);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_custom_value() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("200"), || {
+            assert_eq!(max_tool_loops(), 200);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_invalid_falls_back() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("abc"), || {
+            assert_eq!(max_tool_loops(), DEFAULT_MAX_TOOL_LOOPS);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_zero_clamps_to_one() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("0"), || {
+            assert_eq!(max_tool_loops(), 1);
+        });
     }
 }

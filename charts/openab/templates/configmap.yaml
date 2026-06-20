@@ -61,7 +61,7 @@ data:
     {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
     {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* multibot-mentions (default): require @mention only when another bot has posted in the thread | involved: respond in bot's threads without @mention | mentions: always require @mention */ -}}
     {{- end }}
     {{- if hasKey $cfg.discord "allowDm" }}
     allow_dm = {{ $cfg.discord.allowDm }}
@@ -116,7 +116,7 @@ data:
     {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
     {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* multibot-mentions (default): require @mention only when another bot has posted in the thread | involved: respond in bot's threads without @mention | mentions: always require @mention */ -}}
     {{- end }}
     {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
     {{- if hasKey ($cfg.slack | default dict) "maxBotTurns" }}
