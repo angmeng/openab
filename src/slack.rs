@@ -1594,77 +1594,15 @@ pub async fn run_slack_adapter(
                                         let event = &envelope["payload"]["event"];
                                         let event_type = event["type"].as_str().unwrap_or("");
                                         match event_type {
-                                            "app_mention" => {
-                                                // Apply bot gating for app_mention events (same rules as message events)
-                                                let is_bot = event["bot_id"].is_string()
-                                                    || event["subtype"].as_str() == Some("bot_message");
-                                                if is_bot {
-                                                    match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
-                                                        AllowBots::Mentions | AllowBots::All => {
-                                                            if !trusted_bot_ids.is_empty() {
-                                                                let event_bot_id = event["bot_id"].as_str().unwrap_or("");
-                                                                let is_trusted = adapter
-                                                                    .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
-                                                                    .await;
-                                                                if !is_trusted {
-                                                                    debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
-                                                                    continue;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                let event = event.clone();
-                                                let adapter = adapter.clone();
-                                                let bot_token = bot_token.clone();
-                                                // Snapshot the (runtime-mutable) allowlist per message. Cheap —
-                                                // a handful of channel IDs — and avoids holding the lock across
-                                                // handle_message's awaits. Picks up channels the bot just created.
-                                                let allowed_channels =
-                                                    adapter.allowed_channels.read().await.clone();
-                                                let allowed_users = allowed_users.allowed_users();
-                                                let stt_config = stt_config.clone();
-                                                let dispatcher = dispatcher.clone();
-                                                let ctl_registry = ctl_registry.clone();
-                                                let team_id = envelope["payload"]["team_id"]
-                                                    .as_str()
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                // Idempotency — see SlackAdapter::event_dedup. Claim
-                                                // (channel, ts) at the dispatch point so only the first
-                                                // of the app_mention/message pair dispatches.
-                                                if adapter
-                                                    .already_dispatched(
-                                                        event["channel"].as_str().unwrap_or(""),
-                                                        event["ts"].as_str().unwrap_or(""),
-                                                    )
-                                                    .await
-                                                {
-                                                    debug!(
-                                                        ts = event["ts"].as_str().unwrap_or(""),
-                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
-                                                    );
-                                                    continue;
-                                                }
-                                                tokio::spawn(async move {
-                                                    handle_message(
-                                                        &event,
-                                                        &team_id,
-                                                        &adapter,
-                                                        &bot_token,
-                                                        allow_all_channels,
-                                                        allow_all_users,
-                                                        &allowed_channels,
-                                                        &allowed_users,
-                                                        &stt_config,
-                                                        &dispatcher,
-                                                        &ctl_registry,
-                                                    )
-                                                    .await;
-                                                });
-                                            }
-                                            "message" => {
+                                            // Unified path: `app_mention` and `message` are two deliveries of
+                                            // the same logical inbound message. Slack sends BOTH for a (trusted)
+                                            // peer-bot/human @mention. Routing them through one gating + dispatch
+                                            // body (with `event_dedup` collapsing the pair to a single dispatch)
+                                            // makes loop-protection authoritative and preserves the coverage
+                                            // app_mention alone provides (invite-by-mention, app_mention-only
+                                            // subscriptions, DMs). See 2026-06-23 unify-followup note.
+                                            "app_mention" | "message" => {
+                                                let is_app_mention = event_type == "app_mention";
                                                 let channel_id = event["channel"].as_str().unwrap_or("");
                                                 let has_thread = event["thread_ts"].is_string();
                                                 let is_bot = event["bot_id"].is_string()
@@ -1672,9 +1610,14 @@ pub async fn run_slack_adapter(
                                                 let subtype = event["subtype"].as_str().unwrap_or("");
                                                 let msg_text = event["text"].as_str().unwrap_or("");
                                                 let bot_uid_opt = adapter.get_bot_user_id().await.map(|s| s.to_string());
-                                                let mentions_bot = bot_uid_opt
-                                                    .as_ref()
-                                                    .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
+                                                // app_mention proves the mention regardless of bot-id
+                                                // resolution; a text-parsed mention covers peer-bot mentions
+                                                // Slack delivers only as `message`. Either delivery honours an
+                                                // explicit address.
+                                                let mentions_bot = is_app_mention
+                                                    || bot_uid_opt
+                                                        .as_ref()
+                                                        .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
                                                 let is_dm = channel_id.starts_with('D');
                                                 let event_user_id = event["user"].as_str();
                                                 let is_own_bot_msg = is_bot
@@ -1713,6 +1656,28 @@ pub async fn run_slack_adapter(
                                                     "channel_topic" | "channel_purpose"
                                                 );
                                                 if skip_subtype { continue; }
+
+                                                // Idempotency — claim (channel, ts) HERE, before any
+                                                // side-effecting step (multibot note, bot-turn count) or
+                                                // gating decision. The Socket-Mode loop is sequential, so the
+                                                // first of the app_mention/message pair to arrive wins and runs
+                                                // the pipeline exactly once; the partner (and Slack redeliveries)
+                                                // bail here. Claiming early is what makes the bot-turn STOP
+                                                // authoritative for the whole pair (a turn-limit `continue` no
+                                                // longer leaves the partner free to dispatch). See event_dedup.
+                                                if adapter
+                                                    .already_dispatched(
+                                                        channel_id,
+                                                        event["ts"].as_str().unwrap_or(""),
+                                                    )
+                                                    .await
+                                                {
+                                                    debug!(
+                                                        ts = event["ts"].as_str().unwrap_or(""),
+                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
+                                                    );
+                                                    continue;
+                                                }
 
                                                 // --- Eager multibot detection ---
                                                 // Runs before self-check and bot gating so we always detect
@@ -1783,13 +1748,11 @@ pub async fn run_slack_adapter(
                                                 // Ignore own bot messages (after counting toward turns)
                                                 if is_own_bot_msg { continue; }
 
-                                                // Skip messages that @mention the bot — app_mention handles those.
-                                                // EXCEPT bot-authored mentions: Slack never emits an app_mention
-                                                // event for a mention made by another bot/app, so deferring would
-                                                // drop a peer bot's @mention entirely (it never arrives via
-                                                // app_mention). Also except DMs, where app_mention doesn't fire.
-                                                // Let both fall through to the bot/user gating below.
-                                                if mentions_bot && !is_dm && !is_bot { continue; }
+                                                // (No mention-defer here anymore. Previously the message arm
+                                                // `continue`d on a human @mention to let the separate app_mention
+                                                // arm handle it; now both deliveries share THIS body and the
+                                                // early event_dedup claim collapses the pair to one dispatch, so
+                                                // an @mention must fall through to gating like any other message.)
 
                                                 // --- Bot message gating ---
                                                 if is_bot {
@@ -1845,18 +1808,32 @@ pub async fn run_slack_adapter(
                                                             continue;
                                                         }
                                                     }
-                                                    // Bot messages must be in a thread (no top-level bot processing)
-                                                    if !has_thread { continue; }
+                                                    // Bot messages must be in a thread (top-level bot posts are
+                                                    // loop chatter, not addressed to us) — UNLESS they explicitly
+                                                    // mention us. A top-level @mention is a deliberate address,
+                                                    // delivered as app_mention or (for peer bots) as a text
+                                                    // mention on the message event; both set mentions_bot.
+                                                    if !has_thread && !mentions_bot { continue; }
                                                 }
 
                                                 // --- User message gating ---
                                                 if !is_bot {
                                                     if is_dm {
                                                         // DM: implicit mention — always process
+                                                    } else if mentions_bot {
+                                                        // Explicit @mention — a deliberate address; always
+                                                        // answer regardless of allow_user_messages mode.
+                                                        // Preserves the pre-unification behaviour where the
+                                                        // app_mention arm dispatched mentions unconditionally
+                                                        // (involvement/owner gates apply only to NON-mention
+                                                        // messages).
                                                     } else {
                                                         match allow_user_messages {
                                                             AllowUsers::Mentions => {
-                                                                if !mentions_bot { continue; }
+                                                                // Reached only when !mentions_bot (the
+                                                                // mentions case is handled by the branch
+                                                                // above), so a non-mention message is dropped.
+                                                                continue;
                                                             }
                                                             AllowUsers::Involved => {
                                                                 if !has_thread {
@@ -1925,23 +1902,9 @@ pub async fn run_slack_adapter(
 
                                                 // Dispatch to handle_message (per-thread serialization comes
                                                 // from Dispatcher consumer task in batched mode and from
-                                                // pool.with_connection in per-message mode).
-                                                // Idempotency — see SlackAdapter::event_dedup. Claim
-                                                // (channel, ts) at the dispatch point so only the first
-                                                // of the app_mention/message pair dispatches.
-                                                if adapter
-                                                    .already_dispatched(
-                                                        event["channel"].as_str().unwrap_or(""),
-                                                        event["ts"].as_str().unwrap_or(""),
-                                                    )
-                                                    .await
-                                                {
-                                                    debug!(
-                                                        ts = event["ts"].as_str().unwrap_or(""),
-                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
-                                                    );
-                                                    continue;
-                                                }
+                                                // pool.with_connection in per-message mode). The (channel, ts)
+                                                // dedup claim already happened above (right after subtype skip),
+                                                // so the app_mention/message pair has already collapsed to one.
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
