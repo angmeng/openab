@@ -84,6 +84,40 @@ struct StreamEntry {
     degraded_buf: String,
 }
 
+/// Max inbound message IDs retained for dispatch dedup (see `event_dedup`).
+const EVENT_DEDUP_MAX: usize = 2048;
+
+/// Bounded FIFO set: O(1) contains/insert, evicts the oldest key past `cap`.
+struct FifoSet {
+    cap: usize,
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+impl FifoSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            set: HashSet::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+        }
+    }
+    /// True if `key` was already present (a duplicate). Inserts when new,
+    /// evicting the oldest entry once past `cap`.
+    fn check_and_insert(&mut self, key: String) -> bool {
+        if self.set.contains(&key) {
+            return true;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(key.clone());
+        self.order.push_back(key);
+        false
+    }
+}
+
 pub struct SlackAdapter {
     client: reqwest::Client,
     bot_token: String,
@@ -134,6 +168,19 @@ pub struct SlackAdapter {
     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
     streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
+    /// Inbound-event dedup, keyed on `{channel}|{ts}`. Slack delivers BOTH an
+    /// `app_mention` AND a `message` event for the same message when a (trusted)
+    /// peer bot @mentions us; both reach `handle_message`, so the message is
+    /// dispatched twice → a duplicate, separately-generated reply (observed
+    /// 2026-06-22: thread …424059, two `session/prompt`s, same message_id, 27s
+    /// apart). Makes dispatch idempotent per message: the paired events arrive
+    /// back-to-back in the same read loop, so the second always finds the key.
+    /// FIFO-bounded (capacity, not time): it also collapses a *near-immediate*
+    /// Socket-Mode redelivery, but is NOT a time-window guarantee — a redelivery
+    /// arriving after `EVENT_DEDUP_MAX` other messages have been seen will have
+    /// been evicted. If time-bounded redelivery coverage is ever needed, switch
+    /// to a TTL+FIFO structure.
+    event_dedup: tokio::sync::Mutex<FifoSet>,
 }
 
 impl SlackAdapter {
@@ -170,7 +217,22 @@ impl SlackAdapter {
             config_path,
             assistant_mode,
             streams: tokio::sync::Mutex::new(HashMap::new()),
+            event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
         }
+    }
+
+    /// True if this `{channel}|{ts}` was already dispatched (duplicate event).
+    /// Check-and-insert is atomic under the mutex; the Socket-Mode read loop
+    /// processes envelopes sequentially, so the app_mention/message pair can't
+    /// both pass. Empty `ts` (no id) is never suppressed.
+    async fn already_dispatched(&self, channel_id: &str, ts: &str) -> bool {
+        if ts.is_empty() {
+            return false;
+        }
+        self.event_dedup
+            .lock()
+            .await
+            .check_and_insert(format!("{channel_id}|{ts}"))
     }
 
     /// Add a channel to the runtime allowlist AND persist it to the on-disk
@@ -1569,6 +1631,22 @@ pub async fn run_slack_adapter(
                                                     .as_str()
                                                     .unwrap_or("")
                                                     .to_string();
+                                                // Idempotency — see SlackAdapter::event_dedup. Claim
+                                                // (channel, ts) at the dispatch point so only the first
+                                                // of the app_mention/message pair dispatches.
+                                                if adapter
+                                                    .already_dispatched(
+                                                        event["channel"].as_str().unwrap_or(""),
+                                                        event["ts"].as_str().unwrap_or(""),
+                                                    )
+                                                    .await
+                                                {
+                                                    debug!(
+                                                        ts = event["ts"].as_str().unwrap_or(""),
+                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
+                                                    );
+                                                    continue;
+                                                }
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -1848,6 +1926,22 @@ pub async fn run_slack_adapter(
                                                 // Dispatch to handle_message (per-thread serialization comes
                                                 // from Dispatcher consumer task in batched mode and from
                                                 // pool.with_connection in per-message mode).
+                                                // Idempotency — see SlackAdapter::event_dedup. Claim
+                                                // (channel, ts) at the dispatch point so only the first
+                                                // of the app_mention/message pair dispatches.
+                                                if adapter
+                                                    .already_dispatched(
+                                                        event["channel"].as_str().unwrap_or(""),
+                                                        event["ts"].as_str().unwrap_or(""),
+                                                    )
+                                                    .await
+                                                {
+                                                    debug!(
+                                                        ts = event["ts"].as_str().unwrap_or(""),
+                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
+                                                    );
+                                                    continue;
+                                                }
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
