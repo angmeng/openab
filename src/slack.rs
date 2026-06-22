@@ -173,9 +173,13 @@ pub struct SlackAdapter {
     /// peer bot @mentions us; both reach `handle_message`, so the message is
     /// dispatched twice → a duplicate, separately-generated reply (observed
     /// 2026-06-22: thread …424059, two `session/prompt`s, same message_id, 27s
-    /// apart). Makes dispatch idempotent per message; also absorbs Socket-Mode
-    /// envelope redelivery. FIFO-bounded; entries only need to outlive the
-    /// sub-second gap between the paired events.
+    /// apart). Makes dispatch idempotent per message: the paired events arrive
+    /// back-to-back in the same read loop, so the second always finds the key.
+    /// FIFO-bounded (capacity, not time): it also collapses a *near-immediate*
+    /// Socket-Mode redelivery, but is NOT a time-window guarantee — a redelivery
+    /// arriving after `EVENT_DEDUP_MAX` other messages have been seen will have
+    /// been evicted. If time-bounded redelivery coverage is ever needed, switch
+    /// to a TTL+FIFO structure.
     event_dedup: tokio::sync::Mutex<FifoSet>,
 }
 
