@@ -57,6 +57,40 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 /// aborted turns that begin a stream but never reach stream_finish).
 const STREAM_CACHE_MAX: usize = 1024;
 
+/// Max inbound message IDs retained for dispatch dedup (see `event_dedup`).
+const EVENT_DEDUP_MAX: usize = 2048;
+
+/// Bounded FIFO set: O(1) contains/insert, evicts the oldest key past `cap`.
+struct FifoSet {
+    cap: usize,
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+impl FifoSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            set: HashSet::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+        }
+    }
+    /// True if `key` was already present (a duplicate). Inserts when new,
+    /// evicting the oldest entry once past `cap`.
+    fn check_and_insert(&mut self, key: String) -> bool {
+        if self.set.contains(&key) {
+            return true;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(key.clone());
+        self.order.push_back(key);
+        false
+    }
+}
+
 #[derive(Default)]
 struct StreamEntry {
     active: bool,
@@ -87,10 +121,27 @@ pub struct SlackAdapter {
     /// reply that @-mentions another bot re-firing app_mention in multi-agent
     /// threads). Mirrors `[gateway] streaming`.
     streaming: bool,
+    /// Trusted peer-bot IDs (from `[slack].trusted_bot_ids`). Used by
+    /// `use_streaming` / `uses_native_streaming` to force send-once whenever ANY
+    /// trusted bot is configured: a streamed reply reaches peer bots only as
+    /// `message_changed` events (which every bot's handler skips), so a streamed
+    /// @mention of a peer bot never triggers it. This is race-free, unlike the
+    /// runtime `other_bot_present` cache, which is false when a peer bot is
+    /// addressed before it has posted in the thread.
+    trusted_bot_ids: HashSet<String>,
     /// streaming message ts → state. active=false = degraded (post+edit fallback).
     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
     streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
+    /// Inbound-event dedup, keyed on `{channel}|{ts}`. Slack delivers BOTH an
+    /// `app_mention` AND a `message` event for the same message when a (trusted)
+    /// peer bot — or a human — @mentions us; both reach the unified dispatch
+    /// body, so without this the message is dispatched twice → a duplicate,
+    /// separately-generated reply (observed 2026-06-22: thread …424059, two
+    /// `session/prompt`s, same message_id, 27s apart). Makes dispatch idempotent
+    /// per message; also absorbs Socket-Mode envelope redelivery. FIFO-bounded;
+    /// entries only need to outlive the sub-second gap between the paired events.
+    event_dedup: tokio::sync::Mutex<FifoSet>,
 }
 
 impl SlackAdapter {
@@ -101,6 +152,7 @@ impl SlackAdapter {
         assistant_mode: bool,
         multibot_cache: crate::multibot_cache::MultibotCache,
         streaming: bool,
+        trusted_bot_ids: HashSet<String>,
     ) -> Self {
         Self {
             // Bound every Slack Web API call; an unbounded inline gating call in the
@@ -119,7 +171,9 @@ impl SlackAdapter {
             session_ttl,
             assistant_mode,
             streaming,
+            trusted_bot_ids,
             streams: tokio::sync::Mutex::new(HashMap::new()),
+            event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
         }
     }
 
@@ -141,6 +195,20 @@ impl SlackAdapter {
         }
         // Persist to disk — multibot is irreversible
         self.multibot_cache.mark_multibot(thread_ts).await;
+    }
+
+    /// True if this `{channel}|{ts}` was already dispatched (duplicate event).
+    /// Check-and-insert is atomic under the mutex; the Socket-Mode read loop
+    /// processes envelopes sequentially, so the app_mention/message pair can't
+    /// both pass. Empty `ts` (no id) is never suppressed.
+    async fn already_dispatched(&self, channel_id: &str, ts: &str) -> bool {
+        if ts.is_empty() {
+            return false;
+        }
+        self.event_dedup
+            .lock()
+            .await
+            .check_and_insert(format!("{channel_id}|{ts}"))
     }
 
 
@@ -541,7 +609,13 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
-        self.streaming && !other_bot_present
+        // If any trusted peer bots are configured this is a multi-bot
+        // deployment: force send-once regardless of thread state. A streamed
+        // reply reaches peer bots only as `message_changed` events (which every
+        // bot's handler skips), so a streamed @mention of a peer bot never
+        // triggers it. Race-free, unlike `other_bot_present`, which is false
+        // when a peer bot is addressed before it has posted in the thread.
+        self.streaming && self.trusted_bot_ids.is_empty() && !other_bot_present
     }
 
     fn renders_native_tables(&self) -> bool {
@@ -553,10 +627,17 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn uses_native_streaming(&self, other_bot_present: bool) -> bool {
-        let native = self.streaming && self.assistant_mode && !other_bot_present;
+        // Same multi-bot guard as `use_streaming`: never stream (native either)
+        // when trusted peer bots are configured — a streamed @mention reaches
+        // them only as `message_changed` events, which their handlers skip.
+        let native = self.streaming
+            && self.assistant_mode
+            && self.trusted_bot_ids.is_empty()
+            && !other_bot_present;
         debug!(
             streaming = self.streaming,
             assistant_mode = self.assistant_mode,
+            trusted_bots = !self.trusted_bot_ids.is_empty(),
             other_bot_present,
             native,
             "slack assistant_mode decision (per turn)"
@@ -810,55 +891,15 @@ pub async fn run_slack_adapter(
                                         let event = &envelope["payload"]["event"];
                                         let event_type = event["type"].as_str().unwrap_or("");
                                         match event_type {
-                                            "app_mention" => {
-                                                // Apply bot gating for app_mention events (same rules as message events)
-                                                let is_bot = event["bot_id"].is_string()
-                                                    || event["subtype"].as_str() == Some("bot_message");
-                                                if is_bot {
-                                                    match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
-                                                        AllowBots::Mentions | AllowBots::All => {
-                                                            if !trusted_bot_ids.is_empty() {
-                                                                let event_bot_id = event["bot_id"].as_str().unwrap_or("");
-                                                                let is_trusted = adapter
-                                                                    .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
-                                                                    .await;
-                                                                if !is_trusted {
-                                                                    debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
-                                                                    continue;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                let event = event.clone();
-                                                let adapter = adapter.clone();
-                                                let bot_token = bot_token.clone();
-                                                let allowed_channels = allowed_channels.clone();
-                                                let allowed_users = allowed_users.clone();
-                                                let stt_config = stt_config.clone();
-                                                let dispatcher = dispatcher.clone();
-                                                let team_id = envelope["payload"]["team_id"]
-                                                    .as_str()
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                tokio::spawn(async move {
-                                                    handle_message(
-                                                        &event,
-                                                        &team_id,
-                                                        &adapter,
-                                                        &bot_token,
-                                                        allow_all_channels,
-                                                        allow_all_users,
-                                                        &allowed_channels,
-                                                        &allowed_users,
-                                                        &stt_config,
-                                                        &dispatcher,
-                                                    )
-                                                    .await;
-                                                });
-                                            }
-                                            "message" => {
+                                            // Unified path: `app_mention` and `message` are two deliveries
+                                            // of the same logical inbound message. Slack sends BOTH for a
+                                            // (trusted) peer-bot / human @mention. Routing them through one
+                                            // gating + dispatch body (with `event_dedup` collapsing the pair
+                                            // to a single dispatch) makes loop-protection authoritative and
+                                            // preserves the coverage app_mention alone provides (invite-by-
+                                            // mention, app_mention-only subscriptions, DMs).
+                                            "app_mention" | "message" => {
+                                                let is_app_mention = event_type == "app_mention";
                                                 let channel_id = event["channel"].as_str().unwrap_or("");
                                                 let has_thread = event["thread_ts"].is_string();
                                                 let is_bot = event["bot_id"].is_string()
@@ -866,9 +907,14 @@ pub async fn run_slack_adapter(
                                                 let subtype = event["subtype"].as_str().unwrap_or("");
                                                 let msg_text = event["text"].as_str().unwrap_or("");
                                                 let bot_uid_opt = adapter.get_bot_user_id().await.map(|s| s.to_string());
-                                                let mentions_bot = bot_uid_opt
-                                                    .as_ref()
-                                                    .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
+                                                // app_mention proves the mention regardless of bot-id
+                                                // resolution; a text-parsed mention covers peer-bot mentions
+                                                // Slack delivers only as `message`. Either delivery honours an
+                                                // explicit address.
+                                                let mentions_bot = is_app_mention
+                                                    || bot_uid_opt
+                                                        .as_ref()
+                                                        .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
                                                 let is_dm = channel_id.starts_with('D');
                                                 let event_user_id = event["user"].as_str();
                                                 let is_own_bot_msg = is_bot
@@ -882,8 +928,9 @@ pub async fn run_slack_adapter(
                                                     is_dm,
                                                     subtype,
                                                     mentions_bot,
+                                                    is_app_mention,
                                                     text = msg_text,
-                                                    "message event received"
+                                                    "inbound event received"
                                                 );
 
                                                 // Skip non-message subtypes
@@ -893,6 +940,28 @@ pub async fn run_slack_adapter(
                                                     "channel_topic" | "channel_purpose"
                                                 );
                                                 if skip_subtype { continue; }
+
+                                                // Idempotency — claim (channel, ts) HERE, before any
+                                                // side-effecting step (multibot note, bot-turn count) or
+                                                // gating decision. The Socket-Mode loop is sequential, so the
+                                                // first of the app_mention/message pair to arrive wins and runs
+                                                // the pipeline exactly once; the partner (and Slack redeliveries)
+                                                // bail here. Claiming early is what makes the bot-turn STOP
+                                                // authoritative for the whole pair (a turn-limit `continue` no
+                                                // longer leaves the partner free to dispatch). See event_dedup.
+                                                if adapter
+                                                    .already_dispatched(
+                                                        channel_id,
+                                                        event["ts"].as_str().unwrap_or(""),
+                                                    )
+                                                    .await
+                                                {
+                                                    debug!(
+                                                        ts = event["ts"].as_str().unwrap_or(""),
+                                                        "duplicate inbound event (app_mention+message pair or redelivery) — skipping"
+                                                    );
+                                                    continue;
+                                                }
 
                                                 // --- Eager multibot detection ---
                                                 // Runs before self-check and bot gating so we always detect
@@ -963,9 +1032,11 @@ pub async fn run_slack_adapter(
                                                 // Ignore own bot messages (after counting toward turns)
                                                 if is_own_bot_msg { continue; }
 
-                                                // Skip messages that @mention the bot — app_mention handles those
-                                                // (except in DMs where app_mention doesn't fire)
-                                                if mentions_bot && !is_dm { continue; }
+                                                // (No mention-defer here anymore. Previously the message arm
+                                                // `continue`d on a human @mention to let the separate app_mention
+                                                // arm handle it; now both deliveries share THIS body and the
+                                                // early event_dedup claim collapses the pair to one dispatch, so
+                                                // an @mention must fall through to gating like any other message.)
 
                                                 // --- Bot message gating ---
                                                 if is_bot {
@@ -1021,18 +1092,32 @@ pub async fn run_slack_adapter(
                                                             continue;
                                                         }
                                                     }
-                                                    // Bot messages must be in a thread (no top-level bot processing)
-                                                    if !has_thread { continue; }
+                                                    // Bot messages must be in a thread (top-level bot posts are
+                                                    // loop chatter, not addressed to us) — UNLESS they explicitly
+                                                    // mention us. A top-level @mention is a deliberate address,
+                                                    // delivered as app_mention or (for peer bots) as a text
+                                                    // mention on the message event; both set mentions_bot.
+                                                    if !has_thread && !mentions_bot { continue; }
                                                 }
 
                                                 // --- User message gating ---
                                                 if !is_bot {
                                                     if is_dm {
                                                         // DM: implicit mention — always process
+                                                    } else if mentions_bot {
+                                                        // Explicit @mention — a deliberate address; always
+                                                        // answer regardless of allow_user_messages mode.
+                                                        // Preserves the pre-unification behaviour where the
+                                                        // app_mention arm dispatched mentions unconditionally
+                                                        // (involvement/multibot gates apply only to NON-mention
+                                                        // messages, handled by the match below).
                                                     } else {
                                                         match allow_user_messages {
                                                             AllowUsers::Mentions => {
-                                                                if !mentions_bot { continue; }
+                                                                // Reached only when !mentions_bot (the mentions
+                                                                // case is handled by the branch above), so a
+                                                                // non-mention message is dropped.
+                                                                continue;
                                                             }
                                                             AllowUsers::Involved => {
                                                                 if !has_thread {
@@ -1215,8 +1300,14 @@ async fn handle_message(
     };
     let thread_ts = event["thread_ts"].as_str().map(|s| s.to_string());
 
-    // Check allowed channels
-    if !allow_all_channels && !allowed_channels.contains(&channel_id) {
+    // Check allowed channels. DMs (channel id starts with 'D') are exempt:
+    // they're inherently 1:1 and already gated by `allowed_users` below, so
+    // they must not require the DM channel to appear in `allowed_channels`.
+    // Without this exemption, setting `allowed_channels` to lock down a shared
+    // channel silently drops every DM (regression from the Atlas team-bots
+    // patch, 2026-05-28).
+    let is_dm = channel_id.starts_with('D');
+    if !is_dm && !allow_all_channels && !allowed_channels.contains(&channel_id) {
         return;
     }
 
@@ -1849,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
         adapter.streams.lock().await.insert(
             "TS".into(),
             StreamEntry { active: false, degraded_buf: String::new() },
@@ -2158,7 +2249,7 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
 
         assert!(
             adapter.use_streaming(false),
@@ -2170,24 +2261,56 @@ mod tests {
         );
     }
 
+    /// Multi-bot guard: any configured trusted_bot_ids forces send-once
+    /// regardless of thread state — a streamed reply reaches peer bots only as
+    /// `message_changed` events (which their handlers skip), so a streamed
+    /// @mention of a peer bot never triggers it. Race-free vs `other_bot_present`.
+    #[test]
+    fn streaming_disabled_when_trusted_bots_configured() {
+        let ttl = std::time::Duration::from_secs(300);
+        let trusted = HashSet::from(["U_PEER".to_string()]);
+        // assistant_mode=true so we also exercise the native-streaming path.
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Mentions,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+            trusted,
+        );
+        assert!(
+            !adapter.use_streaming(false),
+            "trusted_bot_ids set => send-once even with no other bot in-thread (race-free)"
+        );
+        assert!(
+            !adapter.use_streaming(true),
+            "trusted_bot_ids set => send-once when other bot present too"
+        );
+        assert!(
+            !adapter.uses_native_streaming(false),
+            "trusted_bot_ids set => native streaming off even alone"
+        );
+    }
+
     #[tokio::test]
     async fn assistant_mode_gates_status_and_native_streaming() {
         let ttl = std::time::Duration::from_secs(60);
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
         assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
         assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
         assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
         assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
-        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
         assert!(!adapter2.uses_assistant_status());
         assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
         assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
 
         // streaming=false → send-once: neither post+edit nor native, even alone.
-        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false);
+        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false, HashSet::new());
         assert!(!adapter3.use_streaming(false), "streaming=false forces send-once (no post+edit)");
         assert!(!adapter3.uses_native_streaming(false), "streaming=false disables native even with assistant_mode");
         assert!(adapter3.uses_assistant_status(), "streaming switch does not affect assistant status API");
@@ -2244,7 +2367,7 @@ mod tests {
     #[test]
     fn typical_long_table_stays_in_one_chunk() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
         let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
@@ -2306,7 +2429,7 @@ mod tests {
     #[test]
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
         assert!(adapter.renders_native_tables());
     }
 }

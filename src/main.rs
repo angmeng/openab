@@ -299,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
             s.assistant_mode,
             multibot_cache.clone(),
             s.streaming,
+            s.trusted_bot_ids.iter().cloned().collect(),
         ))
     });
     #[cfg(not(feature = "slack"))]
