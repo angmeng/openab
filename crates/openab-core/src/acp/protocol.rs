@@ -219,6 +219,14 @@ pub enum AcpEvent {
         options: Vec<ConfigOption>,
     },
     Status,
+    UsageUpdate {
+        used: u64,
+        size: u64,
+        // cost_usd is captured from ACP for future USD-display feature
+        // (Tifa proposal step 6). Currently not displayed.
+        #[allow(dead_code)]
+        cost_usd: Option<f64>,
+    },
 }
 
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
@@ -278,6 +286,19 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         "config_option_update" => {
             let options = parse_config_options(update);
             Some(AcpEvent::ConfigUpdate { options })
+        }
+        "usage_update" => {
+            let used = update.get("used")?.as_u64()?;
+            let size = update.get("size")?.as_u64()?;
+            let cost_usd = update
+                .get("cost")
+                .and_then(|c| c.get("amount"))
+                .and_then(|a| a.as_f64());
+            Some(AcpEvent::UsageUpdate {
+                used,
+                size,
+                cost_usd,
+            })
         }
         _ => None,
     }
@@ -402,5 +423,59 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    #[test]
+    fn classify_usage_update() {
+        let msg = JsonRpcMessage {
+            id: None,
+            method: Some("session/update".into()),
+            params: Some(json!({
+                "sessionId": "abc",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 70679,
+                    "size": 1000000,
+                    "cost": {"amount": 1.477, "currency": "USD"}
+                }
+            })),
+            result: None,
+            error: None,
+        };
+        match classify_notification(&msg) {
+            Some(AcpEvent::UsageUpdate { used, size, cost_usd }) => {
+                assert_eq!(used, 70679);
+                assert_eq!(size, 1000000);
+                assert_eq!(cost_usd, Some(1.477));
+            }
+            other => panic!("expected UsageUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_usage_update_without_cost() {
+        // Early usage_update events arrive without cost; should still parse.
+        let msg = JsonRpcMessage {
+            id: None,
+            method: Some("session/update".into()),
+            params: Some(json!({
+                "sessionId": "abc",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 1000,
+                    "size": 1000000
+                }
+            })),
+            result: None,
+            error: None,
+        };
+        match classify_notification(&msg) {
+            Some(AcpEvent::UsageUpdate { used, size, cost_usd }) => {
+                assert_eq!(used, 1000);
+                assert_eq!(size, 1000000);
+                assert_eq!(cost_usd, None);
+            }
+            other => panic!("expected UsageUpdate, got {other:?}"),
+        }
     }
 }

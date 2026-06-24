@@ -729,6 +729,9 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    // Track the latest usage_update for this prompt; used to
+                    // append a context-usage footer to the final reply (Slack only).
+                    let mut latest_usage: Option<(u64, u64)> = None;
                     // Byte offset into `text_buf` where the final answer block
                     // begins — advanced to the buffer end on every tool
                     // completion so it tracks "just past the last tool". Used by
@@ -1078,6 +1081,9 @@ impl AdapterRouter {
                                 AcpEvent::ConfigUpdate { options } => {
                                     conn.config_options = options;
                                 }
+                                AcpEvent::UsageUpdate { used, size, .. } => {
+                                    latest_usage = Some((used, size));
+                                }
                                 _ => {}
                             }
                         }
@@ -1192,6 +1198,19 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+
+                    // Append context-usage footer (Slack only, threshold-gated).
+                    // Per 2026-05-25-openab-context-usage-footer.md proposal.
+                    let final_content = if let Some((used, size)) = latest_usage {
+                        let threshold = context_footer_threshold();
+                        match format_context_footer(adapter.platform(), used, size, threshold) {
+                            Some(footer) => format!("{final_content}\n\n{footer}"),
+                            None => final_content,
+                        }
+                    } else {
+                        final_content
+                    };
+
                     let chunks = if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);
                         let mention_reserve = mention_footer_len(&mentions);
@@ -1602,6 +1621,62 @@ fn compose_display(
     }
     out.push_str(text.trim_end());
     out
+}
+
+/// Format the context-usage footer per the 2026-05-25 OpenAB proposal.
+///
+/// Returns `None` when usage is below `threshold_pct`, or when called with
+/// non-Slack platform (Discord etc. have their own proposal track).
+///
+/// Returned string is a single italics line (Slack mrkdwn `_..._`) intended
+/// to be appended to the final message body with `\n\n` separator.
+pub(crate) fn format_context_footer(
+    platform: &str,
+    used: u64,
+    size: u64,
+    threshold_pct: u8,
+) -> Option<String> {
+    if platform != "slack" {
+        return None;
+    }
+    if size == 0 {
+        return None;
+    }
+    let pct = (used as f64 / size as f64 * 100.0).round() as u64;
+    if pct < threshold_pct as u64 {
+        return None;
+    }
+    Some(format!(
+        "_⚠ ctx: {pct}% ({used}/{size})_",
+        used = format_token_count(used),
+        size = format_token_count(size),
+    ))
+}
+
+/// Format a token count compactly: 84231 → "84k", 1_000_000 → "1M".
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        if (m - m.round()).abs() < 0.05 {
+            format!("{}M", m.round() as u64)
+        } else {
+            format!("{m:.1}M")
+        }
+    } else if n >= 1_000 {
+        format!("{}k", (n as f64 / 1_000.0).round() as u64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Read `OPENAB_CTX_FOOTER_MIN_PCT` env var, default 70.
+/// Setting `100` disables the footer entirely. Setting `0` enables always-show.
+pub(crate) fn context_footer_threshold() -> u8 {
+    std::env::var("OPENAB_CTX_FOOTER_MIN_PCT")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|&v| v <= 100)
+        .unwrap_or(70)
 }
 
 fn extract_mentions(content: &str) -> Vec<String> {
@@ -2104,6 +2179,48 @@ mod tests {
         )];
         let out = compose_display(&tools, "response text", false, ToolDisplay::None);
         assert_eq!(out, "response text");
+    }
+
+    #[test]
+    fn context_footer_skips_below_threshold() {
+        // 69% on a 1M window with default 70 threshold → no footer.
+        assert!(format_context_footer("slack", 690_000, 1_000_000, 70).is_none());
+    }
+
+    #[test]
+    fn context_footer_appears_at_or_above_threshold() {
+        let out = format_context_footer("slack", 780_000, 1_000_000, 70).unwrap();
+        assert!(out.starts_with("_⚠ ctx: 78%"));
+        assert!(out.contains("(780k/1M)"));
+        assert!(out.ends_with("_"));
+    }
+
+    #[test]
+    fn context_footer_skipped_for_non_slack() {
+        // Proposal scope is Slack only; Discord gets its own track later.
+        assert!(format_context_footer("discord", 900_000, 1_000_000, 70).is_none());
+    }
+
+    #[test]
+    fn context_footer_handles_zero_size_gracefully() {
+        // Defensive: don't divide by zero if ACP ever sends size=0.
+        assert!(format_context_footer("slack", 1000, 0, 70).is_none());
+    }
+
+    #[test]
+    fn context_footer_threshold_zero_always_shows() {
+        // Edge case: threshold=0 means show even at low usage.
+        assert!(format_context_footer("slack", 1000, 1_000_000, 0).is_some());
+    }
+
+    #[test]
+    fn format_token_count_compact() {
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1k");
+        assert_eq!(format_token_count(84_231), "84k");
+        assert_eq!(format_token_count(999_999), "1000k");
+        assert_eq!(format_token_count(1_000_000), "1M");
+        assert_eq!(format_token_count(1_500_000), "1.5M");
     }
 
     #[test]

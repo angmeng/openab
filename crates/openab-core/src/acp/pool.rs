@@ -365,7 +365,27 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&effective_workdir).await?;
+            // Team-wide system-prompt injection. Read a synced rule file (path
+            // overridable via OPENAB_TEAM_SYSTEM_PROMPT_FILE, default
+            // ~/.openab/team-system-prompt.md — same convention as known-bots.md) and
+            // append it on top of the claude_code preset via session/new _meta.
+            // Fail-open: missing or empty file -> None -> agent uses cwd CLAUDE.md only.
+            let team_prompt = {
+                let path = std::env::var("OPENAB_TEAM_SYSTEM_PROMPT_FILE")
+                    .unwrap_or_else(|_| "~/.openab/team-system-prompt.md".to_string());
+                let resolved = match path.strip_prefix("~/") {
+                    Some(rest) => {
+                        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(rest))
+                    }
+                    None => Some(std::path::PathBuf::from(&path)),
+                };
+                resolved
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .filter(|s| !s.trim().is_empty())
+            };
+            new_conn
+                .session_new(&effective_workdir, team_prompt.as_deref())
+                .await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
