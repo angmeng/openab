@@ -270,9 +270,18 @@ pub(crate) fn strip_meta_preamble(text: &str) -> String {
         let line_end = s.find('\n').unwrap_or(s.len());
         let first_line = s[..line_end].trim_end();
         let lower = first_line.to_ascii_lowercase();
-        let is_preamble = first_line.ends_with(':')
+        let is_opener = first_line.ends_with(':')
             && first_line.chars().count() <= 120
             && META_PREAMBLE_OPENERS.iter().any(|op| lower.starts_with(op));
+        // Persona-binding startup leak: the silent `echo "OPENAB_PERSONA_ID=..."`
+        // setup step (vault CLAUDE.md) sometimes leaks into the reply as a leading
+        // line like "`OPENAB_PERSONA_ID=tifa` — replying." Strip it when it opens
+        // the message (tolerate a leading code-fence backtick). Position-anchored
+        // so a mid-sentence mention of the var in a genuine answer is untouched.
+        let is_persona_echo = first_line
+            .trim_start_matches('`')
+            .starts_with("OPENAB_PERSONA_ID=");
+        let is_preamble = is_opener || is_persona_echo;
         if !is_preamble {
             break;
         }
@@ -2102,6 +2111,24 @@ mod tests {
     fn strip_meta_preamble_removes_reply_in_thread_line() {
         let got = strip_meta_preamble("Reply in-thread:\n\nGot it — no ticket, scope locked.");
         assert_eq!(got, "Got it — no ticket, scope locked.");
+    }
+
+    #[test]
+    fn strip_meta_preamble_removes_persona_id_startup_leak() {
+        // The 2026-06-24 leak shape: silent persona-binding echo leaked as the
+        // opening line (with code-fence backticks), answer glued in same block.
+        let got = strip_meta_preamble(
+            "`OPENAB_PERSONA_ID=tifa` — replying.\n\nTurn-based games we can play: 20 Questions, word chain.",
+        );
+        assert_eq!(
+            got,
+            "Turn-based games we can play: 20 Questions, word chain."
+        );
+        // Also the no-backtick form.
+        assert_eq!(
+            strip_meta_preamble("OPENAB_PERSONA_ID=tifa — replying.\n\nHi there."),
+            "Hi there."
+        );
     }
 
     #[test]
