@@ -812,8 +812,20 @@ impl AdapterRouter {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
-                                // Reader saw EOF and already drained pending; nothing to abandon.
-                                None => break,
+                                // EOF before the agent's keyed final response: the stream closed
+                                // mid-turn (connection drop / agent exit). This is an INCOMPLETE
+                                // turn, not a clean empty one — surface it as an interruption so
+                                // the user sees a notice (+ any partial text) rather than a bare
+                                // "_(no response)_". Pairs with the coded-error path below; both
+                                // mean "turn didn't finish".
+                                None => {
+                                    response_error.get_or_insert_with(|| {
+                                        "Response interrupted — the agent stream closed before \
+                                         completing (the connection may have dropped). Say \
+                                         \"continue\" to resume.".to_string()
+                                    });
+                                    break;
+                                }
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
