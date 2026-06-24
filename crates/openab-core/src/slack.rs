@@ -14,6 +14,21 @@ use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
 
+/// Marker syntax for outbound file attachments in agent text output.
+/// The agent writes `<<openab-send-file /abs/path/to/file>>` in its response,
+/// OpenAB intercepts before posting and uploads the file via Slack's files API.
+///
+/// IMPORTANT: do NOT use colons in this marker (`:something:` would collide
+/// with Slack's emoji shortcode parser and get rendered as a gray-box
+/// placeholder even before our interceptor runs). The prefix/suffix and the
+/// line-anchoring rules MUST stay in sync with `relay::strip_file_send_markers`,
+/// which neutralizes the same marker on relay (peer-dispatch) bodies.
+const FILE_SEND_MARKER_PREFIX: &str = "<<openab-send-file ";
+const FILE_SEND_MARKER_SUFFIX: &str = ">>";
+/// Sanity cap so an agent typo doesn't try to upload /Users/jazlim or similar.
+/// Slack's own per-file limit is 1 GB by default; we cap at 100 MB.
+const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
 /// outside this map will fall back to `grey_question`.
@@ -142,6 +157,11 @@ pub struct SlackAdapter {
     /// per message; also absorbs Socket-Mode envelope redelivery. FIFO-bounded;
     /// entries only need to outlive the sub-second gap between the paired events.
     event_dedup: tokio::sync::Mutex<FifoSet>,
+    /// Dedup set for file uploads — keyed on `{channel}|{thread_ts}|{path}`.
+    /// The streaming path calls `edit_message` repeatedly with the final reply,
+    /// each potentially containing the file-send marker. Without dedup we'd
+    /// re-upload the same file dozens of times. Cleared once per session restart.
+    file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl SlackAdapter {
@@ -174,6 +194,7 @@ impl SlackAdapter {
             trusted_bot_ids,
             streams: tokio::sync::Mutex::new(HashMap::new()),
             event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
+            file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -297,6 +318,165 @@ impl SlackAdapter {
             return Err(anyhow!("Slack API {method}: {err}"));
         }
         Ok(json)
+    }
+
+    /// Post a plain text message — the original `send_message` body, extracted
+    /// so the file-send marker-aware paths can reuse it for captions and error
+    /// notices. Uses mrkdwn (no Block Kit `markdown` block) so it can't trip the
+    /// block-payload-rejected fallback dance — these are short, plain strings.
+    async fn send_plain_text(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        let mrkdwn = markdown_to_mrkdwn(content);
+        let mut body = serde_json::json!({
+            "channel": channel.channel_id,
+            "text": mrkdwn,
+        });
+        if let Some(thread_ts) = &channel.thread_id {
+            body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+        }
+        let resp = self.api_post("chat.postMessage", body).await?;
+        let ts = resp["ts"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no ts in chat.postMessage response"))?;
+        Ok(MessageRef {
+            channel: ChannelRef {
+                platform: "slack".into(),
+                channel_id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: ts.to_string(),
+        })
+    }
+
+    /// Upload a file from disk and share it into the given channel/thread.
+    ///
+    /// Implements Slack's 3-step modern upload API:
+    ///   1. `files.getUploadURLExternal` → get an upload_url + file_id
+    ///   2. POST raw bytes to that upload_url
+    ///   3. `files.completeUploadExternal` → publish into the channel
+    ///
+    /// Returns a MessageRef pointing at the share message ts. Failures bubble up
+    /// with the Slack error code in the message; caller is responsible for
+    /// surfacing to the user.
+    ///
+    /// Required Slack bot scopes: `files:write`. The file path must be readable
+    /// by the OpenAB process (host or container — whichever filesystem the
+    /// bridge runs in).
+    async fn send_file_to_slack(&self, channel: &ChannelRef, path: &str) -> Result<MessageRef> {
+        use tokio::io::AsyncReadExt;
+
+        // --- Validate the path ---
+        let path_buf = std::path::PathBuf::from(path);
+        if !path_buf.is_file() {
+            return Err(anyhow!("not a regular file: {path}"));
+        }
+        let metadata = tokio::fs::metadata(&path_buf).await?;
+        let size = metadata.len();
+        if size == 0 {
+            return Err(anyhow!("file is empty: {path}"));
+        }
+        if size > FILE_SEND_MAX_BYTES {
+            return Err(anyhow!(
+                "file too large ({size} bytes > {FILE_SEND_MAX_BYTES} cap): {path}"
+            ));
+        }
+        let filename = path_buf
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("could not derive filename from path: {path}"))?
+            .to_string();
+
+        debug!(path = %path, filename = %filename, size, "slack: starting file upload");
+
+        // --- Step 1: getUploadURLExternal (form-encoded GET, per Slack docs) ---
+        let step1_resp = self
+            .client
+            .get(format!("{SLACK_API}/files.getUploadURLExternal"))
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .query(&[
+                ("filename", filename.as_str()),
+                ("length", size.to_string().as_str()),
+            ])
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        if step1_resp["ok"].as_bool() != Some(true) {
+            let err = step1_resp["error"]
+                .as_str()
+                .unwrap_or("unknown getUploadURLExternal error");
+            return Err(anyhow!("files.getUploadURLExternal: {err}"));
+        }
+        let upload_url = step1_resp["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no upload_url in getUploadURLExternal response"))?
+            .to_string();
+        let file_id = step1_resp["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no file_id in getUploadURLExternal response"))?
+            .to_string();
+
+        // --- Step 2: POST raw bytes to the signed URL ---
+        let mut file_bytes = Vec::with_capacity(size as usize);
+        tokio::fs::File::open(&path_buf)
+            .await?
+            .read_to_end(&mut file_bytes)
+            .await?;
+
+        let step2_resp = self.client.post(&upload_url).body(file_bytes).send().await?;
+
+        if !step2_resp.status().is_success() {
+            let status = step2_resp.status();
+            let body = step2_resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "upload POST failed: HTTP {status} — body: {}",
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+
+        // --- Step 3: completeUploadExternal — actually publish into the channel ---
+        let mut complete_body = serde_json::json!({
+            "files": [{ "id": file_id, "title": filename }],
+            "channel_id": channel.channel_id,
+        });
+        if let Some(thread_ts) = &channel.thread_id {
+            complete_body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+        }
+
+        let step3_resp = self
+            .api_post("files.completeUploadExternal", complete_body)
+            .await?;
+
+        // Slack returns the file metadata; we want the share's message timestamp.
+        // It's available under `files[0].shares.public.<channel>[0].ts` or
+        // `files[0].shares.private.<channel>[0].ts`. Probe both.
+        let ts = extract_share_message_ts(&step3_resp, &channel.channel_id).unwrap_or_else(|| {
+            // No ts surfaced — use file_id as a stand-in. MessageRef is mostly
+            // used for reactions and edits, neither of which makes sense for a
+            // file share. So file_id is a reasonable degenerate identity.
+            file_id.clone()
+        });
+
+        info!(
+            file_id = %file_id,
+            filename = %filename,
+            size,
+            channel = %channel.channel_id,
+            "slack: file upload complete"
+        );
+
+        Ok(MessageRef {
+            channel: ChannelRef {
+                platform: "slack".into(),
+                channel_id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: ts,
+        })
     }
 
     /// Resolve a Slack user ID to display name via users.info API.
@@ -508,6 +688,43 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        // Scan for file-send markers `<<openab-send-file PATH>>`. If found,
+        // intercept: post the residual text (caption) first, then upload each
+        // file via Slack's files API. Returns the MessageRef of the last action.
+        if let Some((stripped_text, file_paths)) = extract_file_send_markers(content) {
+            let mut last_msg: Option<MessageRef> = None;
+
+            // Post the residual text first (if non-empty), so the file appears
+            // AFTER any caption — matches the reading order users expect.
+            let trimmed = stripped_text.trim();
+            if !trimmed.is_empty() {
+                last_msg = Some(self.send_plain_text(channel, trimmed).await?);
+            }
+
+            // Upload each file. Failure on one shouldn't block the rest — log
+            // and surface the failure to the user, then continue.
+            for path in &file_paths {
+                match self.send_file_to_slack(channel, path).await {
+                    Ok(msg_ref) => {
+                        info!(path = %path, "slack: file uploaded");
+                        last_msg = Some(msg_ref);
+                    }
+                    Err(e) => {
+                        error!(path = %path, error = %e, "slack: file upload failed");
+                        let err_text = format!(
+                            "⚠️ Failed to send file `{}`: {}\n(See OpenAB logs for details.)",
+                            path, e
+                        );
+                        last_msg = Some(self.send_plain_text(channel, &err_text).await?);
+                    }
+                }
+            }
+
+            // If we somehow had only markers and no surviving text, return a stub.
+            return last_msg
+                .ok_or_else(|| anyhow!("no message sent (empty after marker strip)"));
+        }
+
         let thread_ts = channel.thread_id.as_deref();
         let body = build_post_message_body(&channel.channel_id, thread_ts, content);
         let resp = match self.api_post("chat.postMessage", body).await {
@@ -593,6 +810,72 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        // Marker handling for the streaming path: OpenAB streams the final agent
+        // response via repeated edit_message calls against a placeholder. If the
+        // text contains file-send markers, strip them from the edit (so the
+        // placeholder shows clean text) and trigger uploads as separate
+        // follow-up messages in the same channel/thread.
+        //
+        // Idempotency: each file must upload ONCE per session, not on every
+        // streaming edit. Tracked via `file_upload_cache` keyed on
+        // (channel_id, thread_ts, path).
+        if let Some((stripped_text, file_paths)) = extract_file_send_markers(content) {
+            // Edit the placeholder to the clean text (without markers).
+            let stripped_mrkdwn = markdown_to_mrkdwn(&stripped_text);
+            self.api_post(
+                "chat.update",
+                serde_json::json!({
+                    "channel": msg.channel.channel_id,
+                    "ts": msg.message_id,
+                    "text": stripped_mrkdwn,
+                }),
+            )
+            .await?;
+
+            // Upload each file as a follow-up, deduped via the cache.
+            //
+            // Race-free check-and-claim: insert into the cache FIRST under the
+            // lock, then upload. If insertion returns false (key already
+            // present), another edit_message call already claimed the slot —
+            // skip. A check-then-act with the lock released between check and
+            // insert would let two streaming edits within the upload-latency
+            // window both pass the check and double-upload.
+            for path in &file_paths {
+                let cache_key = format!(
+                    "{}|{}|{}",
+                    msg.channel.channel_id,
+                    msg.channel.thread_id.as_deref().unwrap_or(""),
+                    path
+                );
+                let claimed = {
+                    let mut cache = self.file_upload_cache.lock().await;
+                    cache.insert(cache_key.clone()) // true if newly inserted
+                };
+                if !claimed {
+                    debug!(path = %path, "skipping duplicate file upload (already claimed)");
+                    continue;
+                }
+                match self.send_file_to_slack(&msg.channel, path).await {
+                    Ok(_) => {
+                        info!(path = %path, "slack: file uploaded via edit_message");
+                    }
+                    Err(e) => {
+                        error!(path = %path, error = %e, "slack: file upload failed");
+                        // Roll back the claim so a future retry of the SAME path
+                        // (e.g. user re-asks after fixing the path) isn't blocked.
+                        let mut cache = self.file_upload_cache.lock().await;
+                        cache.remove(&cache_key);
+                        let err_text = format!(
+                            "⚠️ Failed to send file `{}`: {}\n(See OpenAB logs for details.)",
+                            path, e
+                        );
+                        let _ = self.send_plain_text(&msg.channel, &err_text).await;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let body = build_update_body(&msg.channel.channel_id, &msg.message_id, content);
         match self.api_post("chat.update", body).await {
             Ok(_) => Ok(()),
@@ -1788,6 +2071,74 @@ fn is_plain_user_message(subtype: &str, text: &str) -> bool {
     )
 }
 
+/// Parse outbound text for file-send markers `<<openab-send-file PATH>>`.
+/// Returns `Some((text_without_markers, paths))` if at least one marker line is
+/// found, `None` otherwise (fast-path).
+///
+/// **Line-anchored**: the marker must occupy a line on its own (after trimming
+/// whitespace). Inline occurrences inside running text are preserved as literal
+/// — this prevents the agent from self-triggering when quoting its own source
+/// code or documentation that mentions the marker (2026-05-26 regression).
+///
+/// This is the slack-send counterpart to `relay::strip_file_send_markers`: the
+/// relay helper only strips markers from peer-dispatch bodies (it returns no
+/// paths, because relay targets never upload), whereas this also extracts the
+/// paths to upload. Both use identical prefix/suffix and line-anchoring rules.
+fn extract_file_send_markers(content: &str) -> Option<(String, Vec<String>)> {
+    if !content.contains(FILE_SEND_MARKER_PREFIX) {
+        return None;
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with(FILE_SEND_MARKER_PREFIX)
+            && trimmed.ends_with(FILE_SEND_MARKER_SUFFIX)
+        {
+            // Verified marker line: extract path between prefix and suffix.
+            let inner = &trimmed
+                [FILE_SEND_MARKER_PREFIX.len()..trimmed.len() - FILE_SEND_MARKER_SUFFIX.len()];
+            let path = inner.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+            // Either way, drop the marker line from output (don't leak an empty
+            // `<<openab-send-file >>` to the user).
+            continue;
+        }
+        // Not a marker line — preserve verbatim. Inline marker text is kept literal.
+        kept_lines.push(line);
+    }
+
+    if paths.is_empty() {
+        return None;
+    }
+    Some((kept_lines.join("\n"), paths))
+}
+
+/// Pull the share message timestamp out of a `files.completeUploadExternal`
+/// response, probing both `public` and `private` share entries for the channel.
+/// Returns None if the response shape doesn't match (Slack may change this).
+fn extract_share_message_ts(resp: &serde_json::Value, channel_id: &str) -> Option<String> {
+    let files = resp.get("files")?.as_array()?;
+    let first = files.first()?;
+    let shares = first.get("shares")?;
+    for visibility in ["public", "private"] {
+        if let Some(share_map) = shares.get(visibility) {
+            if let Some(channel_shares) = share_map.get(channel_id) {
+                if let Some(first_share) = channel_shares.as_array().and_then(|a| a.first()) {
+                    if let Some(ts) = first_share.get("ts").and_then(|v| v.as_str()) {
+                        return Some(ts.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Slack caps a single Block Kit `markdown` block at 12,000 characters; we use
 /// 11,900 to keep ~100 chars of headroom. Doubles as the Slack `message_limit`
 /// so the router splits long replies into separate messages at the same bound
@@ -2279,6 +2630,93 @@ mod tests {
     fn trusted_bot_ids_rejects_empty_event_bot_id() {
         let trusted = HashSet::from(["".to_string()]);
         assert!(!bot_id_matches_trusted(&trusted, "", None));
+    }
+
+    // --- extract_file_send_markers tests (line-anchoring, 2026-05-26) ---
+
+    #[test]
+    fn marker_extracts_anchored_single_line() {
+        let input = "Here is the file:\n<<openab-send-file /tmp/report.pdf>>\nHope it helps.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("marker should fire");
+        assert_eq!(paths, vec!["/tmp/report.pdf".to_string()]);
+        assert_eq!(stripped, "Here is the file:\nHope it helps.");
+    }
+
+    #[test]
+    fn marker_extracts_multiple_anchored_lines() {
+        let input = "Files:\n<<openab-send-file /a.txt>>\n<<openab-send-file /b.txt>>\nDone.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("markers should fire");
+        assert_eq!(paths, vec!["/a.txt".to_string(), "/b.txt".to_string()]);
+        assert_eq!(stripped, "Files:\nDone.");
+    }
+
+    #[test]
+    fn marker_inline_is_not_extracted() {
+        // Self-trigger regression: agent quotes the marker mid-sentence.
+        let input = "The marker syntax is `<<openab-send-file /abs/path>>` you write in chat.";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_indented_still_anchored() {
+        let input = "Result:\n    <<openab-send-file /tmp/x.png>>   \nDone.";
+        let (stripped, paths) = extract_file_send_markers(input).expect("marker should fire");
+        assert_eq!(paths, vec!["/tmp/x.png".to_string()]);
+        assert_eq!(stripped, "Result:\nDone.");
+    }
+
+    #[test]
+    fn marker_at_bof_and_eof() {
+        let bof = "<<openab-send-file /a>>\ntrailing";
+        let (s1, p1) = extract_file_send_markers(bof).expect("BOF marker should fire");
+        assert_eq!(p1, vec!["/a".to_string()]);
+        assert_eq!(s1, "trailing");
+
+        let eof = "leading\n<<openab-send-file /b>>";
+        let (s2, p2) = extract_file_send_markers(eof).expect("EOF marker should fire");
+        assert_eq!(p2, vec!["/b".to_string()]);
+        assert_eq!(s2, "leading");
+    }
+
+    #[test]
+    fn marker_with_trailing_text_on_same_line_is_ignored() {
+        let input = "<<openab-send-file /a.txt>> caption text";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_self_trigger_regression_quoted_source_code() {
+        // 2026-05-26 incident: an agent read slack.rs and quoted the marker
+        // prefix verbatim in a reply. The line-anchor keeps it literal.
+        let input = "OpenAB marker syntax `<<openab-send-file ` and suffix `>>` plus other words like `<<openab-relay-to discord:swat-team>>` describe the design.";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn marker_empty_path_drops_line_without_upload() {
+        let input = "Before\n<<openab-send-file >>\nAfter";
+        assert!(extract_file_send_markers(input).is_none());
+    }
+
+    #[test]
+    fn share_message_ts_probes_public_and_private() {
+        let public = serde_json::json!({
+            "files": [{ "shares": { "public": { "C1": [{ "ts": "1700.1" }] } } }]
+        });
+        assert_eq!(
+            extract_share_message_ts(&public, "C1"),
+            Some("1700.1".to_string())
+        );
+        let private = serde_json::json!({
+            "files": [{ "shares": { "private": { "C2": [{ "ts": "1700.2" }] } } }]
+        });
+        assert_eq!(
+            extract_share_message_ts(&private, "C2"),
+            Some("1700.2".to_string())
+        );
+        // Shape mismatch → None.
+        let bad = serde_json::json!({ "files": [{ "shares": {} }] });
+        assert_eq!(extract_share_message_ts(&bad, "C1"), None);
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).
