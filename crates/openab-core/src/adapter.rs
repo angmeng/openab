@@ -117,19 +117,55 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
 /// `answer_start` is always a previous `full.len()`, hence a valid char
 /// boundary; the `get(..)` fallback to `full` only guards against a future
 /// caller passing a stale offset.
-pub fn select_delivery_text(full: &str, answer_start: usize, keep_full: bool) -> &str {
+///
+/// One refinement (ported 2026-06-10, 0f1f4e9): if the post-last-tool slice is
+/// *only* a transient status aside (e.g. "(背景驗證還在跑…)") and the text just
+/// before the last tool carries real content, prepend that content so the
+/// finding isn't silently replaced by the aside. Without this, a turn that
+/// emits the finding, runs a final tool, then tacks on a parenthetical note
+/// delivers only the aside — the "answer vanished" worst case. Strictly
+/// additive: the aside is preserved, and a substantive (non-parenthetical)
+/// final answer is never demoted.
+pub fn select_delivery_text(full: &str, answer_start: usize, keep_full: bool) -> Cow<'_, str> {
     if keep_full {
-        full
-    } else {
-        full.get(answer_start..).unwrap_or_else(|| {
-            tracing::warn!(
-                answer_start,
-                full_len = full.len(),
-                "stale answer_start offset; delivering full buffer"
-            );
-            full
-        })
+        return Cow::Borrowed(full);
     }
+    let Some(post_tool) = full.get(answer_start..) else {
+        tracing::warn!(
+            answer_start,
+            full_len = full.len(),
+            "stale answer_start offset; delivering full buffer"
+        );
+        return Cow::Borrowed(full);
+    };
+    // Recovery: a tool ran (answer_start > 0) and the post-tool slice is wholly
+    // a status aside — pull back the finding emitted before the last tool.
+    if answer_start > 0 && is_status_aside(post_tool) {
+        let before = &full[..answer_start];
+        if is_substantive(before) {
+            return Cow::Owned(format!("{}\n\n{}", before.trim_end(), post_tool.trim_start()));
+        }
+    }
+    Cow::Borrowed(post_tool)
+}
+
+/// A trailing block that is wholly wrapped in a single pair of (half- or
+/// full-width) parentheses — a transient status note like
+/// "(background job still running, will report when done)". Under send-once
+/// trimming these displace the real finding the model emitted just before the
+/// last tool call, so they're recoverable rather than authoritative.
+fn is_status_aside(s: &str) -> bool {
+    let t = s.trim();
+    let first = t.chars().next();
+    let last = t.chars().last();
+    matches!(first, Some('(') | Some('（')) && matches!(last, Some(')') | Some('）'))
+}
+
+/// Heuristic for "this block carries real content, not a one-line narration
+/// fragment". 80 chars comfortably clears "收到", "我先看一下", "Let me check X"
+/// while admitting a genuine multi-sentence finding.
+fn is_substantive(s: &str) -> bool {
+    s.trim().chars().count() >= 80
 }
 
 /// Resolve the directives and body to deliver for a finished turn.
@@ -159,9 +195,9 @@ pub fn split_delivery(
     // begins at byte 0 (no tools ran, or keep_full). When answer_start > 0,
     // delivered is the post-last-tool suffix — don't re-parse it.
     let body = if answer_start == 0 || keep_full {
-        parse_output_directives(delivered).1
+        parse_output_directives(&delivered).1
     } else {
-        delivered.to_owned()
+        delivered.into_owned()
     };
     (directives, body)
 }
@@ -190,6 +226,71 @@ pub(crate) fn finalize_body(
         format!("⚠️ _Session expired, starting fresh..._\n\n{body}")
     } else {
         body
+    }
+}
+
+/// Openers that, when a reply *starts* with one AND the line ends in ':',
+/// mark a model-emitted process-narration preamble rather than real content
+/// (e.g. "Now the reply (channel → English, mrkdwn, grounded):" or
+/// "Reply in-thread:"). Kept tight + lower-cased; matched position-anchored so
+/// a reply that merely *mentions* these words later is never touched.
+const META_PREAMBLE_OPENERS: &[&str] = &[
+    "now the reply",
+    "now my reply",
+    "reply in-thread",
+    "reply in thread",
+    "here's the reply",
+    "here is the reply",
+];
+
+/// Strip a leading process-narration "status line" from a reply when it is the
+/// very first content — e.g. "Now the reply (channel → English, mrkdwn,
+/// grounded):" or "Reply in-thread:". Also drops a horizontal rule immediately
+/// following such a line. Position-sensitive, pure, and idempotent.
+///
+/// Why this exists (2026-06-16): the preamble both leaks reasoning into the
+/// channel AND, once posted, re-enters the model's context as thread history
+/// and gets imitated, so the leak compounds across a thread. The offset-based
+/// narration trim (`select_delivery_text`) can't catch it — the preamble is
+/// glued to the answer in one text block with no tool boundary, so on a no-tool
+/// turn the offset stays at 0 and the whole block (preamble + answer) ships.
+/// This is the complementary sanitizer: applied to the final reply text after
+/// `select_delivery_text`, it strips the preamble even when no tool ran.
+/// Stripping it here (send time) and in re-injected thread context breaks the
+/// loop at both ends.
+/// Root-cause: AI-Memory/shared/2026-06-16-tifa-meta-preamble-leak-rootcause.md.
+///
+/// Fail-safe: if stripping would empty the message, the original is returned
+/// untouched (never silently blank a reply).
+pub(crate) fn strip_meta_preamble(text: &str) -> String {
+    let mut cur = text;
+    let mut stripped_any = false;
+    loop {
+        let s = cur.trim_start();
+        let line_end = s.find('\n').unwrap_or(s.len());
+        let first_line = s[..line_end].trim_end();
+        let lower = first_line.to_ascii_lowercase();
+        let is_preamble = first_line.ends_with(':')
+            && first_line.chars().count() <= 120
+            && META_PREAMBLE_OPENERS.iter().any(|op| lower.starts_with(op));
+        if !is_preamble {
+            break;
+        }
+        stripped_any = true;
+        // Advance past the preamble line.
+        cur = &s[line_end..];
+        // Optionally skip a single following horizontal rule (the model often
+        // inserts "---" between the preamble and the real answer).
+        let after = cur.trim_start();
+        let hr_end = after.find('\n').unwrap_or(after.len());
+        if matches!(after[..hr_end].trim(), "---" | "***" | "___") {
+            cur = &after[hr_end..];
+        }
+    }
+    if stripped_any && !cur.trim().is_empty() {
+        cur.trim_start().to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -1130,6 +1231,17 @@ impl AdapterRouter {
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
+                    // Strip a leading process-narration status line ("Now the
+                    // reply (channel → English, mrkdwn, grounded):", "Reply
+                    // in-thread:") glued to the answer in one block. The
+                    // offset-based trim (select_delivery_text) can't catch it on
+                    // a no-tool turn (offset stays 0), so this complementary
+                    // sanitizer runs on the final reply text. Also breaks the
+                    // self-imitation loop: a stripped preamble never lands in
+                    // the channel, so it never re-enters context as thread
+                    // history to be copied next turn.
+                    let text_buf = strip_meta_preamble(&text_buf);
+
                     // Cross-channel relay extraction. Runs on the finalized agent
                     // text BEFORE compose_display + split_message. Tool-display
                     // lines never enter relay parsing. See
@@ -1185,6 +1297,15 @@ impl AdapterRouter {
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
+                    // A dispatched bot that emits empty output would otherwise post
+                    // "_(no response)_". In a multi-bot channel that placeholder is pure
+                    // noise — the agent legitimately chose to add nothing, and the dispatch
+                    // reaction (👀→✅) already signals "seen, done". Suppress the post there,
+                    // leaving only the reaction as the acknowledgment. Keep the placeholder in
+                    // DM / solo (no peer to spam; a useful "finished / nothing to say" signal).
+                    // Errors always surface regardless.
+                    let suppress_send =
+                        final_content.is_empty() && response_error.is_none() && other_bot_present;
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
@@ -1211,7 +1332,10 @@ impl AdapterRouter {
                         final_content
                     };
 
-                    let chunks = if adapter.platform() == "discord" {
+                    let chunks = if suppress_send {
+                        // Reaction-only ack (multi-bot channel, empty turn): post nothing.
+                        Vec::new()
+                    } else if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);
                         let mention_reserve = mention_footer_len(&mentions);
                         let chunks = format::split_message(
@@ -1912,6 +2036,99 @@ mod tests {
         assert_eq!(select_delivery_text(full, 999, false), full);
         // 1 is a non-boundary inside the multi-byte '✓' (3 bytes); fallback.
         assert_eq!(select_delivery_text("✓x", 1, false), "✓x");
+    }
+
+    #[test]
+    fn select_delivery_recovers_finding_displaced_by_trailing_status_aside() {
+        // Real failure mode (Frieren log, rc=124 turn): the model emits the
+        // finding, runs a final tool, then tacks on "(背景驗證還在跑…)". Naive
+        // send-once trimming would deliver ONLY the post-tool aside and silently
+        // drop the finding. answer_start points just past the finding (the last
+        // ToolDone offset), so the slice is the aside alone — recovery pulls the
+        // finding back.
+        let finding = "止血改下去了，但驗證又掛了，這次是不同原因：rc=124 —— 那是 timeout 的退出碼。\
+            content script 裡的 timeout 220 gemini 在 220 秒把它砍了。flash 跑完整新聞 prompt\
+            （web search + 最多 15 條 + 查證日期）超過 220 秒沒跑完。換句話說 flash 本身能用，\
+            但接 grounding 抓 15 條新聞太慢撞到逾時，我量一下它到底要多久再決定拉長逾時還是砍工作量。";
+        let aside = "(背景測時跑著，最長 7 分鐘，完成自動回報)";
+        let full = format!("{finding}{aside}");
+        let answer_start = finding.len();
+        assert_eq!(
+            select_delivery_text(&full, answer_start, false),
+            format!("{finding}\n\n{aside}")
+        );
+    }
+
+    #[test]
+    fn select_delivery_keeps_aside_when_no_substantive_prior_block() {
+        // If the text before the last tool is just narration ("我先看一下"), there's
+        // no finding to recover — keep the aside as-is rather than resurfacing
+        // narration.
+        let before = "我先看一下";
+        let aside = "(背景跑著，等等回報)";
+        let full = format!("{before}{aside}");
+        let answer_start = before.len();
+        assert_eq!(select_delivery_text(&full, answer_start, false), aside);
+    }
+
+    #[test]
+    fn select_delivery_real_final_answer_is_never_demoted() {
+        // A substantive (non-parenthetical) final block is the answer — the
+        // aside-recovery path must not touch it even if a long prior block exists.
+        let before = "收到，先讀 config 拿錨點，然後做三處編輯，重啟前嚴格驗證避免事後不能修。";
+        let answer = "結論：bridge 重啟成功，PID 50651，跑在新 binary 上，三處修正都生效了。";
+        let full = format!("{before}{answer}");
+        let answer_start = before.len();
+        assert_eq!(select_delivery_text(&full, answer_start, false), answer);
+    }
+
+    #[test]
+    fn strip_meta_preamble_removes_now_the_reply_line_and_hr() {
+        // The exact 2026-06-16 leak shape (preamble + "---" + answer in one block).
+        let got = strip_meta_preamble(
+            "Now the reply (channel → English, mrkdwn, grounded):\n\n---\n\nJaz is on leave, so I'm covering the backend.",
+        );
+        assert_eq!(got, "Jaz is on leave, so I'm covering the backend.");
+    }
+
+    #[test]
+    fn strip_meta_preamble_removes_reply_in_thread_line() {
+        let got = strip_meta_preamble("Reply in-thread:\n\nGot it — no ticket, scope locked.");
+        assert_eq!(got, "Got it — no ticket, scope locked.");
+    }
+
+    #[test]
+    fn strip_meta_preamble_leaves_normal_reply_untouched() {
+        // A real answer that just happens to mention "grounded" / "mrkdwn" later
+        // must be fully preserved — the ban is position-sensitive, not word-based.
+        let body = "Yes, this is grounded in the actual code. I formatted it for mrkdwn.";
+        assert_eq!(strip_meta_preamble(body), body);
+    }
+
+    #[test]
+    fn strip_meta_preamble_is_idempotent() {
+        let once = strip_meta_preamble("Reply in-thread:\n\nthe answer");
+        assert_eq!(strip_meta_preamble(&once), once);
+    }
+
+    #[test]
+    fn strip_meta_preamble_handles_stacked_preambles() {
+        let got = strip_meta_preamble("Now the reply:\nReply in-thread:\n\nthe answer");
+        assert_eq!(got, "the answer");
+    }
+
+    #[test]
+    fn strip_meta_preamble_keeps_original_if_only_preamble() {
+        // Degenerate: nothing but the preamble. Never silently blank the reply.
+        let only = "Reply in-thread:";
+        assert_eq!(strip_meta_preamble(only), only);
+    }
+
+    #[test]
+    fn strip_meta_preamble_does_not_match_preamble_words_mid_reply() {
+        // "reply in thread" appearing as prose, not as an opening status line.
+        let body = "I'll reply in thread so Jaz can follow it later.";
+        assert_eq!(strip_meta_preamble(body), body);
     }
 
     #[test]
