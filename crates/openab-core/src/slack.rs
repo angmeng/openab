@@ -1478,7 +1478,43 @@ async fn handle_message(
                         debug!(filename, "adding image attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        // Non-image binary (video, PDF, Office docs, archives,
+                        // generic binary): download to disk so the agent gets a
+                        // local path it can hand to ffmpeg / pdftotext / etc.
+                        // If the disk write fails, inject a failure-notice block
+                        // so the agent still knows the file existed (fail loudly,
+                        // don't silently drop).
+                        match media::download_to_disk(
+                            url,
+                            filename,
+                            mimetype,
+                            size,
+                            Some(bot_token),
+                            &ts,
+                        )
+                        .await
+                        {
+                            Some(block) => {
+                                debug!(filename, "adding file attachment via disk path");
+                                extra_blocks.push(block);
+                            }
+                            None => {
+                                let notice = format!(
+                                    "[Slack file attachment — download failed]\n\
+                                     - filename: {filename}\n\
+                                     - mimetype: {mimetype}\n\
+                                     - size: {size} bytes\n\
+                                     \n\
+                                     OpenAB tried to save this file locally but the download or write \
+                                     failed (see logs). The user shared the file; acknowledge it but \
+                                     note you couldn't access the contents."
+                                );
+                                warn!(filename, mimetype, size, "download_to_disk failed, emitting failure notice");
+                                extra_blocks.push(ContentBlock::Text { text: notice });
+                            }
+                        }
+                    }
                     Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
                         warn!(filename, actual, limit, "image exceeds size limit");
                         failed_image_files.push(filename.to_string());
