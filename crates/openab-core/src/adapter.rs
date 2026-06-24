@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -10,6 +11,7 @@ use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+use crate::relay::{self, RelayContext, RelayDirective};
 
 // --- Output directive parsing ---
 
@@ -439,6 +441,8 @@ pub struct AdapterRouter {
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
+    /// Cross-channel relay registry. `None` = relay disabled or not configured.
+    relay_ctx: Option<Arc<RelayContext>>,
     /// Workspace aliases from `[workspace.aliases]` config.
     workspace_aliases: std::collections::HashMap<String, String>,
     /// Bot home directory (security boundary for workspace directives).
@@ -469,6 +473,7 @@ impl AdapterRouter {
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
+        relay_ctx: Option<Arc<RelayContext>>,
         workspace_aliases: std::collections::HashMap<String, String>,
         bot_home: std::path::PathBuf,
     ) -> Self {
@@ -487,9 +492,17 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
+            relay_ctx,
             workspace_aliases,
             bot_home,
         }
+    }
+
+    /// Cheap relay-enabled check. Called once before the receive loop and
+    /// hoisted into a local bool so the hot streaming path doesn't re-read
+    /// the Arc on every text chunk.
+    fn relay_enabled(&self) -> bool {
+        self.relay_ctx.as_ref().is_some_and(|c| c.config.enabled)
     }
 
     /// Access the underlying session pool (e.g. for config option queries).
@@ -695,6 +708,10 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        // Hoist relay state into the closure: bool for the hot streaming path,
+        // Arc<RelayContext> for the post-stream dispatch path.
+        let relay_enabled = self.relay_enabled();
+        let relay_ctx = self.relay_ctx.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -956,10 +973,10 @@ impl AdapterRouter {
                                             }
                                         }
                                     } else if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
+                                            relay_enabled,
                                             tool_display,
                                         ));
                                     }
@@ -1005,10 +1022,10 @@ impl AdapterRouter {
                                     }
                                     // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
+                                            relay_enabled,
                                             tool_display,
                                         ));
                                     }
@@ -1050,10 +1067,10 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
+                                            relay_enabled,
                                             tool_display,
                                         ));
                                     }
@@ -1106,6 +1123,58 @@ impl AdapterRouter {
                     // exactly that case. `finalize_body` is the pure helper that
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
+
+                    // Cross-channel relay extraction. Runs on the finalized agent
+                    // text BEFORE compose_display + split_message. Tool-display
+                    // lines never enter relay parsing. See
+                    // AI-Memory/shared/proposals/2026-05-26-openab-cross-channel-relay.md
+                    // for the full spec.
+                    let text_buf = if let Some(ctx) =
+                        relay_ctx.as_ref().filter(|c| c.config.enabled)
+                    {
+                        let result = relay::extract_relay_blocks(&text_buf);
+
+                        if !result.errors.is_empty() {
+                            reactions.set_error().await;
+                            let detail = result
+                                .errors
+                                .iter()
+                                .map(|e| format!("- {e:?}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let _ = adapter
+                                .send_message(
+                                    &thread_channel,
+                                    &format!("⚠️ relay parse error(s):\n{detail}"),
+                                )
+                                .await;
+                        }
+
+                        for block in &result.directives {
+                            if let Err(e) =
+                                dispatch_relay_block(ctx, &adapter, &thread_channel, block).await
+                            {
+                                warn!(
+                                    error = ?e,
+                                    target = %format!("{}:{}", block.target_platform, block.target_alias),
+                                    "relay dispatch failed"
+                                );
+                                let _ = adapter
+                                    .send_message(
+                                        &thread_channel,
+                                        &format!(
+                                            "⚠️ relay to `{}:{}` failed: {}",
+                                            block.target_platform, block.target_alias, e
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+
+                        result.residual
+                    } else {
+                        text_buf
+                    };
 
                     // Build final content
                     let final_content =
@@ -1423,6 +1492,26 @@ impl ToolEntry {
 /// during streaming before collapsing into a summary line.
 const TOOL_COLLAPSE_THRESHOLD: usize = 3;
 
+/// Streaming-time wrapper around `compose_display`. Masks in-progress relay
+/// blocks from the placeholder edit loop when relay is enabled. Pure
+/// fast-path (`Cow::Borrowed`) when disabled or text has no opener marker.
+///
+/// Centralized so all 3 streaming call sites (`Text`, `ToolStart`, `ToolDone`
+/// arms) route through it — otherwise a relay block can leak via tool events.
+fn compose_streaming_display(
+    tool_lines: &[ToolEntry],
+    text_buf: &str,
+    relay_enabled: bool,
+    tool_display: ToolDisplay,
+) -> String {
+    let masked: Cow<'_, str> = if relay_enabled {
+        relay::mask_streaming_relay_blocks(text_buf)
+    } else {
+        Cow::Borrowed(text_buf)
+    };
+    compose_display(tool_lines, &masked, true, tool_display)
+}
+
 fn compose_display(
     tool_lines: &[ToolEntry],
     text: &str,
@@ -1605,6 +1694,106 @@ fn propagate_mentions_to_chunks(
             }
         })
         .collect()
+}
+
+/// Upper bound on a single relay send_message call. A relay send runs inline on
+/// the per-lane consumer loop, so an unbounded hang wedges the whole lane (see
+/// Fix 1 note in dispatch_relay_block). 15s comfortably covers a normal Slack/
+/// Discord post + retry while still failing loudly if the call never returns.
+const RELAY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Forward a single relay block to its peer adapter. Caller (the post-stream
+/// hook in `stream_prompt_blocks`) handles error reporting back to the origin
+/// channel.
+async fn dispatch_relay_block(
+    ctx: &RelayContext,
+    origin_adapter: &Arc<dyn ChatAdapter>,
+    _origin_channel: &ChannelRef,
+    block: &RelayDirective,
+) -> Result<()> {
+    let alias_key = format!("{}:{}", block.target_platform, block.target_alias);
+    let alias = ctx
+        .config
+        .aliases
+        .get(&alias_key)
+        .ok_or_else(|| anyhow!("unknown relay alias: {}", alias_key))?;
+
+    // Fix 2: same-platform relay (e.g. slack→slack: a Slack thread relaying into
+    // another Slack channel like #ai-workflow) uses the ORIGIN adapter directly.
+    // Resolving ctx.peer("slack") returns the same shared adapter we're already
+    // running on (self-peer) — routing the send back through a Weak::upgrade of
+    // ourselves is needless indirection. Only reach for the peer registry when
+    // the target is a genuinely different platform.
+    let sender: Arc<dyn ChatAdapter> = if block.target_platform == origin_adapter.platform() {
+        origin_adapter.clone()
+    } else {
+        ctx.peer(&block.target_platform)
+            .ok_or_else(|| anyhow!("no peer adapter for platform: {}", block.target_platform))?
+    };
+
+    if relay::contains_relay_marker(&block.body) {
+        return Err(anyhow!(
+            "loop-guard: relayed body still contains relay marker"
+        ));
+    }
+
+    let persona = std::env::var("OPENAB_PERSONA_ID").unwrap_or_else(|_| "unknown".to_string());
+    let formatted = relay::format_relay_body(
+        &ctx.config.prefix_template,
+        &persona,
+        origin_adapter.platform(),
+        &block.body,
+    );
+
+    // Security: strip file-send markers from relay bodies. Slack's send_message
+    // extracts and uploads file-send markers; a relayed body containing
+    // `<<openab-send-file /path>>` would silently upload when targeting Slack.
+    // Stripped uniformly for audit consistency.
+    let formatted = relay::strip_file_send_markers(&formatted);
+
+    // When relaying INTO Discord, rewrite plain-text @persona mentions (the
+    // origin platform flattens cross-platform mentions to text) into real
+    // <@id> mentions, so discord.rs's inbound mention gate actually fires for
+    // the target bot. No-op for other target platforms / empty map.
+    let formatted = if block.target_platform == "discord" {
+        relay::resolve_discord_mentions(&formatted, &ctx.config.discord_mentions)
+    } else {
+        formatted
+    };
+
+    let target = ChannelRef {
+        platform: block.target_platform.clone(),
+        channel_id: alias.channel_id.clone(),
+        thread_id: None,
+        parent_id: None,
+        origin_event_id: None,
+    };
+
+    // Peer-side splitting. Adapters' send_message does NOT split internally
+    // (split is normally done by AdapterRouter before adapter.send_message).
+    // Since relay bypasses that path, we split here using the sender's own
+    // message_limit. Loop send_message over chunks.
+    //
+    // Fix 1: each send is bounded by RELAY_SEND_TIMEOUT. dispatch_relay_block is
+    // awaited inline on the per-lane consumer_loop (dispatch.rs) — a send that
+    // never returns would wedge that lane forever, silently queuing every
+    // subsequent message on the same (thread, sender) key. The timeout converts
+    // a hang into an Err the caller already handles (warn + user-facing ⚠️),
+    // guaranteeing the consumer loop drains.
+    let chunks = format::split_message(&formatted, sender.message_limit());
+    for chunk in &chunks {
+        tokio::time::timeout(RELAY_SEND_TIMEOUT, sender.send_message(&target, chunk))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "relay send timed out after {}s (target {}:{})",
+                    RELAY_SEND_TIMEOUT.as_secs(),
+                    block.target_platform,
+                    block.target_alias
+                )
+            })??;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -235,21 +235,37 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let router = Arc::new(AdapterRouter::new(
-        pool.clone(),
-        cfg.reactions,
-        cfg.markdown.tables,
-        cfg.pool.prompt_hard_timeout_secs,
-        cfg.pool.liveness_check_secs,
-        cfg.workspace.aliases,
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
-            tracing::warn!(
-                "HOME environment variable is not set — falling back to /tmp as bot_home. \
-                 This weakens the workspace security boundary."
-            );
-            "/tmp".into()
-        })),
-    ));
+    // Take relay config out of cfg now (before adapters are built) so we can
+    // validate it early. Actual RelayContext + AdapterRouter construction is
+    // deferred until shared_*_adapter handles exist (a few dozen lines below).
+    let relay_cfg: Option<openab_core::relay::RelayConfig> = cfg.relay.take();
+    if let Some(ref rc) = relay_cfg {
+        if let Err(e) = rc.validate() {
+            anyhow::bail!("invalid [relay] config: {e}");
+        }
+    }
+
+    // persona display-name -> Discord id map (from [relay.discord_mentions]),
+    // shared with the Discord adapter so the agent's plain-text "@<name>" replies
+    // are rewritten into real <@id> mentions. Empty when no [relay] / no map.
+    let discord_mentions: Arc<std::collections::HashMap<String, u64>> = Arc::new(
+        relay_cfg
+            .as_ref()
+            .map(|r| r.discord_mentions.clone())
+            .unwrap_or_default(),
+    );
+
+    // Built here so they can be moved into AdapterRouter::new below.
+    let workspace_aliases = cfg.workspace.aliases;
+    let reactions_cfg = cfg.reactions;
+    let table_mode = cfg.markdown.tables;
+    let bot_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::warn!(
+            "HOME environment variable is not set — falling back to /tmp as bot_home. \
+             This weakens the workspace security boundary."
+        );
+        "/tmp".into()
+    }));
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -274,7 +290,8 @@ async fn main() -> anyhow::Result<()> {
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
         cfg.discord.as_ref().map(|dc| {
             let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+            Arc::new(discord::DiscordAdapter::new(http, discord_mentions.clone()))
+                as Arc<dyn adapter::ChatAdapter>
         });
     #[cfg(not(feature = "discord"))]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
@@ -304,6 +321,44 @@ async fn main() -> anyhow::Result<()> {
     });
     #[cfg(not(feature = "slack"))]
     let shared_slack_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
+
+    // Build cross-channel relay context. Peers stored as Weak refs to avoid
+    // cross-adapter Arc cycles. Only platforms with a shared adapter handle
+    // are registered as peers.
+    let relay_ctx: Option<Arc<openab_core::relay::RelayContext>> = relay_cfg
+        .filter(|c| c.enabled)
+        .map(|cfg_inner| {
+            let mut peers: std::collections::HashMap<
+                String,
+                std::sync::Weak<dyn adapter::ChatAdapter>,
+            > = std::collections::HashMap::new();
+            #[cfg(feature = "slack")]
+            if let Some(ref s) = shared_slack_adapter {
+                let s_dyn: Arc<dyn adapter::ChatAdapter> = s.clone();
+                peers.insert("slack".to_string(), Arc::downgrade(&s_dyn));
+            }
+            #[cfg(feature = "discord")]
+            if let Some(ref d) = shared_discord_adapter {
+                peers.insert("discord".to_string(), Arc::downgrade(d));
+            }
+            info!(peers = peers.len(), "relay enabled");
+            Arc::new(openab_core::relay::RelayContext {
+                config: Arc::new(cfg_inner),
+                peers,
+            })
+        });
+
+    // Now we can build the AdapterRouter (needs relay_ctx).
+    let router = Arc::new(AdapterRouter::new(
+        pool.clone(),
+        reactions_cfg,
+        table_mode,
+        cfg.pool.prompt_hard_timeout_secs,
+        cfg.pool.liveness_check_secs,
+        relay_ctx,
+        workspace_aliases,
+        bot_home,
+    ));
 
     // Shared slot for Discord ShardMessenger (set in ready handler, used by ctl for agent.status)
     let ctl_shard: ctl::ShardSlot = Arc::new(std::sync::OnceLock::new());
@@ -783,6 +838,7 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            discord_mentions: discord_mentions.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

@@ -1204,6 +1204,7 @@ mod tests {
             crate::markdown::TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
+            None,
             std::collections::HashMap::new(),
             std::path::PathBuf::from("/tmp"),
         ));

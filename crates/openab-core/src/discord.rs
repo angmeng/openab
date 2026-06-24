@@ -42,11 +42,16 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    /// persona display-name -> Discord user id. Rewrites the agent's plain-text
+    /// "@<name>" into a real <@id> mention on every outgoing message so the
+    /// target bot's mention-gate fires (the agent writes names as text, not
+    /// Discord mention tokens). Empty for bots without a discord_mentions map.
+    mentions: Arc<std::collections::HashMap<String, u64>>,
 }
 
 impl DiscordAdapter {
-    pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+    pub fn new(http: Arc<Http>, mentions: Arc<std::collections::HashMap<String, u64>>) -> Self {
+        Self { http, mentions }
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
@@ -72,7 +77,8 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        let content = crate::relay::resolve_discord_mentions(content, &self.mentions);
+        let msg = ChannelId::new(ch_id).say(&self.http, &content).await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -88,11 +94,12 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg_id: u64 = reply_to_message_id.parse().unwrap_or(0);
         if msg_id == 0 {
-            // Invalid message ID, fall back to plain send
+            // Invalid message ID, fall back to plain send (which rewrites mentions)
             return self.send_message(channel, content).await;
         }
+        let content = crate::relay::resolve_discord_mentions(content, &self.mentions);
         let builder = serenity::builder::CreateMessage::new()
-            .content(content)
+            .content(&content)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -105,7 +112,7 @@ impl ChatAdapter for DiscordAdapter {
             Err(e) => {
                 // Fallback to plain send if reply fails (e.g. unknown message, cross-channel)
                 tracing::warn!(error = ?e, reply_to = reply_to_message_id, "reply_to failed, falling back to plain send");
-                self.send_message(channel, content).await
+                self.send_message(channel, &content).await
             }
         }
     }
@@ -238,6 +245,10 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// persona display-name -> Discord user id, shared into the DiscordAdapter so
+    /// the agent's plain-text "@<name>" replies become real <@id> mentions. From
+    /// `[relay.discord_mentions]`; empty when unset.
+    pub discord_mentions: Arc<std::collections::HashMap<String, u64>>,
 }
 
 impl Handler {
@@ -443,7 +454,12 @@ impl EventHandler for Handler {
 
         let adapter = self
             .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::new(
+                    ctx.http.clone(),
+                    self.discord_mentions.clone(),
+                ))
+            })
             .clone();
 
         let channel_id = msg.channel_id.get();
@@ -956,7 +972,12 @@ impl EventHandler for Handler {
 
         let adapter = self
             .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::new(
+                    ctx.http.clone(),
+                    self.discord_mentions.clone(),
+                ))
+            })
             .clone();
 
         let channel_id = reaction.channel_id;
@@ -3190,14 +3211,16 @@ mod tests {
     /// Single bot thread: streaming enabled.
     #[test]
     fn discord_streams_when_no_other_bot() {
-        let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
+        let adapter =
+            super::DiscordAdapter::new(Arc::new(super::Http::new("")), std::sync::Arc::default());
         assert!(adapter.use_streaming(false));
     }
 
     /// Multi-bot thread: send-once to avoid edit interference.
     #[test]
     fn discord_no_stream_when_other_bot_present() {
-        let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
+        let adapter =
+            super::DiscordAdapter::new(Arc::new(super::Http::new("")), std::sync::Arc::default());
         assert!(!adapter.use_streaming(true));
     }
 

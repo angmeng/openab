@@ -143,6 +143,8 @@ pub struct Config {
     #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
+    pub relay: Option<crate::relay::RelayConfig>,
+    #[serde(default)]
     pub hooks: HooksConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,

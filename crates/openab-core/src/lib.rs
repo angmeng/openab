@@ -13,6 +13,7 @@ pub mod markdown;
 pub mod media;
 pub mod multibot_cache;
 pub mod reactions;
+pub mod relay;
 #[cfg(feature = "discord")]
 pub mod remind;
 pub mod secrets;
