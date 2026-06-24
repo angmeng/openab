@@ -668,6 +668,29 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
+                AllowUsers::OwnerOrMentions => {
+                    // Mirrors Slack: in a thread the bot is involved in, only the
+                    // owner (allowed_users) gets a tag-free reply; other humans
+                    // must @mention. We're already inside `!is_mentioned`, so a
+                    // non-owner here has not mentioned the bot — ignore them.
+                    if !in_thread {
+                        return;
+                    }
+                    let (involved, _) = if bot_owns_thread {
+                        (true, false)
+                    } else {
+                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await
+                    };
+                    if !involved {
+                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        return;
+                    }
+                    if !self.allowed_users.contains(&msg.author.id.get()) {
+                        tracing::debug!(channel_id = %msg.channel_id, "non-owner without @mention, ignoring");
+                        return;
+                    }
+                }
             }
         }
 
@@ -1065,7 +1088,7 @@ impl EventHandler for Handler {
         let (bot_involved, other_bot_present) = if is_thread
             && matches!(
                 self.allow_user_messages,
-                AllowUsers::Involved | AllowUsers::MultibotMentions
+                AllowUsers::Involved | AllowUsers::MultibotMentions | AllowUsers::OwnerOrMentions
             ) {
             self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
         } else {
@@ -2537,6 +2560,12 @@ fn should_process_user_message(
             }
             !other_bot_present
         }
+        // This pure helper models the mention/involvement dimension only; it has
+        // no sender/owner input. OwnerOrMentions additionally requires the sender
+        // to be an allowed user when not mentioned — that owner check is enforced
+        // at the real call site (EventHandler::message), not here. The
+        // involvement precondition it CAN model mirrors Involved.
+        AllowUsers::OwnerOrMentions => in_thread && involved,
     }
 }
 
@@ -2570,6 +2599,10 @@ fn should_process_reaction(
             }
             true
         }
+        // Reactions have no @mention concept, so OwnerOrMentions can only gate on
+        // the involvement dimension here (mirrors Involved). The owner restriction
+        // is enforced separately at the call site via is_denied_user(allowed_users).
+        AllowUsers::OwnerOrMentions => is_thread && bot_involved,
     }
 }
 
@@ -2950,6 +2983,49 @@ mod tests {
             false, // is_mentioned
             true,  // in_thread
             true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// GIVEN: owner-or-mentions mode, @mention present
+    /// WHEN:  any human @mentions the bot
+    /// THEN:  bot responds (explicit mention always wins, even non-owner)
+    #[test]
+    fn owner_or_mentions_mention_always_responds() {
+        assert!(should_process_user_message(
+            AllowUsers::OwnerOrMentions,
+            true,  // is_mentioned
+            false, // in_thread
+            false, // involved
+            true,  // other_bot_present
+        ));
+    }
+
+    /// GIVEN: owner-or-mentions mode, no @mention, bot involved in thread
+    /// WHEN:  non-mention message arrives (owner check is at the call site)
+    /// THEN:  helper passes the involvement precondition (mirrors Involved).
+    ///        The owner restriction is enforced in EventHandler::message, not here.
+    #[test]
+    fn owner_or_mentions_passes_involvement_precondition() {
+        assert!(should_process_user_message(
+            AllowUsers::OwnerOrMentions,
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present ← ignored; owner gating is at the call site
+        ));
+    }
+
+    /// GIVEN: owner-or-mentions mode, no @mention, bot NOT involved in thread
+    /// WHEN:  non-mention message arrives in a thread the bot never joined
+    /// THEN:  helper rejects (no involvement → no tag-free reply)
+    #[test]
+    fn owner_or_mentions_rejects_when_not_involved() {
+        assert!(!should_process_user_message(
+            AllowUsers::OwnerOrMentions,
+            false, // is_mentioned
+            true,  // in_thread
+            false, // involved ← bot never posted here
             false, // other_bot_present
         ));
     }
@@ -3617,6 +3693,43 @@ mod tests {
     fn reaction_multibot_non_thread_rejected() {
         assert!(!should_process_reaction(
             AllowUsers::MultibotMentions,
+            false, // is_thread
+            false, false, false,
+        ));
+    }
+
+    /// GIVEN: OwnerOrMentions mode, thread the bot participated in
+    /// THEN:  accepted (mirrors Involved; owner gating is at the call site).
+    ///        targets_this_bot/other_bot are ignored — reactions have no @mention.
+    #[test]
+    fn reaction_owner_or_mentions_thread_involved_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::OwnerOrMentions,
+            true,  // is_thread
+            true,  // bot_involved
+            true,  // other_bot_present ← ignored
+            false, // targets_this_bot ← ignored
+        ));
+    }
+
+    /// GIVEN: OwnerOrMentions mode, thread the bot never joined
+    /// THEN:  rejected (no involvement → no trigger)
+    #[test]
+    fn reaction_owner_or_mentions_thread_not_involved_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::OwnerOrMentions,
+            true,  // is_thread
+            false, // bot_involved
+            false, false,
+        ));
+    }
+
+    /// GIVEN: OwnerOrMentions mode, non-thread channel
+    /// THEN:  rejected
+    #[test]
+    fn reaction_owner_or_mentions_non_thread_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::OwnerOrMentions,
             false, // is_thread
             false, false, false,
         ));

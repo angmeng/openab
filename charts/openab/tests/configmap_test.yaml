@@ -82,6 +82,14 @@ tests:
           path: data["config.toml"]
           pattern: 'allow_user_messages = "multibot-mentions"'
 
+  - it: renders allow_user_messages = "owner-or-mentions"
+    set:
+      agents.kiro.discord.allowUserMessages: owner-or-mentions
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_user_messages = "owner-or-mentions"'
+
   - it: rejects invalid allowUserMessages value
     set:
       agents.kiro.discord.allowUserMessages: yolo

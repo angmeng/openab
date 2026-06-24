@@ -315,12 +315,15 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "multibot-mentions" (default) | "involved" | "mentions"
+      # allowUserMessages: "multibot-mentions" (default) | "involved" | "mentions" | "owner-or-mentions"
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
       # "multibot-mentions" = same as "involved" in single-bot threads; require @mention
       #                      only when another bot has also posted in the thread
       #                      (recommended for multi-bot deployments)
+      # "owner-or-mentions" = in threads the bot participated in, reply tag-free only to the
+      #                      owner (allowedUsers); other humans must @mention
+      #                      (recommended for multi-human threads)
       allowUserMessages: "multibot-mentions"
       # maxBotTurns: soft cap on consecutive bot turns per thread before
       # the bot stops auto-replying. A human message resets the counter.
