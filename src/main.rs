@@ -844,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
                 discord_cfg.max_bot_turns,
             )),
             allow_dm: discord_cfg.allow_dm,
+            reply_in_channel: discord_cfg.reply_in_channel,
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),

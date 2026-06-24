@@ -606,6 +606,13 @@ impl AdapterRouter {
         self.relay_ctx.as_ref().is_some_and(|c| c.config.enabled)
     }
 
+    /// The recv-loop hard ceiling (pool.prompt_hard_timeout_secs). Exposed so
+    /// the dispatcher's per-lane watchdog (Fix 3) can derive a wall-clock batch
+    /// bound that sits just above it.
+    pub fn prompt_hard_timeout(&self) -> std::time::Duration {
+        self.prompt_hard_timeout
+    }
+
     /// Access the underlying session pool (e.g. for config option queries).
     pub fn pool(&self) -> &Arc<SessionPool> {
         &self.pool

@@ -124,6 +124,22 @@ impl ThreadHandle {
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
 
+    /// Wall-clock upper bound for a single `dispatch_batch` call, used by the
+    /// per-lane consumer as a watchdog (Fix 3). The recv-loop's own
+    /// `prompt_hard_timeout` only bounds the streaming phase — post-stream work
+    /// (relay dispatch, file uploads, message splitting) runs after the loop
+    /// breaks and is NOT covered. This is the backstop: if ANY part of a turn
+    /// hangs, the consumer abandons the batch so the lane can't be pinned
+    /// forever. Should sit comfortably above `prompt_hard_timeout` so the
+    /// graceful in-loop mechanism fires first; this only catches true wedges.
+    /// Default is the prompt hard ceiling + 60s margin.
+    fn batch_watchdog_timeout(&self) -> Duration {
+        crate::config::default_prompt_hard_timeout_secs()
+            .checked_add(60)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30 * 60))
+    }
+
     /// Workspace aliases from config (for `[[ws:@alias]]` resolution).
     fn workspace_aliases(&self) -> std::collections::HashMap<String, String>;
 
@@ -163,6 +179,15 @@ impl DispatchTarget for AdapterRouter {
 
     fn bot_home(&self) -> std::path::PathBuf {
         self.bot_home_path()
+    }
+
+    fn batch_watchdog_timeout(&self) -> Duration {
+        // Sit 60s above the recv-loop hard ceiling so the graceful in-loop
+        // abandon fires first; this watchdog only catches turns that wedge
+        // outside the recv loop (e.g. post-stream relay/upload hangs).
+        self.prompt_hard_timeout()
+            .checked_add(Duration::from_secs(60))
+            .unwrap_or(Duration::from_secs(30 * 60))
     }
 
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
@@ -597,15 +622,36 @@ async fn consumer_loop(
         // §2.6: read the freshest snapshot in the batch (batch is non-empty).
         let bot_present = batch.last().unwrap().other_bot_present;
 
-        dispatch_batch(
-            &thread_key,
-            &thread_channel,
-            &target,
-            &adapter,
-            batch,
-            bot_present,
+        // Fix 3 — per-lane watchdog. dispatch_batch is awaited inline here, so
+        // any code path inside it that never returns (a wedged post-stream relay
+        // send, a stuck upload, a future hang the recv-loop's prompt_hard_timeout
+        // doesn't cover) would pin this lane forever and silently queue every
+        // later message on the same (thread, sender) key. Bound the whole batch
+        // with a wall-clock timeout; on expiry we log and loop, freeing the lane.
+        // The agent turn may keep running detached, but the lane is no longer
+        // blocked — the next message gets a fresh turn.
+        let watchdog = target.batch_watchdog_timeout();
+        if tokio::time::timeout(
+            watchdog,
+            dispatch_batch(
+                &thread_key,
+                &thread_channel,
+                &target,
+                &adapter,
+                batch,
+                bot_present,
+            ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            error!(
+                thread_key = %thread_key,
+                channel = %thread_channel.channel_id,
+                watchdog_secs = watchdog.as_secs(),
+                "dispatch_batch exceeded per-lane watchdog — abandoning batch so the lane can drain"
+            );
+        }
     }
 }
 
@@ -1374,6 +1420,11 @@ mod tests {
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
         stream_err: Mutex<Option<String>>,
+        /// If > 0, `stream_prompt_blocks` sleeps this long before returning —
+        /// used to exercise the per-lane watchdog (Fix 3).
+        hang_ms: u64,
+        /// Watchdog timeout reported to the consumer loop.
+        watchdog: Duration,
     }
 
     impl MockDispatchTarget {
@@ -1383,6 +1434,8 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
+                hang_ms: 0,
+                watchdog: Duration::from_secs(30 * 60),
             }
         }
 
@@ -1395,6 +1448,10 @@ mod tests {
     impl DispatchTarget for MockDispatchTarget {
         fn reactions_config(&self) -> &ReactionsConfig {
             &self.reactions
+        }
+
+        fn batch_watchdog_timeout(&self) -> Duration {
+            self.watchdog
         }
 
         fn workspace_aliases(&self) -> std::collections::HashMap<String, String> {
@@ -1433,6 +1490,9 @@ mod tests {
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
             });
+            if self.hang_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.hang_ms)).await;
+            }
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1642,6 +1702,51 @@ mod tests {
             calls[0].dispatch_channel.origin_event_id.as_deref(),
             Some("evt-fresh")
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_drains_lane_when_dispatch_hangs() {
+        // Fix 3: a dispatch_batch that never returns (here: stream_prompt_blocks
+        // sleeps 10s) must not pin the lane. With a 100ms watchdog, the consumer
+        // abandons the first batch and loops, so a second message still gets
+        // dispatched. Without the watchdog, the second dispatch would never run.
+        let mock = Arc::new(MockDispatchTarget {
+            reactions: ReactionsConfig::default(),
+            calls: Mutex::new(Vec::new()),
+            ensure_err: Mutex::new(None),
+            stream_err: Mutex::new(None),
+            hang_ms: 10_000,
+            watchdog: Duration::from_millis(100),
+        });
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(4);
+        let consumer = tokio::spawn(consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            1, // max_batch=1 so each message is its own batch (no greedy merge)
+            24_000,
+            Duration::from_secs(5),
+        ));
+
+        tx.send(make_msg("first (will hang)", 10)).await.unwrap();
+        // Give the watchdog time to fire on the first batch and loop back.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        tx.send(make_msg("second", 10)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Both messages reached dispatch — the lane drained despite the first
+        // batch hanging. (stream_prompt_blocks records the call before sleeping.)
+        assert_eq!(
+            mock.calls().len(),
+            2,
+            "watchdog should free the lane so the second message dispatches"
+        );
+        assert!(!consumer.is_finished(), "consumer should still be alive");
+        drop(tx);
     }
 
     #[tokio::test]

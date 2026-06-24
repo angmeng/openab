@@ -337,6 +337,13 @@ pub struct DiscordConfig {
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
     pub allow_dm: bool,
+    /// Reply directly in the channel instead of auto-creating a thread for a
+    /// channel @mention. Default: false (thread-per-mention — original behaviour).
+    /// Set true for bots (e.g. Aizen) that must reply visibly in the main channel
+    /// so humans/peers see it and the bot's @mentions land in the parent channel
+    /// (where the target bot is actually listening, not a thread it can't see).
+    #[serde(default)]
+    pub reply_in_channel: bool,
     /// Message dispatch mode. Default: per-message (v0.8.2-beta.1 behaviour).
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,

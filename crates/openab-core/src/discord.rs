@@ -239,6 +239,9 @@ pub struct Handler {
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
     /// Allow the bot to respond to Discord DMs.
     pub allow_dm: bool,
+    /// Reply directly in the parent channel instead of auto-creating a thread
+    /// for a channel @mention (config `discord.reply_in_channel`).
+    pub reply_in_channel: bool,
     /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     /// Reminder store for /remind slash command.
@@ -873,8 +876,11 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
-            // DMs use the DM channel directly (no threads in DMs).
+        // reply_in_channel: post in the parent channel (no auto-thread) so the
+        // reply is visible in the main channel and any @mention lands where the
+        // target bot is actually listening (a thread it can't see otherwise).
+        let thread_channel = if in_thread || is_dm || self.reply_in_channel {
+            // DMs / reply_in_channel use the message's own channel directly.
             ChannelRef {
                 platform: "discord".into(),
                 channel_id: msg.channel_id.get().to_string(),
