@@ -445,6 +445,23 @@ pub struct AdapterRouter {
     bot_home: std::path::PathBuf,
 }
 
+/// Silence threshold for the dropped-turn watchdog. If the agent emits content
+/// and then goes quiet for this long — with no tool call running — and never
+/// sends a stopReason, the recv loop treats the turn as finished and flushes
+/// the buffered reply, instead of waiting out `prompt_hard_timeout` (30m).
+///
+/// Why this exists: `alive()` only detects a *closed* stdout (process exit). A
+/// hung-but-alive agent (stdout open, no further output, no stopReason) is
+/// invisible to it, so the loop would otherwise block for the full 30m hard
+/// ceiling — long enough for a follow-up message to evict this connection and
+/// silently drop the fully-composed reply sitting in `text_buf`. That is the
+/// 2026-06-05 dropped-turn incident (silent message loss, zero error logged).
+///
+/// Sized well above any legitimate no-tool gap (model picking its next action
+/// takes seconds) but far below the hard ceiling. Gated on `!has_running_tool`
+/// so a legitimately slow tool (e.g. a multi-minute bash) is never cut short.
+const IDLE_FLUSH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl AdapterRouter {
     pub fn new(
         pool: Arc<SessionPool>,
@@ -808,8 +825,21 @@ impl AdapterRouter {
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
                     let prompt_start = tokio::time::Instant::now();
+                    // Last sign of life from the agent; drives the dropped-turn
+                    // idle watchdog below. Reset only on real forward progress
+                    // (reply text / tool start / tool done), not on keepalives.
+                    let mut last_activity = prompt_start;
+                    // Whether the agent has produced actual reply text. Distinct
+                    // from `!text_buf.is_empty()`, which is already true when a
+                    // reset banner was pre-seeded above — the idle watchdog must
+                    // not fire on the banner alone before any agent output.
+                    let mut agent_emitted_text = false;
                     loop {
                         let notification = tokio::select! {
+                            // Prefer draining a ready notification over a timeout
+                            // tick: if both are ready, consuming the notification
+                            // first avoids an idle-flush racing a just-resumed turn.
+                            biased;
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
                                 // EOF before the agent's keyed final response: the stream closed
@@ -841,6 +871,29 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // Dropped-turn watchdog: agent emitted content but
+                                // has gone quiet without a stopReason. If no tool is
+                                // running, treat it as turn-end and flush text_buf
+                                // rather than risk a silent drop on eviction. No
+                                // response_error is set, so the buffered reply is
+                                // delivered clean. See IDLE_FLUSH_AFTER.
+                                let has_running_tool = tool_lines
+                                    .iter()
+                                    .any(|e| matches!(e.state, ToolState::Running));
+                                if agent_emitted_text
+                                    && !has_running_tool
+                                    && last_activity.elapsed() > IDLE_FLUSH_AFTER
+                                {
+                                    warn!(
+                                        idle_secs = last_activity.elapsed().as_secs(),
+                                        buffered_chars = text_buf.len(),
+                                        "agent idle after emitting content without \
+                                         stopReason; flushing buffered reply to avoid \
+                                         silent drop (dropped-turn watchdog)"
+                                    );
+                                    conn.abandon_request(request_id).await;
+                                    break;
+                                }
                                 continue;
                             }
                         };
@@ -860,9 +913,24 @@ impl AdapterRouter {
                         }
 
                         if let Some(event) = classify_notification(&notification) {
+                            // Reset the dropped-turn idle watchdog only on REAL
+                            // forward progress — reply text or tool activity — NOT on
+                            // empty keepalive thought-chunks. Those otherwise pin the
+                            // watchdog open and let a finished reply sit buffered until
+                            // the next inbound prompt flushes it. (2026-06-08 stuck-reply
+                            // bug — see AI-Memory/shared/2026-06-08-openab-buffered-reply-stuck-bug.md)
+                            if matches!(
+                                event,
+                                AcpEvent::Text(_)
+                                    | AcpEvent::ToolStart { .. }
+                                    | AcpEvent::ToolDone { .. }
+                            ) {
+                                last_activity = tokio::time::Instant::now();
+                            }
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    agent_emitted_text = true;
                                     if native {
                                         // Lazy stream_begin: open the stream on first text.
                                         if native_msg.is_none() && !stream_begin_failed {

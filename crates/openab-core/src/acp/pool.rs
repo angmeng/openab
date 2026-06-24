@@ -5,9 +5,36 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
+
+/// Wall-clock seconds since the Unix epoch. Used to age persisted sessions
+/// across process restarts (tokio's `Instant` is monotonic-only and resets
+/// every process, so it cannot gate cross-restart resume).
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A suspended/persisted session is too stale to resume when its last-seen
+/// timestamp is older than the pool TTL. Missing timestamp (legacy mapping or
+/// never-stamped) counts as expired so an upgrade flushes pre-existing entries
+/// — this is the fix for the resume-into-bloated-session death loop where an
+/// ancient session is resurrected only to spin forever on context compaction.
+/// `ttl_secs == 0` disables the gate (always resume — opt-out / test path).
+fn resume_expired(now: u64, last_seen: Option<u64>, ttl_secs: u64) -> bool {
+    if ttl_secs == 0 {
+        return false;
+    }
+    match last_seen {
+        Some(ts) => now.saturating_sub(ts) > ttl_secs,
+        None => true,
+    }
+}
 
 /// Error substrings produced by `AcpConnection::send_request` that indicate a
 /// transient failure worth preserving the session ID for retry, as opposed to
@@ -36,6 +63,10 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+    /// Wall-clock epoch (secs) a thread's session was last persisted/active.
+    /// Drives the TTL resume gate so a stale session is never resurrected.
+    /// Persisted to a sidecar (`thread_seen.json`) so it survives restarts.
+    last_seen: HashMap<String, u64>,
 }
 
 pub struct SessionPool {
@@ -44,6 +75,10 @@ pub struct SessionPool {
     max_sessions: usize,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    /// Persisted-session resume TTL in seconds (0 = never expire).
+    ttl_secs: u64,
+    /// Sidecar file holding `thread_seen.json` (thread_key → last-seen epoch).
+    seen_path: PathBuf,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -70,7 +105,7 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 }
 
 impl SessionPool {
-    pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
+    pub fn new(config: AgentConfig, max_sessions: usize, ttl_hours: u64) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
@@ -78,8 +113,10 @@ impl SessionPool {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
+        let seen_path = openab_dir.join("thread_seen.json");
         let suspended = Self::load_mapping(&mapping_path);
         let session_workdirs = Self::load_mapping(&meta_path);
+        let last_seen = Self::load_seen(&seen_path);
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -88,11 +125,38 @@ impl SessionPool {
                 suspended,
                 creating: HashMap::new(),
                 session_workdirs,
+                last_seen,
             }),
             config,
             max_sessions,
             mapping_path,
             meta_path,
+            ttl_secs: ttl_hours.saturating_mul(3600),
+            seen_path,
+        }
+    }
+
+    fn load_seen(path: &Path) -> HashMap<String, u64> {
+        match std::fs::read_to_string(path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Persist the last-seen sidecar so the TTL resume gate survives restarts.
+    fn save_seen(&self, last_seen: &HashMap<String, u64>) {
+        let data = match serde_json::to_string_pretty(last_seen) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize last-seen map");
+                return;
+            }
+        };
+        let tmp = self.seen_path.with_extension("json.tmp");
+        if let Err(e) =
+            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.seen_path))
+        {
+            warn!(path = %self.seen_path.display(), error = %e, "failed to persist last-seen map");
         }
     }
 
@@ -166,16 +230,32 @@ impl SessionPool {
         };
         let _create_guard = create_gate.lock().await;
 
-        let (existing, saved_session_id) = {
+        let (existing, suspended_session_id, suspended_last_seen) = {
             let state = self.state.read().await;
             (
                 state.active.get(thread_id).cloned(),
                 state.suspended.get(thread_id).cloned(),
+                state.last_seen.get(thread_id).copied(),
             )
         };
 
         let had_existing = existing.is_some();
-        let mut saved_session_id = saved_session_id;
+        // Only suspended/persisted sessions are subject to the TTL resume gate;
+        // a session id recovered from a just-died live connection (below) is
+        // fresh and must still be resumed for crash recovery.
+        let mut saved_session_id = match suspended_session_id {
+            Some(sid) if resume_expired(now_epoch(), suspended_last_seen, self.ttl_secs) => {
+                info!(
+                    thread_id,
+                    session_id = %sid,
+                    ttl_secs = self.ttl_secs,
+                    "suspended session older than TTL; starting fresh instead of \
+                     resuming (avoids resurrecting a bloated session)"
+                );
+                None
+            }
+            other => other,
+        };
         if let Some(conn) = existing.clone() {
             let conn = conn.lock().await;
             if conn.alive() {
@@ -322,10 +402,12 @@ impl SessionPool {
                     state.cancel_handles.remove(&key);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
+                        state.last_seen.insert(key.clone(), now_epoch());
                         state.persisted.insert(key.clone(), sid.clone());
                         state.suspended.insert(key, sid);
                     } else {
                         state.persisted.remove(&key);
+                        state.last_seen.remove(&key);
                     }
                 } else {
                     warn!(evicted = %key, "pool full but eviction candidate changed before removal");
@@ -345,10 +427,12 @@ impl SessionPool {
 
         if cancel_session_id.is_empty() {
             state.persisted.remove(thread_id);
+            state.last_seen.remove(thread_id);
         } else {
             state
                 .persisted
                 .insert(thread_id.to_string(), cancel_session_id.clone());
+            state.last_seen.insert(thread_id.to_string(), now_epoch());
         }
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
@@ -358,6 +442,7 @@ impl SessionPool {
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
         self.save_mapping(&state.persisted);
+        self.save_seen(&state.last_seen);
 
         // Persist workspace override only after session spawn succeeded (口渡 F2).
         if working_dir_override.is_some() {
@@ -487,9 +572,11 @@ impl SessionPool {
         state.cancel_handles.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
+        state.last_seen.remove(thread_id);
         state.creating.remove(thread_id);
         state.session_workdirs.remove(thread_id);
         self.save_mapping(&state.persisted);
+        self.save_seen(&state.last_seen);
         self.save_meta(&state.session_workdirs);
         if had_active {
             info!(thread_id, "session reset");
@@ -534,15 +621,18 @@ impl SessionPool {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
                 if let Some(sid) = sid {
+                    state.last_seen.insert(key.clone(), now_epoch());
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
                 } else {
                     state.persisted.remove(&key);
+                    state.last_seen.remove(&key);
                     state.session_workdirs.remove(&key);
                 }
             }
         }
         self.save_mapping(&state.persisted);
+        self.save_seen(&state.last_seen);
         self.save_meta(&state.session_workdirs);
     }
 
@@ -568,11 +658,14 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
+        let now = now_epoch();
         for (key, sid) in session_ids {
+            state.last_seen.insert(key.clone(), now);
             state.persisted.insert(key.clone(), sid.clone());
             state.suspended.insert(key, sid);
         }
         self.save_mapping(&state.persisted);
+        self.save_seen(&state.last_seen);
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
@@ -582,10 +675,25 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{get_or_insert_gate, remove_if_same_handle, resume_expired};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn resume_gate_expires_stale_and_unknown_sessions() {
+        let ttl = 24 * 3600;
+        let now = 1_000_000_u64;
+        // Fresh: seen 1h ago → resumable.
+        assert!(!resume_expired(now, Some(now - 3600), ttl));
+        // Stale: seen 35h ago (the death-loop case) → must NOT resume.
+        assert!(resume_expired(now, Some(now - 35 * 3600), ttl));
+        // Legacy / never-stamped mapping → treat as expired so upgrades flush it.
+        assert!(resume_expired(now, None, ttl));
+        // ttl == 0 disables the gate entirely (opt-out / test path).
+        assert!(!resume_expired(now, None, 0));
+        assert!(!resume_expired(now, Some(now - 99 * 3600), 0));
+    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {
