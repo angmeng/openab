@@ -1184,6 +1184,122 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Append a channel id to the `allowed_channels` array in the `[slack]` section
+/// of a config file on disk, idempotently and as a SURGICAL TEXT EDIT (not a
+/// parse/serialize round-trip).
+///
+/// Why text-edit and not round-trip: config is env-expanded at load
+/// (`expand_env_vars`), so re-serializing the parsed `Config` would write the
+/// EXPANDED `${SLACK_BOT_TOKEN}` etc. back as plaintext secrets, and would also
+/// drop every comment. Editing the raw text preserves `${...}` placeholders,
+/// comments, and formatting byte-for-byte.
+///
+/// Used so a channel the bot is invited into (or creates) survives a restart —
+/// the runtime allowlist add alone is lost when the process restarts.
+///
+/// Returns Ok(true) if the file was changed, Ok(false) if the id was already
+/// present (no write). Section-aware: only touches `allowed_channels` under
+/// `[slack]`, never `[discord]`'s. Fails (without writing) if it can't find a
+/// single-line `[slack]` `allowed_channels = [...]` to edit — caller should log
+/// and fall back to runtime-only rather than risk corrupting the file.
+///
+/// Atomic: writes a sibling temp file then renames over the original, after
+/// taking a one-time `.bak` backup.
+pub fn persist_allowed_channel(config_path: &Path, channel_id: &str) -> anyhow::Result<bool> {
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
+
+    let mut in_slack = false;
+    let mut out: Vec<String> = Vec::with_capacity(raw.lines().count() + 1);
+    let mut edited = false;
+    let mut already_present = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        // Track section. A line starting with '[' opens a new section/table.
+        if trimmed.starts_with('[') {
+            in_slack = trimmed.starts_with("[slack]");
+            out.push(line.to_string());
+            continue;
+        }
+        // The target line: inside [slack], `allowed_channels` = single-line array.
+        if in_slack
+            && !edited
+            && !already_present
+            && trimmed.starts_with("allowed_channels")
+            && line.contains('[')
+            && line.contains(']')
+        {
+            let open = line.find('[').unwrap();
+            let close = line.rfind(']').unwrap();
+            if close <= open {
+                anyhow::bail!("malformed allowed_channels array in {}", config_path.display());
+            }
+            let inner = &line[open + 1..close];
+            // Existing ids: strip quotes/whitespace from comma-split parts.
+            let ids: Vec<String> = inner
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if ids.iter().any(|id| id == channel_id) {
+                already_present = true;
+                out.push(line.to_string());
+                continue;
+            }
+            // Rebuild the array: keep prefix (`key = `) and any trailing comment.
+            let prefix = &line[..open]; // includes indentation + `allowed_channels…= `
+            let suffix = &line[close + 1..]; // trailing comment / whitespace, if any
+            let mut new_ids = ids;
+            new_ids.push(channel_id.to_string());
+            let joined = new_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("{prefix}[{joined}]{suffix}"));
+            edited = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if already_present {
+        return Ok(false);
+    }
+    if !edited {
+        anyhow::bail!(
+            "no single-line `allowed_channels = [...]` under [slack] in {} to edit",
+            config_path.display()
+        );
+    }
+
+    // Preserve a trailing newline if the original had one.
+    let mut new_content = out.join("\n");
+    if raw.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    // One-time backup (don't clobber an existing .bak).
+    let bak = config_path.with_extension("toml.autoallow.bak");
+    if !bak.exists() {
+        let _ = std::fs::copy(config_path, &bak);
+    }
+
+    // Atomic write: temp sibling + rename (same dir so rename is atomic).
+    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        config_path.file_name().and_then(|s| s.to_str()).unwrap_or("config.toml")
+    ));
+    std::fs::write(&tmp, new_content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write temp {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .map_err(|e| anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), config_path.display()))?;
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1715,5 +1831,66 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    // --- persist_allowed_channel ---
+
+    fn write_tmp(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    const SLACK_CFG: &str = r#"[slack]
+bot_token       = "${SLACK_BOT_TOKEN}"
+# a comment we must keep
+allowed_channels         = ["C0AAA", "C0BBB"]
+trusted_bot_ids = ["B0X"]
+
+[discord]
+allowed_channels = ["111"]
+"#;
+
+    #[test]
+    fn persist_appends_new_channel() {
+        let f = write_tmp(SLACK_CFG);
+        let changed = persist_allowed_channel(f.path(), "C0NEW").unwrap();
+        assert!(changed);
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        assert!(out.contains(r#"allowed_channels         = ["C0AAA", "C0BBB", "C0NEW"]"#));
+        // secrets + comments preserved (no round-trip)
+        assert!(out.contains(r#"bot_token       = "${SLACK_BOT_TOKEN}""#));
+        assert!(out.contains("# a comment we must keep"));
+        // discord section untouched
+        assert!(out.contains(r#"[discord]
+allowed_channels = ["111"]"#));
+    }
+
+    #[test]
+    fn persist_is_idempotent() {
+        let f = write_tmp(SLACK_CFG);
+        let changed = persist_allowed_channel(f.path(), "C0AAA").unwrap();
+        assert!(!changed, "already-present id must be a no-op");
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(out, SLACK_CFG, "file must be byte-identical when no-op");
+    }
+
+    #[test]
+    fn persist_only_touches_slack_section() {
+        // A discord id that happens to collide must NOT match the slack array.
+        let f = write_tmp(SLACK_CFG);
+        persist_allowed_channel(f.path(), "C0NEW").unwrap();
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        // discord line still exactly one id
+        assert!(out.contains(r#"[discord]
+allowed_channels = ["111"]"#));
+    }
+
+    #[test]
+    fn persist_errors_on_missing_slack_array() {
+        let f = write_tmp("[discord]\nallowed_channels = [\"111\"]\n");
+        let r = persist_allowed_channel(f.path(), "C0NEW");
+        assert!(r.is_err(), "no [slack] allowed_channels => error, not silent corruption");
     }
 }

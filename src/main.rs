@@ -307,6 +307,14 @@ async fn main() -> anyhow::Result<()> {
         .join("threads.json");
     let multibot_cache = multibot_cache::MultibotCache::load(multibot_cache_path);
 
+    // Local config path (for persisting runtime allowlist additions). None when
+    // the config came from a URL — can't write back to a remote.
+    let slack_config_path: Option<PathBuf> =
+        if config_source.starts_with("http://") || config_source.starts_with("https://") {
+            None
+        } else {
+            Some(PathBuf::from(&config_source))
+        };
     #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
@@ -317,6 +325,8 @@ async fn main() -> anyhow::Result<()> {
             multibot_cache.clone(),
             s.streaming,
             s.trusted_bot_ids.iter().cloned().collect(),
+            s.allowed_channels.iter().cloned().collect(),
+            slack_config_path.clone(),
         ))
     });
     #[cfg(not(feature = "slack"))]
@@ -442,7 +452,6 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
-                slack_cfg.allowed_channels.into_iter().collect(),
                 slack_allowed_users,
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),

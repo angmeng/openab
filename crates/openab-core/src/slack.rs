@@ -29,6 +29,13 @@ const FILE_SEND_MARKER_SUFFIX: &str = ">>";
 /// Slack's own per-file limit is 1 GB by default; we cap at 100 MB.
 const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Marker syntax for owner-triggered Slack channel creation. DM-only: only
+/// honored when the agent's reply is going to a DM channel (id starts with 'D'),
+/// so channel/relay chatter can never trigger it.
+/// `<<openab-create-channel name=<slug> [private] [topic="…"] [invite=@U…,@U…]>>`
+const CREATE_CHANNEL_MARKER_PREFIX: &str = "<<openab-create-channel ";
+const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
+
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
 /// outside this map will fall back to `grey_question`.
@@ -162,9 +169,22 @@ pub struct SlackAdapter {
     /// each potentially containing the file-send marker. Without dedup we'd
     /// re-upload the same file dozens of times. Cleared once per session restart.
     file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
+    /// Channel allowlist (from `[slack].allowed_channels`), shared mutable so a
+    /// channel the bot CREATES (via the `<<openab-create-channel>>` marker) or is
+    /// INVITED into can be added at runtime — otherwise the bot is deaf in its
+    /// own ticket channels until the next restart (observed 2026-06-04: @mention
+    /// in a freshly-created `at-2043-…` channel was dropped at the gate). The gate
+    /// reads a snapshot per message; `allow_channel_now` inserts on create/invite.
+    /// `allow_all_channels` (separate flag) still bypasses this entirely.
+    allowed_channels: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Path to the on-disk config file, so runtime allowlist additions (a channel
+    /// the bot is invited into, or creates) can be PERSISTED — otherwise they're
+    /// lost on restart. None when the config came from a URL (can't write back).
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl SlackAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bot_token: String,
         session_ttl: std::time::Duration,
@@ -173,6 +193,8 @@ impl SlackAdapter {
         multibot_cache: crate::multibot_cache::MultibotCache,
         streaming: bool,
         trusted_bot_ids: HashSet<String>,
+        allowed_channels: HashSet<String>,
+        config_path: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             // Bound every Slack Web API call; an unbounded inline gating call in the
@@ -195,6 +217,35 @@ impl SlackAdapter {
             streams: tokio::sync::Mutex::new(HashMap::new()),
             event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
+            allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
+            config_path,
+        }
+    }
+
+    /// Add a channel to the runtime allowlist AND persist it to the on-disk
+    /// config so it survives a restart. Idempotent. The runtime add is the part
+    /// that matters for *this* process (the gate reads it next message);
+    /// persistence is best-effort — if the config write fails (URL config, perms,
+    /// unexpected format) we log and keep the runtime add, never block listening.
+    /// `reason` is for the log line ("created" | "invited").
+    async fn allow_channel_now(&self, channel_id: &str, reason: &str) {
+        let newly_added = {
+            let mut allowed = self.allowed_channels.write().await;
+            allowed.insert(channel_id.to_string())
+        };
+        if newly_added {
+            info!(channel_id, reason, "slack: added channel to runtime allowlist");
+        }
+        if let Some(path) = &self.config_path {
+            match crate::config::persist_allowed_channel(path, channel_id) {
+                Ok(true) => info!(channel_id, "slack: persisted channel to config allowlist"),
+                Ok(false) => {} // already in config
+                Err(e) => warn!(
+                    channel_id, error = %e,
+                    "slack: could not persist channel to config (runtime add still active; \
+                     add it to [slack].allowed_channels by hand to survive restart)"
+                ),
+            }
         }
     }
 
@@ -479,6 +530,71 @@ impl SlackAdapter {
         })
     }
 
+    /// Create a Slack channel, then optionally set its topic and invite users.
+    ///
+    /// Required bot scopes: `channels:manage` (public) or `groups:write`
+    /// (private); those also cover setTopic + invite. Returns the new channel id.
+    /// `api_post` already turns a non-`ok` Slack response into an `Err` carrying
+    /// the Slack error code (e.g. `name_taken`, `missing_scope`), so the caller's
+    /// error arm surfaces it to the owner.
+    async fn create_channel_in_slack(&self, spec: &CreateChannelSpec) -> Result<String> {
+        let create_resp = self
+            .api_post(
+                "conversations.create",
+                serde_json::json!({
+                    "name": spec.name,
+                    "is_private": spec.is_private,
+                }),
+            )
+            .await?;
+
+        let channel_id = create_resp["channel"]["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("conversations.create returned no channel id"))?
+            .to_string();
+
+        info!(
+            channel_id = %channel_id,
+            name = %spec.name,
+            is_private = spec.is_private,
+            "slack: channel created"
+        );
+
+        // Self-heal the allowlist: a channel the bot just created must be
+        // listenable immediately, or @mentions in it are dropped at the gate
+        // until the next restart (2026-06-04 fix). Runtime add + persist to
+        // config so it also survives a restart. `allow_all_channels` makes the
+        // gate a no-op, so this only matters when the allowlist is enforced —
+        // adding unconditionally is harmless.
+        self.allow_channel_now(&channel_id, "created").await;
+
+        if let Some(topic) = &spec.topic {
+            if let Err(e) = self
+                .api_post(
+                    "conversations.setTopic",
+                    serde_json::json!({ "channel": channel_id, "topic": topic }),
+                )
+                .await
+            {
+                warn!(channel_id = %channel_id, error = %e, "slack: setTopic failed (channel still created)");
+            }
+        }
+
+        if !spec.invite.is_empty() {
+            if let Err(e) = self
+                .api_post(
+                    "conversations.invite",
+                    serde_json::json!({ "channel": channel_id, "users": spec.invite.join(",") }),
+                )
+                .await
+            {
+                warn!(channel_id = %channel_id, error = %e, "slack: invite failed (channel still created)");
+            }
+        }
+
+        Ok(channel_id)
+    }
+
     /// Resolve a Slack user ID to display name via users.info API.
     /// Results are cached for 5 minutes to avoid hitting Slack rate limits.
     async fn resolve_user_name(&self, user_id: &str) -> Option<String> {
@@ -688,6 +804,42 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        // Owner-triggered channel creation (DM-only). Runs before the file-send
+        // check so the marker line is stripped regardless of outcome.
+        if let Some((residual, spec)) = extract_create_channel_marker(content) {
+            if !channel.channel_id.starts_with('D') {
+                // Not a DM — channel creation is owner-DM-only. Strip the marker,
+                // forward any residual text, and note it was ignored.
+                let trimmed = residual.trim();
+                let notice = if trimmed.is_empty() {
+                    "⚠️ channel creation is owner-DM-only; ignored here.".to_string()
+                } else {
+                    format!("{trimmed}\n\n⚠️ (channel-create marker ignored: DM-only)")
+                };
+                return self.send_plain_text(channel, &notice).await;
+            }
+            let confirmation = match self.create_channel_in_slack(&spec).await {
+                Ok(cid) => {
+                    let mut parts = vec![format!("✅ Created <#{cid}|{}>", spec.name)];
+                    if spec.topic.is_some() {
+                        parts.push("topic set".to_string());
+                    }
+                    if !spec.invite.is_empty() {
+                        parts.push(format!("invited {}", spec.invite.len()));
+                    }
+                    parts.join(" · ")
+                }
+                Err(e) => format!("⚠️ Failed to create channel `{}`: {}", spec.name, e),
+            };
+            let residual = residual.trim();
+            let body = if residual.is_empty() {
+                confirmation
+            } else {
+                format!("{residual}\n\n{confirmation}")
+            };
+            return self.send_plain_text(channel, &body).await;
+        }
+
         // Scan for file-send markers `<<openab-send-file PATH>>`. If found,
         // intercept: post the residual text (caption) first, then upload each
         // file via Slack's files API. Returns the MessageRef of the last action.
@@ -1084,7 +1236,6 @@ pub async fn run_slack_adapter(
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
-    allowed_channels: HashSet<String>,
     allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
@@ -1122,8 +1273,17 @@ pub async fn run_slack_adapter(
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((ws_stream, _)) => {
+        // Bound the WebSocket handshake for the same reason as the HTTP call
+        // above — `connect_async` can otherwise hang indefinitely on a half-up
+        // network. On timeout, warn and fall through to the backoff retry below
+        // so the bridge keeps trying until the network returns (ac1fa7b).
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio_tungstenite::connect_async(&ws_url),
+        )
+        .await
+        {
+            Ok(Ok((ws_stream, _))) => {
                 info!("Slack Socket Mode connected");
                 backoff_secs = 1; // reset on success
                 let (mut write, mut read) = ws_stream.split();
@@ -1216,6 +1376,20 @@ pub async fn run_slack_adapter(
                                                     "inbound event received"
                                                 );
 
+                                                // Bot invited into an existing channel: Slack emits a
+                                                // `channel_join` message whose `user` is the joiner. When that's
+                                                // the bot itself, self-heal the allowlist (runtime + persist) so
+                                                // the bot can hear that channel without a manual config edit +
+                                                // restart (2026-06-04 — symmetric with the create-channel path).
+                                                // Still falls through to skip_subtype below (no agent dispatch for
+                                                // a join notice).
+                                                if subtype == "channel_join"
+                                                    && bot_uid_opt.as_deref().is_some()
+                                                    && event_user_id == bot_uid_opt.as_deref()
+                                                {
+                                                    adapter.allow_channel_now(channel_id, "invited").await;
+                                                }
+
                                                 // Skip non-message subtypes
                                                 let skip_subtype = matches!(subtype,
                                                     "message_changed" | "message_deleted" |
@@ -1292,7 +1466,7 @@ pub async fn run_slack_adapter(
                                                             TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
                                                         }
                                                         let channel_allowed = allow_all_channels
-                                                            || allowed_channels.contains(channel_id);
+                                                            || adapter.allowed_channels.read().await.contains(channel_id);
                                                         if !is_own_bot_msg && channel_allowed {
                                                             let warn_channel = ChannelRef {
                                                                 platform: "slack".into(),
@@ -1478,7 +1652,6 @@ pub async fn run_slack_adapter(
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
-                                                let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
@@ -1490,7 +1663,6 @@ pub async fn run_slack_adapter(
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
-                                                        &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
@@ -1540,8 +1712,11 @@ pub async fn run_slack_adapter(
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
+            }
+            Err(_) => {
+                warn!(backoff = backoff_secs, "connect_async timed out after 20s, retrying");
             }
         }
 
@@ -1556,7 +1731,15 @@ pub async fn run_slack_adapter(
 
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
 async fn get_socket_mode_url(app_token: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    // Bound the HTTP call. A bare `reqwest::Client::new()` has no default
+    // timeout, so a hung TCP connect (e.g. waking from laptop sleep onto a
+    // not-yet-ready network) would block the reconnect loop forever — process
+    // alive, last log line "connecting…", no "connected", silent (ac1fa7b).
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let resp = client
         .post(format!("{SLACK_API}/apps.connections.open"))
         .header("Authorization", format!("Bearer {app_token}"))
@@ -1582,7 +1765,6 @@ async fn handle_message(
     bot_token: &str,
     allow_all_channels: bool,
     allow_all_users: bool,
-    allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
@@ -1615,7 +1797,12 @@ async fn handle_message(
     // channel silently drops every DM (regression from the Atlas team-bots
     // patch, 2026-05-28).
     let is_dm = channel_id.starts_with('D');
-    if !is_dm && !allow_all_channels && !allowed_channels.contains(&channel_id) {
+    // Read the (runtime-mutable) allowlist snapshot here — picks up channels the
+    // bot just created or was invited into (see `allow_channel_now`).
+    if !is_dm
+        && !allow_all_channels
+        && !adapter.allowed_channels.read().await.contains(&channel_id)
+    {
         return;
     }
 
@@ -2089,6 +2276,116 @@ fn is_plain_user_message(subtype: &str, text: &str) -> bool {
     )
 }
 
+/// Spec parsed from an `<<openab-create-channel …>>` marker.
+struct CreateChannelSpec {
+    name: String,
+    is_private: bool,
+    topic: Option<String>,
+    invite: Vec<String>,
+}
+
+/// Parse outbound text for a single owner-triggered channel-create marker.
+/// Line-anchored like the file-send marker (must occupy its own trimmed line).
+/// Returns `Some((text_without_marker, spec))` for the FIRST valid marker line;
+/// later marker lines are left as literal text. `None` if no marker present or
+/// the marker has no usable `name=`.
+fn extract_create_channel_marker(content: &str) -> Option<(String, CreateChannelSpec)> {
+    if !content.contains(CREATE_CHANNEL_MARKER_PREFIX) {
+        return None;
+    }
+
+    let mut spec: Option<CreateChannelSpec> = None;
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if spec.is_none()
+            && trimmed.starts_with(CREATE_CHANNEL_MARKER_PREFIX)
+            && trimmed.ends_with(CREATE_CHANNEL_MARKER_SUFFIX)
+        {
+            let inner = trimmed[CREATE_CHANNEL_MARKER_PREFIX.len()
+                ..trimmed.len() - CREATE_CHANNEL_MARKER_SUFFIX.len()]
+                .trim();
+            if let Some(parsed) = parse_create_channel_args(inner) {
+                spec = Some(parsed);
+                continue; // strip the marker line from output
+            }
+            // invalid marker (no name) — drop the line so we don't leak it
+            continue;
+        }
+        kept_lines.push(line);
+    }
+
+    spec.map(|s| (kept_lines.join("\n"), s))
+}
+
+/// Parse the inner args of a create-channel marker. Grammar:
+///   name=<slug>            (required)
+///   private                (optional bare flag)
+///   topic="<free text>"    (optional, quoted — may contain spaces)
+///   invite=@U1,@U2,...     (optional, comma-separated Slack user IDs)
+fn parse_create_channel_args(inner: &str) -> Option<CreateChannelSpec> {
+    // Pull out topic="..." first (it may contain spaces), then parse the rest
+    // as whitespace-separated tokens.
+    let mut rest = inner.to_string();
+    let mut topic: Option<String> = None;
+    if let Some(start) = rest.find("topic=\"") {
+        let after = start + "topic=\"".len();
+        if let Some(end_rel) = rest[after..].find('"') {
+            let t = rest[after..after + end_rel].trim().to_string();
+            if !t.is_empty() {
+                topic = Some(t);
+            }
+            let end = after + end_rel + 1;
+            rest.replace_range(start..end, " ");
+        }
+    }
+
+    let mut name: Option<String> = None;
+    let mut is_private = false;
+    let mut invite: Vec<String> = Vec::new();
+
+    for tok in rest.split_whitespace() {
+        if tok == "private" {
+            is_private = true;
+        } else if let Some(v) = tok.strip_prefix("name=") {
+            let slug = normalize_channel_name(v);
+            if !slug.is_empty() {
+                name = Some(slug);
+            }
+        } else if let Some(v) = tok.strip_prefix("invite=") {
+            for id in v.split(',') {
+                let id = id.trim().trim_start_matches('@');
+                if !id.is_empty() {
+                    invite.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    name.map(|name| CreateChannelSpec {
+        name,
+        is_private,
+        topic,
+        invite,
+    })
+}
+
+/// Normalize a requested channel name to Slack's rules: lowercase, only
+/// `a-z0-9` plus hyphen/underscore, spaces/`.`/`/`→hyphen, ≤80 chars.
+fn normalize_channel_name(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c == ' ' || c == '.' || c == '/' {
+            out.push('-');
+        }
+        // drop anything else
+    }
+    out.trim_matches('-').chars().take(80).collect()
+}
+
 /// Parse outbound text for file-send markers `<<openab-send-file PATH>>`.
 /// Returns `Some((text_without_markers, paths))` if at least one marker line is
 /// found, `None` otherwise (fast-path).
@@ -2345,7 +2642,7 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
         adapter.streams.lock().await.insert(
             "TS".into(),
             StreamEntry { active: false, degraded_buf: String::new() },
@@ -2741,7 +3038,7 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
 
         assert!(
             adapter.use_streaming(false),
@@ -2770,6 +3067,8 @@ mod tests {
             crate::multibot_cache::MultibotCache::load("/dev/null".into()),
             true,
             trusted,
+            HashSet::new(),
+            None,
         );
         assert!(
             !adapter.use_streaming(false),
@@ -2790,19 +3089,19 @@ mod tests {
         let ttl = std::time::Duration::from_secs(60);
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
         assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
         assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
         assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
         assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
-        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
         assert!(!adapter2.uses_assistant_status());
         assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
         assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
 
         // streaming=false → send-once: neither post+edit nor native, even alone.
-        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false, HashSet::new());
+        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false, HashSet::new(), HashSet::new(), None);
         assert!(!adapter3.use_streaming(false), "streaming=false forces send-once (no post+edit)");
         assert!(!adapter3.uses_native_streaming(false), "streaming=false disables native even with assistant_mode");
         assert!(adapter3.uses_assistant_status(), "streaming switch does not affect assistant status API");
@@ -2859,7 +3158,7 @@ mod tests {
     #[test]
     fn typical_long_table_stays_in_one_chunk() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
         let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
@@ -2921,7 +3220,7 @@ mod tests {
     #[test]
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new());
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
         assert!(adapter.renders_native_tables());
     }
 }
