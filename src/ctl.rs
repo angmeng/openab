@@ -1,8 +1,19 @@
-//! `openab set/get` IPC over Unix domain socket.
+//! `openab set/get` IPC over a local control socket.
 //!
 //! Architecture (like consul/vault):
-//! - `openab run` spawns a UnixListener at a well-known path.
+//! - `openab run` spawns a listener at a well-known endpoint.
 //! - `openab set key value` connects, sends a JSON request, reads the response.
+//!
+//! Transport is platform-specific (Windows has no Unix-domain sockets in tokio):
+//! - Unix: a Unix-domain socket at `OPENAB_SOCK` (default `/tmp/openab.sock`),
+//!   chmod 0600 so only the owner can reach it.
+//! - Windows: a loopback TCP socket. `OPENAB_SOCK` may be a full `host:port` or
+//!   a bare port; default `127.0.0.1:48222`. NOTE: loopback TCP is reachable by
+//!   any local process (no per-file ACL like the Unix 0600 socket) — acceptable
+//!   for a single-user bridge; switch to a named pipe if you need local
+//!   isolation on a shared Windows host.
+//!
+//! The wire protocol (one line of JSON each way) is identical on both.
 //!
 //! Phase 1 supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
@@ -12,14 +23,54 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-/// Default socket path. Overridable via `OPENAB_SOCK` env var.
+/// Default control endpoint, returned as a `PathBuf` for back-compat with
+/// callers. On Unix this is the Unix-socket path; on Windows it is the loopback
+/// TCP address string (see module docs). Overridable via `OPENAB_SOCK`.
 pub fn socket_path() -> PathBuf {
-    std::env::var("OPENAB_SOCK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/openab.sock"))
+    #[cfg(unix)]
+    {
+        std::env::var("OPENAB_SOCK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/openab.sock"))
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(windows_addr())
+    }
+}
+
+/// Windows loopback control address. `OPENAB_SOCK` may be a full `host:port`
+/// or a bare port number; anything else (unset, or a Unix-style path) falls
+/// back to the default port.
+#[cfg(windows)]
+fn windows_addr() -> String {
+    match std::env::var("OPENAB_SOCK") {
+        Ok(v) if v.parse::<std::net::SocketAddr>().is_ok() => v,
+        Ok(v) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("127.0.0.1:{v}")
+        }
+        _ => "127.0.0.1:48222".to_string(),
+    }
+}
+
+/// Resolve a caller-supplied endpoint `PathBuf` to a bindable/connectable TCP
+/// address on Windows. A real `host:port` is used as-is; a non-address path
+/// (e.g. a Unix-style `*.sock` from a test or stale config) falls back to the
+/// default loopback endpoint so server and client still rendezvous.
+#[cfg(windows)]
+fn resolve_addr(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if s.parse::<std::net::SocketAddr>().is_ok() {
+        s.into_owned()
+    } else {
+        windows_addr()
+    }
 }
 
 // ─── Protocol ───────────────────────────────────────────────────────────────
@@ -73,21 +124,33 @@ pub fn spawn_server_at(
     handler: std::sync::Arc<dyn CtlHandler>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Remove stale socket file
-        let _ = std::fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
-            Ok(l) => l,
-            Err(e) => {
-                error!(path = %path.display(), error = %e, "failed to bind control socket");
-                return;
-            }
-        };
-        // Restrict socket to owner only (defense-in-depth for shared hosts).
         #[cfg(unix)]
-        {
+        let listener = {
+            // Remove stale socket file, bind, then restrict to owner only
+            // (defense-in-depth for shared hosts).
+            let _ = std::fs::remove_file(&path);
+            let listener = match UnixListener::bind(&path) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(path = %path.display(), error = %e, "failed to bind control socket");
+                    return;
+                }
+            };
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+            listener
+        };
+        #[cfg(windows)]
+        let listener = {
+            let addr = resolve_addr(&path);
+            match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(addr = %addr, error = %e, "failed to bind control socket");
+                    return;
+                }
+            }
+        };
         info!(path = %path.display(), "control socket listening");
 
         loop {
@@ -108,11 +171,14 @@ pub fn spawn_server_at(
     })
 }
 
-async fn handle_conn(
-    stream: UnixStream,
+async fn handle_conn<S>(
+    stream: S,
     handler: &dyn CtlHandler,
-) -> anyhow::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     if let Some(line) = lines.next_line().await? {
         let req: Request = serde_json::from_str(&line)?;
@@ -313,6 +379,7 @@ pub async fn send_request(req: &Request) -> anyhow::Result<Response> {
 
 /// Send a request to a specific socket path.
 pub async fn send_request_to(path: &PathBuf, req: &Request) -> anyhow::Result<Response> {
+    #[cfg(unix)]
     let stream = UnixStream::connect(&path).await.map_err(|e| {
         anyhow::anyhow!(
             "cannot connect to openab at {}: {} (is `openab run` running?)",
@@ -320,7 +387,18 @@ pub async fn send_request_to(path: &PathBuf, req: &Request) -> anyhow::Result<Re
             e
         )
     })?;
-    let (reader, mut writer) = stream.into_split();
+    #[cfg(windows)]
+    let stream = {
+        let addr = resolve_addr(path);
+        TcpStream::connect(&addr).await.map_err(|e| {
+            anyhow::anyhow!(
+                "cannot connect to openab at {}: {} (is `openab run` running?)",
+                addr,
+                e
+            )
+        })?
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut buf = serde_json::to_vec(req)?;
     buf.push(b'\n');
     writer.write_all(&buf).await?;
