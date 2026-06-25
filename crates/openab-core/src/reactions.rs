@@ -65,6 +65,12 @@ impl StatusReactionController {
         }
     }
 
+    /// Whether reaction acks are enabled. Lets callers rely on the ✅ ack
+    /// instead of a text placeholder when a turn legitimately emits nothing.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub async fn set_queued(&self) {
         if !self.enabled {
             return;

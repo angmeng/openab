@@ -961,6 +961,14 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    // Per-turn usage from the keyed result. `inputTokens == 0`
+                    // means the model was never invoked — a prompt arrived while
+                    // the session was mid-turn and ACP returned an instant empty
+                    // `end_turn` (busy no-op), distinct from a turn where the model
+                    // ran and chose to emit nothing (`inputTokens > 0`). Drives the
+                    // busy-noop notice in the final-compose below. See
+                    // AI-Memory/shared/2026-06-23-openab-no-response-fix.md (#4).
+                    let mut result_input_tokens: Option<u64> = None;
                     let prompt_start = tokio::time::Instant::now();
                     // Last sign of life from the agent; drives the dropped-turn
                     // idle watchdog below. Reset only on real forward progress
@@ -1045,6 +1053,14 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                            } else if let Some(ref result) = notification.result {
+                                // Capture the turn's input-token count to tell a
+                                // busy no-op (model never ran) apart from a genuine
+                                // empty turn in the final-compose below.
+                                result_input_tokens = result
+                                    .get("usage")
+                                    .and_then(|u| u.get("inputTokens"))
+                                    .and_then(|v| v.as_u64());
                             }
                             break;
                         }
@@ -1313,18 +1329,32 @@ impl AdapterRouter {
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
+                    // A busy no-op: a prompt arrived while the session was mid-turn,
+                    // so ACP returned an instant empty `end_turn` with the model never
+                    // invoked (`inputTokens == 0`). This is NOT "nothing to say" — the
+                    // user's message was effectively dropped — so it must surface a
+                    // notice, never be suppressed to a bare/silent placeholder.
+                    let busy_noop = final_content.is_empty()
+                        && response_error.is_none()
+                        && !agent_emitted_text
+                        && result_input_tokens == Some(0);
                     // A dispatched bot that emits empty output would otherwise post
-                    // "_(no response)_". In a multi-bot channel that placeholder is pure
-                    // noise — the agent legitimately chose to add nothing, and the dispatch
-                    // reaction (👀→✅) already signals "seen, done". Suppress the post there,
-                    // leaving only the reaction as the acknowledgment. Keep the placeholder in
-                    // DM / solo (no peer to spam; a useful "finished / nothing to say" signal).
-                    // Errors always surface regardless.
-                    let suppress_send =
-                        final_content.is_empty() && response_error.is_none() && other_bot_present;
+                    // "_(no response)_". That placeholder is pure noise whenever the
+                    // turn legitimately added nothing AND the user still gets an ack:
+                    // either a peer bot's dispatch reaction (multi-bot channel) or this
+                    // bot's own ✅ status reaction. Suppress the post in those cases,
+                    // leaving the reaction as the acknowledgment. Keep the placeholder
+                    // only when there is no reaction ack to fall back on. Busy no-ops
+                    // and errors always surface regardless.
+                    let suppress_send = final_content.is_empty()
+                        && response_error.is_none()
+                        && !busy_noop
+                        && (other_bot_present || reactions.enabled());
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
+                        } else if busy_noop {
+                            "⏳ 還在忙上一個任務，跑完這個再回你這則。".to_string()
                         } else {
                             "_(no response)_".to_string()
                         }
