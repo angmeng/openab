@@ -17,6 +17,9 @@
 //!
 //! Phase 1 supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
+//! - `message.send` — proactively post text to a channel, out-of-band (no
+//!   user-prompt turn). Lets cron / heartbeat / the agent's own shell push a
+//!   message immediately instead of waiting for the next turn to flush.
 
 use openab_core::adapter::{ChannelRef, ChatAdapter};
 use serde::{Deserialize, Serialize};
@@ -347,6 +350,68 @@ impl CtlHandler for RuntimeHandler {
                         message: "agent.status requires discord feature".into(),
                         value: None,
                     }
+                }
+            }
+            "message.send" => {
+                // Proactive / out-of-band push: deliver `value` to the channel now via
+                // the adapter's own send_message, bypassing the user-prompt turn pipeline
+                // (the finalize-only buffering that otherwise holds replies until a turn
+                // ends). Any local process — cron, heartbeat, the agent's own shell — can
+                // trigger this without an inbound prompt waiting.
+                let Some(tid) = thread_id else {
+                    return Response {
+                        ok: false,
+                        message: "message.send requires --thread <channel_id>".into(),
+                        value: None,
+                    };
+                };
+                if value.is_empty() {
+                    return Response {
+                        ok: false,
+                        message: "message.send requires a non-empty value (the text)".into(),
+                        value: None,
+                    };
+                }
+                // Resolve the adapter: registry first; fall back to the sole configured
+                // adapter when the registry has no entry. The registry is only populated
+                // after an inbound message, but proactive push must work before that — and
+                // a per-persona bridge has exactly one chat adapter.
+                let adapter = match self.resolve(Some(tid)).await {
+                    Some((a, _)) => a,
+                    None if self.adapters.len() == 1 => {
+                        self.adapters.values().next().unwrap().clone()
+                    }
+                    None => {
+                        return Response {
+                            ok: false,
+                            message: format!(
+                                "cannot resolve platform for thread {tid}: registry empty and \
+                                 {} adapters configured (ambiguous — wire the registry or run a \
+                                 single-adapter bridge)",
+                                self.adapters.len()
+                            ),
+                            value: None,
+                        };
+                    }
+                };
+                let channel = ChannelRef {
+                    platform: String::new(),
+                    channel_id: tid.to_string(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                match adapter.send_message(&channel, value).await {
+                    Ok(m) => Response {
+                        ok: true,
+                        message: format!("sent to {tid} (message_id {})", m.message_id),
+                        value: Some(m.message_id),
+                    },
+                    Err(e) => Response {
+                        ok: false,
+                        message: format!("send failed: {e}"),
+                        value: None,
+                    },
                 }
             }
             _ => Response {
