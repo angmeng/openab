@@ -11,11 +11,15 @@
 #   echo "text" | frieren-say            read text from stdin
 #
 # env: FRIEREN_CHANNEL (default channel id) · OPENAB_BIN (openab path) ·
-#      OPENAB_SOCK (ctl socket; honored by openab itself)
+#      OPENAB_SOCK (ctl socket; default /tmp/openab-frieren.sock)
 set -euo pipefail
 
 OPENAB_BIN="${OPENAB_BIN:-$HOME/openab-src/target/release/openab}"
 CHANNEL="${FRIEREN_CHANNEL:-1485140554839752747}"
+# Frieren's dedicated ctl socket (matches run-openab-frieren.sh). Explicit
+# OPENAB_SOCK still wins; this default makes the wrapper work even when the
+# caller didn't inherit the bridge env.
+export OPENAB_SOCK="${OPENAB_SOCK:-/tmp/openab-frieren.sock}"
 FILE=""
 ARGS=()
 
