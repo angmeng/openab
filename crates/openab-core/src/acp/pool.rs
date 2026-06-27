@@ -377,9 +377,9 @@ impl SessionPool {
                 let path = std::env::var("OPENAB_TEAM_SYSTEM_PROMPT_FILE")
                     .unwrap_or_else(|_| "~/.openab/team-system-prompt.md".to_string());
                 let resolved = match path.strip_prefix("~/") {
-                    Some(rest) => {
-                        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(rest))
-                    }
+                    Some(rest) => std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(|h| std::path::PathBuf::from(h).join(rest)),
                     None => Some(std::path::PathBuf::from(&path)),
                 };
                 resolved

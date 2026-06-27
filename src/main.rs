@@ -259,13 +259,16 @@ async fn main() -> anyhow::Result<()> {
     let workspace_aliases = cfg.workspace.aliases;
     let reactions_cfg = cfg.reactions;
     let table_mode = cfg.markdown.tables;
-    let bot_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
-        tracing::warn!(
-            "HOME environment variable is not set — falling back to /tmp as bot_home. \
-             This weakens the workspace security boundary."
-        );
-        "/tmp".into()
-    }));
+    let bot_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "neither HOME nor USERPROFILE is set — falling back to the OS temp dir as \
+                 bot_home. This weakens the workspace security boundary."
+            );
+            std::env::temp_dir()
+        });
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

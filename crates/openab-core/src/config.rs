@@ -756,7 +756,9 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_working_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())
 }
 fn default_agent_command() -> String {
     if let Ok(val) = std::env::var("OPENAB_AGENT_COMMAND") {
