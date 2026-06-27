@@ -299,9 +299,7 @@ async fn main() -> anyhow::Result<()> {
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
     // Initialize multibot cache
-    let multibot_cache_path = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
+    let multibot_cache_path = home_dir()?
         .join(".openab")
         .join("cache")
         .join("threads.json");
@@ -723,18 +721,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let usercron_path = if cfg.cron.usercron_enabled {
-        cfg.cron.usercron_path.as_ref().map(|p| {
-            let path = std::path::PathBuf::from(p);
-            if path.is_absolute() {
-                path
-            } else {
-                std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default()
-                    .join(".openab")
-                    .join(path)
-            }
-        })
+        cfg.cron
+            .usercron_path
+            .as_ref()
+            .map(|p| -> anyhow::Result<std::path::PathBuf> {
+                let path = std::path::PathBuf::from(p);
+                Ok(if path.is_absolute() {
+                    path
+                } else {
+                    home_dir()?.join(".openab").join(path)
+                })
+            })
+            .transpose()?
     } else {
         None
     };
@@ -816,9 +814,7 @@ async fn main() -> anyhow::Result<()> {
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store
-        let reminder_path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
+        let reminder_path = home_dir()?
             .join(".openab")
             .join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
@@ -931,6 +927,18 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("openab shut down");
     Ok(())
+}
+
+/// Resolve the user's home directory cross-platform. Unix sets HOME; Windows
+/// normally sets only USERPROFILE. Returns an absolute path or errors loudly —
+/// never an empty/relative PathBuf, which on a Windows service would resolve
+/// against the service CWD (e.g. C:\Windows\System32) and fail with
+/// "Access is denied. (os error 5)" when creating .openab subdirs.
+fn home_dir() -> anyhow::Result<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set; cannot locate home directory"))
 }
 
 fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {

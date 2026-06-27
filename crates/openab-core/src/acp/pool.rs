@@ -106,9 +106,12 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 
 impl SessionPool {
     pub fn new(config: AgentConfig, max_sessions: usize, ttl_hours: u64) -> Self {
-        let openab_dir = std::env::var("HOME")
+        // HOME on Unix, USERPROFILE on Windows; the OS temp dir only as a last
+        // resort (literal /tmp does not exist on Windows).
+        let openab_dir = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .unwrap_or_else(std::env::temp_dir)
             .join(".openab");
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
@@ -607,7 +610,13 @@ impl SessionPool {
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+        // Use `last_active.elapsed() > ttl` rather than comparing against a
+        // back-dated `Instant::now() - ttl`. On Windows the monotonic clock
+        // (QueryPerformanceCounter) starts near zero, so subtracting a large
+        // ttl (hours) from a freshly-read Instant underflows and panics
+        // ("overflow when subtracting duration from instant"), killing this
+        // cleanup task. `elapsed()` is saturating and never underflows.
+        let ttl = std::time::Duration::from_secs(ttl_secs);
 
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
@@ -626,7 +635,7 @@ impl SessionPool {
             let Ok(conn) = conn.try_lock() else {
                 continue;
             };
-            if conn.last_active < cutoff || !conn.alive() {
+            if conn.last_active.elapsed() > ttl || !conn.alive() {
                 stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
         }
