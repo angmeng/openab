@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# frieren-say — proactively push a message (or file) to a Discord channel,
+# out-of-band, with NO prompt turn waiting. Thin wrapper over
+# `openab set message.send` (ctl socket → adapter.send_message), so cron /
+# heartbeat / the agent's own shell can deliver immediately.
+#
+#   frieren-say "your text"              push text to the default channel
+#   frieren-say -c <channel_id> "text"   push to a specific channel
+#   frieren-say -f /abs/path.png         push a file (uses the Q1 send-file marker)
+#   frieren-say "caption" -f /abs/clip   caption + file in one message
+#   echo "text" | frieren-say            read text from stdin
+#
+# env: FRIEREN_CHANNEL (default channel id) · OPENAB_BIN (openab path) ·
+#      OPENAB_SOCK (ctl socket; honored by openab itself)
+set -euo pipefail
+
+OPENAB_BIN="${OPENAB_BIN:-$HOME/openab-src/target/release/openab}"
+CHANNEL="${FRIEREN_CHANNEL:-1485140554839752747}"
+FILE=""
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--channel) CHANNEL="${2:?-c/--channel needs a channel id}"; shift 2 ;;
+    -f|--file)    FILE="${2:?-f/--file needs a path}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,14p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+      exit 0 ;;
+    --)           shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done; break ;;
+    -*)           echo "frieren-say: unknown flag: $1" >&2; exit 2 ;;
+    *)            ARGS+=("$1"); shift ;;
+  esac
+done
+
+if (( ${#ARGS[@]} > 0 )); then
+  TEXT="${ARGS[*]}"
+elif [[ ! -t 0 ]]; then
+  TEXT="$(cat)"
+else
+  TEXT=""
+fi
+
+if [[ -n "$FILE" ]]; then
+  [[ -e "$FILE" ]] || { echo "frieren-say: file not found: $FILE" >&2; exit 2; }
+  # Marker must be on its own line (Q1 parser is line-anchored).
+  if [[ -n "$TEXT" ]]; then
+    MSG="$TEXT"$'\n'"<<openab-send-file $FILE>>"
+  else
+    MSG="<<openab-send-file $FILE>>"
+  fi
+elif [[ -n "${TEXT//[[:space:]]/}" ]]; then
+  MSG="$TEXT"
+else
+  echo "usage: frieren-say [-c <channel>] [-f <path>] <text>   (text optional with -f; or pipe via stdin)" >&2
+  exit 2
+fi
+
+exec "$OPENAB_BIN" set message.send "$MSG" --thread "$CHANNEL"
