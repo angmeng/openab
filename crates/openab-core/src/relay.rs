@@ -367,6 +367,26 @@ pub fn strip_file_send_markers(body: &str) -> String {
         .join("\n")
 }
 
+/// Return the `<<openab-send-file PATH>>` marker lines (trimmed, one per entry)
+/// present in `text`, using the same line-anchored rule as
+/// [`strip_file_send_markers`].
+///
+/// Used by the turn finalizer to recover a file-send marker from the FULL turn
+/// buffer before send-once answer trimming can discard it: an explicit file-send
+/// marker is an upload intent, not inter-tool narration, so it must survive into
+/// the delivered body where the platform adapter (`discord.rs` / `slack.rs`)
+/// intercepts and uploads it.
+pub fn extract_file_send_marker_lines(text: &str) -> Vec<String> {
+    if !text.contains(FILE_SEND_MARKER_PREFIX) {
+        return Vec::new();
+    }
+    text.split('\n')
+        .map(str::trim)
+        .filter(|t| t.starts_with(FILE_SEND_MARKER_PREFIX) && t.ends_with(FILE_SEND_MARKER_SUFFIX))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Rewrite plain-text `@<persona>` tokens into real Discord mention tokens
 /// `<@<id>>` for the names in `map`. Used for relays whose target platform is
 /// Discord: the origin platform (e.g. Slack) flattens a cross-platform mention

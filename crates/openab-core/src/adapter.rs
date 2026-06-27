@@ -1254,6 +1254,18 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
+                    // Capture file-send markers from the FULL turn buffer before
+                    // send-once trimming. An explicit `<<openab-send-file PATH>>`
+                    // is an upload intent, not inter-tool narration, so it must
+                    // not be discarded by answer-block selection. Re-injected
+                    // after the finalize pipeline below if the body lost it.
+                    let recovered_send_markers = relay::extract_file_send_marker_lines(&text_buf);
+                    if !recovered_send_markers.is_empty() {
+                        tracing::info!(
+                            count = recovered_send_markers.len(),
+                            "finalize: captured file-send marker(s) from full turn buffer"
+                        );
+                    }
                     let (directives, text_buf) =
                         split_delivery(&text_buf, answer_start, keep_full_text);
                     // The session-reset notice lives at the head of the buffer; a
@@ -1324,6 +1336,16 @@ impl AdapterRouter {
                         result.residual
                     } else {
                         text_buf
+                    };
+
+                    // Strip file-send markers from the delivered TEXT: they are
+                    // handled out-of-band via a direct `send_message` below
+                    // (bypassing the whole finalize/chunk pipeline), so a transform
+                    // can never drop them and they never leak as literal text.
+                    let text_buf = if recovered_send_markers.is_empty() {
+                        text_buf
+                    } else {
+                        relay::strip_file_send_markers(&text_buf)
                     };
 
                     // Build final content
@@ -1591,6 +1613,19 @@ impl AdapterRouter {
                                 delivery_failed = true;
                             }
                             first = false;
+                        }
+                    }
+
+                    // Out-of-band file-send: deliver each recovered marker as its
+                    // OWN message straight through the adapter send hook
+                    // (Discord/Slack intercept + upload). This bypasses send-once
+                    // trimming and every finalize text transform, so an explicit
+                    // `<<openab-send-file PATH>>` upload intent is never dropped.
+                    for marker in &recovered_send_markers {
+                        tracing::info!(marker = %marker, "finalize: direct-sending file-send marker");
+                        if let Err(e) = adapter.send_message(&thread_channel, marker).await {
+                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "direct file-send marker delivery failed");
+                            delivery_failed = true;
                         }
                     }
 

@@ -38,6 +38,59 @@ const SELECT_MENU_PAGE_SIZE: usize = 25;
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
+/// Outbound file-send marker. The agent writes `<<openab-send-file /abs/path>>`
+/// on its own line in a reply; the adapter intercepts it, uploads the file to
+/// the current channel, and strips the marker from the visible text. This is the
+/// Discord counterpart to the Slack implementation in `slack.rs` — the marker
+/// syntax, line-anchoring, and cap MUST stay in sync with `slack.rs` and
+/// `relay::strip_file_send_markers`.
+const FILE_SEND_MARKER_PREFIX: &str = "<<openab-send-file ";
+const FILE_SEND_MARKER_SUFFIX: &str = ">>";
+/// Sanity cap mirroring `slack.rs`. Discord enforces a much lower per-message
+/// upload limit itself (8–100 MB depending on server boost); files over that are
+/// rejected by the Discord API and the error is surfaced to the user.
+const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Parse outbound text for file-send markers `<<openab-send-file PATH>>`.
+/// Returns `Some((text_without_markers, paths))` if at least one marker *line* is
+/// found, `None` otherwise (fast-path). Line-anchored: a marker must occupy its
+/// own line (after trimming whitespace) — inline occurrences are preserved
+/// literally so the agent can quote the syntax without self-triggering. Mirrors
+/// `slack.rs::extract_file_send_markers`; keep the two in sync.
+fn extract_file_send_markers(content: &str) -> Option<(String, Vec<String>)> {
+    if !content.contains(FILE_SEND_MARKER_PREFIX) {
+        return None;
+    }
+    let mut paths: Vec<String> = Vec::new();
+    let mut kept_lines: Vec<&str> = Vec::new();
+    for line in content.split('\n') {
+        // Trim normal whitespace AND zero-width / invisible characters. The agent
+        // or the rendering pipeline can leave a trailing zero-width space (U+200B),
+        // BOM (U+FEFF), word-joiner (U+2060), or bidi mark on the line, and a plain
+        // `trim()` (whitespace-only) would leave it attached — so `ends_with(">>")`
+        // fails and the marker leaks as literal text instead of uploading.
+        let trimmed = line.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}')
+        });
+        if trimmed.starts_with(FILE_SEND_MARKER_PREFIX) && trimmed.ends_with(FILE_SEND_MARKER_SUFFIX)
+        {
+            let inner = &trimmed
+                [FILE_SEND_MARKER_PREFIX.len()..trimmed.len() - FILE_SEND_MARKER_SUFFIX.len()];
+            let path = inner.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+            // Drop the marker line either way (don't leak an empty marker).
+            continue;
+        }
+        kept_lines.push(line);
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    Some((kept_lines.join("\n"), paths))
+}
+
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
 pub struct DiscordAdapter {
@@ -59,6 +112,94 @@ impl DiscordAdapter {
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
     }
+
+    /// If `content` carries `<<openab-send-file PATH>>` marker line(s), post the
+    /// residual caption (if any) and then upload each file, returning the last
+    /// MessageRef. Returns `Ok(None)` when no marker is present, so the caller
+    /// proceeds with its normal text post. Mirrors `slack.rs`'s interception.
+    /// `reply_to` (the inbound message id) is attached only to the *first*
+    /// message sent so quote-reply threading still works on mobile.
+    async fn try_send_files(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        reply_to: Option<u64>,
+    ) -> anyhow::Result<Option<MessageRef>> {
+        let Some((stripped, paths)) = extract_file_send_markers(content) else {
+            return Ok(None);
+        };
+        let mut last: Option<MessageRef> = None;
+        let mut reply_to = reply_to; // consumed by whichever message goes first
+
+        // Caption first (if any non-empty residual), so files read after it.
+        let trimmed = stripped.trim();
+        if !trimmed.is_empty() {
+            last = Some(match reply_to.take() {
+                Some(mid) => {
+                    self.send_message_with_reply(channel, trimmed, &mid.to_string())
+                        .await?
+                }
+                None => self.send_message(channel, trimmed).await?,
+            });
+        }
+
+        // Upload each file; one failure shouldn't block the rest — surface it.
+        for path in &paths {
+            match self.send_file_to_discord(channel, path, reply_to.take()).await {
+                Ok(m) => last = Some(m),
+                Err(e) => {
+                    error!(path = %path, error = %e, "discord: file upload failed");
+                    let err_text = format!("⚠️ Failed to send file `{path}`: {e}");
+                    last = Some(self.send_message(channel, &err_text).await?);
+                }
+            }
+        }
+
+        last.map(Some)
+            .ok_or_else(|| anyhow::anyhow!("no message sent (empty after marker strip)"))
+    }
+
+    /// Upload one file from disk into the channel via serenity, optionally as a
+    /// quote-reply. Validates the path (regular file, non-empty, within the
+    /// sanity cap) before reading. Mirrors `slack.rs`'s `send_file_to_slack`.
+    async fn send_file_to_discord(
+        &self,
+        channel: &ChannelRef,
+        path: &str,
+        reply_to: Option<u64>,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let path_buf = std::path::PathBuf::from(path);
+        if !path_buf.is_file() {
+            return Err(anyhow::anyhow!("not a regular file: {path}"));
+        }
+        let size = tokio::fs::metadata(&path_buf).await?.len();
+        if size == 0 {
+            return Err(anyhow::anyhow!("file is empty: {path}"));
+        }
+        if size > FILE_SEND_MAX_BYTES {
+            return Err(anyhow::anyhow!(
+                "file too large ({size} bytes > {FILE_SEND_MAX_BYTES} cap): {path}"
+            ));
+        }
+        let filename = path_buf
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("could not derive filename from path: {path}"))?
+            .to_string();
+        let bytes = tokio::fs::read(&path_buf).await?;
+        let attachment = CreateAttachment::bytes(bytes, filename);
+        let mut builder = serenity::builder::CreateMessage::new().add_file(attachment);
+        if let Some(mid) = reply_to.filter(|m| *m != 0) {
+            builder = builder.reference_message((ChannelId::new(ch_id), MessageId::new(mid)));
+        }
+        let msg = ChannelId::new(ch_id).send_message(&self.http, builder).await?;
+        info!(path = %path, size, "discord: file uploaded");
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
 }
 
 #[async_trait]
@@ -76,6 +217,9 @@ impl ChatAdapter for DiscordAdapter {
         channel: &ChannelRef,
         content: &str,
     ) -> anyhow::Result<MessageRef> {
+        if let Some(m) = self.try_send_files(channel, content, None).await? {
+            return Ok(m);
+        }
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let content = crate::relay::resolve_discord_mentions(content, &self.mentions);
         let msg = ChannelId::new(ch_id).say(&self.http, &content).await?;
@@ -91,6 +235,10 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> anyhow::Result<MessageRef> {
+        let reply_id = reply_to_message_id.parse::<u64>().ok().filter(|m| *m != 0);
+        if let Some(m) = self.try_send_files(channel, content, reply_id).await? {
+            return Ok(m);
+        }
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg_id: u64 = reply_to_message_id.parse().unwrap_or(0);
         if msg_id == 0 {
