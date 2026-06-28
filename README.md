@@ -4,7 +4,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
@@ -38,7 +38,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 ## Features
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
-- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](gateway/)
+- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
@@ -89,35 +89,35 @@ See [docs/slack.md](docs/slack.md) for a detailed step-by-step guide.
 <details>
 <summary><strong>Telegram</strong> (via Custom Gateway)</summary>
 
-See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
 
 </details>
 
 <details>
 <summary><strong>LINE</strong> (via Custom Gateway)</summary>
 
-See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
 
 </details>
 
 <details>
 <summary><strong>Feishu/Lark</strong> (via Custom Gateway)</summary>
 
-See [docs/feishu.md](docs/feishu.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service. Supports WebSocket long-connection (default, no public URL needed) and HTTP webhook fallback.
+See [docs/feishu.md](docs/feishu.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service. Supports WebSocket long-connection (default, no public URL needed) and HTTP webhook fallback.
 
 </details>
 
 <details>
 <summary><strong>Google Chat</strong> (via Custom Gateway)</summary>
 
-See [docs/google-chat.md](docs/google-chat.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+See [docs/google-chat.md](docs/google-chat.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
 
 </details>
 
 <details>
 <summary><strong>WeCom (企业微信)</strong> (via Custom Gateway)</summary>
 
-See [docs/wecom.md](docs/wecom.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+See [docs/wecom.md](docs/wecom.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
 
 </details>
 

@@ -209,6 +209,25 @@ Each thread gets its own agent session. Sessions are cleaned up after `session_t
 
 ---
 
+## Ambient Mode
+
+Ambient mode allows the bot to passively listen to configured channels and respond only when it has something valuable to add — without requiring @mentions. See [ambient.md](ambient.md) for full details.
+
+```toml
+[ambient]
+enabled = true
+
+[ambient.discord]
+channels = ["1234567890"]   # Channel IDs to monitor (and their threads)
+```
+
+When enabled:
+- Non-mention messages in listed channels are buffered and periodically sent to the LLM as a batch.
+- If the LLM has nothing to add, it returns `[NO_REPLY]` (silently suppressed).
+- **@mention always takes priority** — the ambient buffer is discarded and the mention gets an immediate response.
+
+---
+
 ## Attachment Handling
 
 OpenAB processes Discord file attachments and converts them into content blocks
