@@ -1529,6 +1529,24 @@ pub async fn run_slack_adapter(
                                                         TurnAction::Continue
                                                     }
                                                 };
+                                                if is_bot {
+                                                    // Diagnostic for the "peer-bot @mention never triggers me" class
+                                                    // of report: shows exactly why a bot message is kept or dropped.
+                                                    // turn_action != Continue  => dropped by the bot-turn limiter.
+                                                    // Continue but mentions_bot=false / bot_uid_ok=false => auth.test
+                                                    //   failed, so mention detection is suppressed.
+                                                    info!(
+                                                        channel_id,
+                                                        turn_key = %turn_key,
+                                                        is_app_mention,
+                                                        mentions_bot,
+                                                        bot_uid_ok = bot_uid_opt.is_some(),
+                                                        event_bot_id = event["bot_id"].as_str().unwrap_or(""),
+                                                        ?turn_action,
+                                                        ?allow_bot_messages,
+                                                        "slack bot inbound decision"
+                                                    );
+                                                }
                                                 match turn_action {
                                                     TurnAction::Continue => {}
                                                     TurnAction::SilentStop => continue,
