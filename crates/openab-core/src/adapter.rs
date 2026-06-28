@@ -1372,11 +1372,15 @@ impl AdapterRouter {
                     // either a peer bot's dispatch reaction (multi-bot channel) or this
                     // bot's own ✅ status reaction. Suppress the post in those cases,
                     // leaving the reaction as the acknowledgment. Keep the placeholder
-                    // only when there is no reaction ack to fall back on. Busy no-ops
-                    // and errors always surface regardless.
+                    // only when there is no reaction ack to fall back on. Busy no-ops,
+                    // errors, and silent failures always surface regardless — a silent
+                    // failure (end_turn with 0 output tokens) is a backend/auth problem
+                    // the user must see, NOT a legitimate empty turn; suppressing it to
+                    // a bare reaction would swallow the very diagnostic it exists to show.
                     let suppress_send = final_content.is_empty()
                         && response_error.is_none()
                         && !busy_noop
+                        && !turn_result.is_silent_failure()
                         && (other_bot_present || reactions.enabled());
                     let final_content = if final_content.is_empty() {
                         if busy_noop {
