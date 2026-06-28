@@ -1531,10 +1531,11 @@ pub async fn run_slack_adapter(
                                                 };
                                                 if is_bot {
                                                     // Diagnostic for the "peer-bot @mention never triggers me" class
-                                                    // of report: shows exactly why a bot message is kept or dropped.
-                                                    // turn_action != Continue  => dropped by the bot-turn limiter.
-                                                    // Continue but mentions_bot=false / bot_uid_ok=false => auth.test
-                                                    //   failed, so mention detection is suppressed.
+                                                    // of report. NOTE: this is the LIMITER verdict only — it fires
+                                                    // BEFORE the trusted_bot_ids / allow_bot_messages gauntlet below,
+                                                    // so `turn_action=Continue` here does NOT mean accepted. The
+                                                    // gauntlet logs its own "DROP: ..." line, and a fully-accepted
+                                                    // message logs "slack bot mention ACCEPTED -> dispatching".
                                                     info!(
                                                         channel_id,
                                                         turn_key = %turn_key,
@@ -1544,7 +1545,7 @@ pub async fn run_slack_adapter(
                                                         event_bot_id = event["bot_id"].as_str().unwrap_or(""),
                                                         ?turn_action,
                                                         ?allow_bot_messages,
-                                                        "slack bot inbound decision"
+                                                        "slack bot inbound: limiter verdict (pre-gating, NOT yet accepted)"
                                                     );
                                                 }
                                                 match turn_action {
@@ -1635,7 +1636,13 @@ pub async fn run_slack_adapter(
                                                             .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
                                                             .await;
                                                         if !is_trusted {
-                                                            debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
+                                                            info!(
+                                                                event_bot_id,
+                                                                trusted_bot_ids = ?trusted_bot_ids,
+                                                                "DROP: bot not in trusted_bot_ids (peer-bot mention rejected HERE). \
+                                                                 Add this event_bot_id (B…) or the bot's user-id (U…) to \
+                                                                 trusted_bot_ids, or set trusted_bot_ids=[] to trust all bots."
+                                                            );
                                                             continue;
                                                         }
                                                     }
@@ -1745,6 +1752,13 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                if is_bot {
+                                                    info!(
+                                                        channel_id,
+                                                        event_bot_id = event["bot_id"].as_str().unwrap_or(""),
+                                                        "slack bot mention ACCEPTED -> dispatching"
+                                                    );
+                                                }
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
