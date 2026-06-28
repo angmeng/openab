@@ -150,6 +150,8 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub ambient: AmbientConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -200,8 +202,56 @@ fn default_exec_timeout() -> u64 {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HooksConfig {
+    pub pre_seed: Option<PreSeedConfig>,
     pub pre_boot: Option<HookConfig>,
     pub pre_shutdown: Option<HookConfig>,
+}
+
+/// Configuration for the pre_seed phase.
+/// Downloads and extracts zip archives from S3 before pre_boot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreSeedConfig {
+    /// S3 URIs of zip archives to download and extract (max 5).
+    /// Extracted in order; later layers overwrite earlier ones.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Extraction target directory. Default: $HOME.
+    pub target: Option<String>,
+    /// Override AWS region for S3 access.
+    pub region: Option<String>,
+    /// Override S3 endpoint URL (for LocalStack, VPC endpoints).
+    pub endpoint_url: Option<String>,
+    /// Maximum compressed zip size in bytes. Default: 100 MiB.
+    #[serde(default = "default_max_zip_bytes")]
+    pub max_bytes: u64,
+    /// Timeout in seconds for each download+extract operation. Default: 300.
+    #[serde(default = "default_pre_seed_timeout")]
+    pub timeout_seconds: u64,
+    /// Failure policy. Default: abort.
+    #[serde(default)]
+    pub on_failure: OnFailure,
+}
+
+impl Default for PreSeedConfig {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            target: None,
+            region: None,
+            endpoint_url: None,
+            max_bytes: default_max_zip_bytes(),
+            timeout_seconds: default_pre_seed_timeout(),
+            on_failure: OnFailure::Abort,
+        }
+    }
+}
+
+fn default_max_zip_bytes() -> u64 {
+    100 * 1024 * 1024 // 100 MiB
+}
+
+fn default_pre_seed_timeout() -> u64 {
+    300
 }
 
 /// Failure policy for a hook.
@@ -1307,6 +1357,155 @@ pub fn persist_allowed_channel(config_path: &Path, channel_id: &str) -> anyhow::
         .map_err(|e| anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), config_path.display()))?;
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Ambient Mode configuration
+// ---------------------------------------------------------------------------
+
+/// Top-level `[ambient]` configuration for passive channel listening.
+///
+/// NOTE: ADR #1211 originally specified `[discord.ambient]`. The implementation
+/// uses top-level `[ambient]` with nested `[ambient.discord]` to allow future
+/// multi-platform ambient support without restructuring config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmbientConfig {
+    /// Master switch (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Time-based flush trigger in seconds (±20% jitter applied). Default: 60.
+    #[serde(default = "default_flush_interval_seconds")]
+    pub flush_interval_seconds: u64,
+    /// Count-based flush trigger. Default: 10.
+    #[serde(default = "default_flush_max_messages")]
+    pub flush_max_messages: usize,
+    /// Safety cap — force flush at this count even if timer hasn't expired.
+    /// Only relevant when `flush_max_messages` is set very high or disabled. Default: 50.
+    #[serde(default = "default_flush_hard_cap")]
+    pub flush_hard_cap: usize,
+    /// Historical messages fetched via Discord API before the batch. Default: 20.
+    /// NOTE: Not yet implemented (v2 follow-up). Parsed but not used at runtime.
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    /// Max simultaneous LLM calls across all ambient channels. Default: 3.
+    #[serde(default = "default_max_concurrent_flushes")]
+    pub max_concurrent_flushes: usize,
+    /// Safety timeout (seconds) — auto-reset flushing flag if exceeded. Default: 120.
+    #[serde(default = "default_flush_timeout_seconds")]
+    pub flush_timeout_seconds: u64,
+    /// Path to a custom instructions file for the ambient system prompt.
+    /// Default: `~/.openab/config/ambient.md`. If the file exists, its content
+    /// (up to 2000 characters) replaces the built-in system instruction.
+    #[serde(default = "default_instructions_file")]
+    pub instructions_file: String,
+    /// Ambient session pool configuration.
+    #[serde(default)]
+    pub pool: AmbientPoolConfig,
+    /// Platform-specific ambient settings.
+    #[serde(default)]
+    pub discord: AmbientDiscordConfig,
+    /// Debug mode: when true, [NO_REPLY] responses are sent to the channel
+    /// instead of being suppressed, allowing observation of ambient behavior.
+    /// ⚠️ WARNING: This exposes the system prompt and buffered messages to the
+    /// channel. Only use in private/test channels, never in production.
+    #[serde(default)]
+    pub debug: bool,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            flush_interval_seconds: default_flush_interval_seconds(),
+            flush_max_messages: default_flush_max_messages(),
+            flush_hard_cap: default_flush_hard_cap(),
+            context_window: default_context_window(),
+            max_concurrent_flushes: default_max_concurrent_flushes(),
+            flush_timeout_seconds: default_flush_timeout_seconds(),
+            instructions_file: default_instructions_file(),
+            pool: AmbientPoolConfig::default(),
+            discord: AmbientDiscordConfig::default(),
+            debug: false,
+        }
+    }
+}
+
+/// `[ambient.pool]` — dedicated session pool for ambient dispatches.
+///
+/// NOTE: Pool management is not yet implemented (v2 follow-up). These settings
+/// are parsed and validated on startup but not enforced at runtime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmbientPoolConfig {
+    /// Max concurrent ambient sessions. Default: 5.
+    #[serde(default = "default_ambient_max_sessions")]
+    pub max_sessions: usize,
+    /// Ambient session inactivity timeout in minutes. Default: 60.
+    #[serde(default = "default_ambient_session_ttl_minutes")]
+    pub session_ttl_minutes: u64,
+    /// Rolling window of retained flush history (cross-flush memory). Default: 3.
+    #[serde(default = "default_ambient_context_flushes")]
+    pub context_flushes: usize,
+}
+
+impl Default for AmbientPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: default_ambient_max_sessions(),
+            session_ttl_minutes: default_ambient_session_ttl_minutes(),
+            context_flushes: default_ambient_context_flushes(),
+        }
+    }
+}
+
+/// `[ambient.discord]` — Discord-specific ambient settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmbientDiscordConfig {
+    /// Explicit channel allowlist. Required — empty means ambient is disabled.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Whether other bots' messages enter the ambient buffer. Default: true.
+    #[serde(default = "default_true")]
+    pub allow_bot_messages: bool,
+}
+
+impl Default for AmbientDiscordConfig {
+    fn default() -> Self {
+        Self {
+            channels: Vec::new(),
+            allow_bot_messages: true,
+        }
+    }
+}
+
+fn default_flush_interval_seconds() -> u64 {
+    60
+}
+fn default_flush_max_messages() -> usize {
+    10
+}
+fn default_flush_hard_cap() -> usize {
+    50
+}
+fn default_context_window() -> usize {
+    20
+}
+fn default_max_concurrent_flushes() -> usize {
+    3
+}
+fn default_flush_timeout_seconds() -> u64 {
+    120
+}
+fn default_instructions_file() -> String {
+    "~/.openab/config/ambient.md".to_string()
+}
+fn default_ambient_max_sessions() -> usize {
+    5
+}
+fn default_ambient_session_ttl_minutes() -> u64 {
+    60
+}
+fn default_ambient_context_flushes() -> usize {
+    3
 }
 
 #[cfg(test)]

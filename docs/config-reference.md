@@ -239,7 +239,39 @@ Session pool settings for managing concurrent agent sessions.
 
 ## `[hooks]`
 
-Lifecycle hooks that run custom scripts at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+Lifecycle hooks that run at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+
+### `[hooks.pre_seed]`
+
+Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
+
+> `pre-seed` is enabled by default. No feature flag needed.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sources` | string[] | `[]` | S3 URIs of archives (`.zip`, `.tar.gz`, `.tgz`). Max 5. Extracted in order; later layers overwrite earlier ones. |
+| `target` | string | `$HOME` | Extraction target directory. |
+| `max_bytes` | u64 | `104857600` | Max compressed archive size in bytes (100 MiB). Rejects downloads exceeding this. |
+| `timeout_seconds` | u64 | `300` | Per-source download+extract timeout in seconds. |
+| `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
+| `region` | string | — | Override AWS region for S3 access. |
+| `endpoint_url` | string | — | Override S3 endpoint URL (for LocalStack, VPC endpoints). |
+
+**Credential resolution** uses the standard AWS provider chain (same as `config-s3` and `secrets-aws`):
+environment variables, shared credentials, IRSA / EKS Pod Identity, ECS task role.
+
+**Integrity verification:** If S3 objects are uploaded with `--checksum-algorithm SHA256`, OpenAB automatically verifies the checksum on download. No config needed — see [hooks.md](hooks.md) for details.
+
+```toml
+[hooks.pre_seed]
+sources = [
+  "s3://my-bucket/base-env.tar.gz",
+  "s3://my-bucket/shared-memory.zip",
+  "s3://my-bucket/agent-overrides.tgz",
+]
+timeout_seconds = 300
+on_failure = "abort"
+```
 
 ### `[hooks.pre_boot]`
 
@@ -428,6 +460,32 @@ web    = "~/projects/frontend"
 - Paths are canonicalized and must be within bot home subtree
 - Symlink escapes are caught by canonicalization
 - Target must be an existing directory (not a file)
+
+---
+
+## `[ambient]`
+
+Passive channel listening with batch flush. See [ambient.md](ambient.md) for full guide.
+
+```toml
+[ambient]
+enabled = false                   # Master switch
+flush_interval_seconds = 60       # Time trigger (±20% jitter)
+flush_max_messages = 10           # Count trigger
+flush_hard_cap = 50               # Max buffer size
+max_concurrent_flushes = 3        # Global LLM concurrency limit
+flush_timeout_seconds = 120       # Safety timeout per flush
+context_window = 20               # (v2, not yet implemented)
+
+[ambient.pool]                    # (v2, not yet enforced)
+max_sessions = 5
+session_ttl_minutes = 60
+context_flushes = 3
+
+[ambient.discord]
+channels = []                     # Channel ID allowlist — and their threads (required)
+allow_bot_messages = true
+```
 
 ---
 

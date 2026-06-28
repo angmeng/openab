@@ -74,6 +74,19 @@ pub struct PendingPasteLogin {
     /// (written before this field existed) deserializable.
     #[serde(default)]
     pub resource: Option<String>,
+    /// Unix-seconds stamp set when the pending entry is written; `with_auth_locked`
+    /// expires entries older than 15 min (ADR §7) so an abandoned `/auth` two-step
+    /// (verifier written, code never pasted) doesn't accumulate. The two-step flow
+    /// that *writes* pending state is forthcoming; today this struct is a legacy
+    /// read-tolerant tombstone, so the field exists mainly for the GC. `#[serde(default)]`
+    /// (= 0) reads pre-existing/legacy entries as ancient → swept on the next write.
+    ///
+    /// **Any code that writes a fresh `Pending` entry MUST set `created_at` to the
+    /// current Unix time** — an unstamped (0) entry is treated as ancient and is
+    /// swept by `gc_stale_pending` on the very next locked write, so a verifier
+    /// written without stamping would vanish before the user pastes the code.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// `auth.json` value type. Untagged Serde enum: `TokenStore` has required
@@ -214,6 +227,259 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
     Ok(())
 }
 
+// ── auth.json cross-process locking (ADR §5.4) ──────────────────────────────
+//
+// `auth.json` is written by multiple processes (one openab-agent per Discord
+// thread) and by two code paths within each (`save_tokens` for the codex tenant
+// + `McpCredentialStore` for MCP servers). Two hazards, two locks:
+//
+//   (a) File integrity — every read-modify-write funnels through `with_auth_locked`,
+//       which holds an exclusive `flock` on an `auth.json.global.lock` sidecar
+//       across the re-read → mutate → atomic-write. The re-read *inside* the lock
+//       is what makes concurrent writers merge instead of lost-update.
+//   (b) Refresh-token rotation — `lock_tenant_refresh` serialises the network
+//       refresh per tenant so concurrent processes present a rotated `RT_old`
+//       only once, never tripping OAuth 2.1 §10.4 token-family revocation.
+//
+// `flock(2)` (not a sentinel lockfile) so the kernel auto-releases on fd close /
+// process death — no stale lock, no orphan cleanup. The lock lives on a sidecar,
+// never on `auth.json` itself, because the atomic tmp+rename swaps that inode out
+// from under any lock held on it. `#[cfg(unix)]`; a non-unix build is a no-op
+// (openab-agent is de-facto unix-only — see `write_auth_file`).
+
+/// Sidecar lock path `auth.json.<suffix>.lock`, next to the auth file so a
+/// test-injected tempdir locks its own sidecar rather than the real `$HOME` one.
+#[cfg(unix)]
+fn lock_path_for(auth: &Path, suffix: &str) -> PathBuf {
+    let dir = auth.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("auth.json.{suffix}.lock"))
+}
+
+/// RAII guard releasing the advisory lock on drop. The kernel also drops it on
+/// fd close / process death, so a crashed holder never wedges the file.
+#[cfg(unix)]
+pub(crate) struct AuthFileLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for AuthFileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `self.file` owns a valid fd; flock has no memory effects.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(unix)]
+fn open_lock_file(lock: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = lock.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock)?)
+}
+
+/// Blocking exclusive lock. Used ONLY for the global file RMW, which performs no
+/// network I/O while held, so acquisition blocks at most for another process's
+/// fast tmp+rename — never for a slow refresh (those take the per-tenant lock).
+#[cfg(unix)]
+fn flock_exclusive(lock: &Path) -> Result<AuthFileLock> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock_file(lock)?;
+    // SAFETY: valid fd held by `file`; flock has no memory effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(AuthFileLock { file })
+}
+
+/// Acquire the global `auth.json` write lock (a no-op `None` guard off-unix).
+/// Both `with_auth_locked` and `McpCredentialStore::clear` — which needs a
+/// delete-on-empty tail the funnel can't express — acquire here, so the
+/// `"global"` sidecar name and the acquire policy live in exactly one place.
+fn lock_global(path: &Path) -> Result<Option<AuthFileLock>> {
+    #[cfg(unix)]
+    {
+        Ok(Some(flock_exclusive(&lock_path_for(path, "global"))?))
+    }
+    #[cfg(not(unix))]
+    {
+        // No flock(2) off-unix: every writer runs unprotected, so concurrent
+        // processes can silently corrupt auth.json (ADR §5.4). openab-agent is
+        // de-facto unix-only; warn once rather than fail silently so a non-unix
+        // build with concurrent processes is at least diagnosable.
+        use std::sync::Once;
+        static WARN_NO_LOCK: Once = Once::new();
+        WARN_NO_LOCK.call_once(|| {
+            tracing::warn!(
+                "auth.json cross-process file locking is unavailable on this non-unix platform; \
+                 concurrent openab-agent processes may corrupt stored credentials (ADR §5.4)"
+            );
+        });
+        let _ = path;
+        Ok(None)
+    }
+}
+
+/// (a) File-integrity funnel (ADR §5.4). Holds the global sidecar lock across a
+/// re-read → mutate → atomic-write so the codex `save_tokens` path AND the MCP
+/// `McpCredentialStore` never lost-update the shared map: each writer merges onto
+/// the latest on-disk state. A corrupt file is quarantined by `read_auth_file`
+/// and treated as empty (`unwrap_or_default`), matching the prior save behaviour.
+fn with_auth_locked<R>(
+    path: &Path,
+    f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R,
+) -> Result<R> {
+    let _guard = lock_global(path)?;
+    let mut map = read_auth_file(path).unwrap_or_default();
+    let r = f(&mut map);
+    gc_stale_pending(&mut map);
+    write_auth_file(path, &map)?;
+    Ok(r)
+}
+
+/// Opportunistic GC (ADR §7): drop `AuthEntry::Pending` entries older than 15 min
+/// on every locked write, so abandoned `/auth` two-step attempts don't accumulate.
+/// `created_at == 0` (legacy/unstamped entries) reads as ancient and is swept.
+const PENDING_TTL_SECONDS: u64 = 15 * 60;
+
+fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    map.retain(|_, entry| match entry {
+        AuthEntry::Pending(p) => now.saturating_sub(p.created_at) <= PENDING_TTL_SECONDS,
+        _ => true,
+    });
+}
+
+/// HTTP timeout on the token-refresh network call (codex + MCP). Strictly shorter
+/// than [`REFRESH_LOCK_TIMEOUT`] so the per-tenant lock is provably released before
+/// a waiter's deadline — which is what lets the lock timeout fail *closed* (a
+/// timeout then signals a genuinely abnormal state, not normal slowness).
+pub(crate) const REFRESH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Outcome of acquiring a tenant's refresh lock. See [`lock_tenant_refresh`].
+#[cfg(unix)]
+pub(crate) enum RefreshLock {
+    /// Lock acquired — hold across the refresh.
+    Held(AuthFileLock),
+    /// Sidecar lock file couldn't be opened (filesystem error). Best-effort:
+    /// proceed unserialised rather than block every refresh on a broken lock dir.
+    Unavailable,
+    /// Contended past [`REFRESH_LOCK_TIMEOUT`]. Fail-closed: the caller must NOT
+    /// refresh — surface a transient, retryable error.
+    TimedOut,
+}
+
+/// Worst-case number of sequential bounded refresh round-trips a single lock-holder
+/// makes while holding the tenant lock. The codex path makes one (the token POST);
+/// the MCP path makes two — rmcp's `initialize_from_store()` (authorization-server
+/// discovery) then `get_access_token()` (the refresh) — each bounded by
+/// [`REFRESH_HTTP_TIMEOUT`].
+#[cfg(unix)]
+const MAX_REFRESH_ROUND_TRIPS: u64 = 2;
+
+/// Lock-acquire deadline. Sized strictly above the worst-case lock-hold
+/// (`MAX_REFRESH_ROUND_TRIPS` × [`REFRESH_HTTP_TIMEOUT`]) plus margin, so a waiter
+/// never fails closed on a holder that is still legitimately progressing through its
+/// bounded — and, on the MCP path, multi-call — refresh; only a genuinely stuck
+/// holder trips the timeout. Derived from `REFRESH_HTTP_TIMEOUT` so the relationship
+/// can't silently drift if that bound changes.
+#[cfg(unix)]
+const REFRESH_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(REFRESH_HTTP_TIMEOUT.as_secs() * MAX_REFRESH_ROUND_TRIPS + 4);
+
+/// (b) Per-tenant refresh serialisation (ADR §5.4). On success the returned
+/// [`RefreshLock::Held`] guard is kept by the caller across the network refresh so
+/// concurrent processes do exactly one real refresh per tenant — never presenting a
+/// rotated `RT_old` twice (OAuth 2.1 §10.4 family revocation). Non-blocking acquire
+/// on a single fd + async backoff so a refresh in flight elsewhere never blocks this
+/// executor thread.
+///
+/// **Fail-closed on timeout.** Each refresh round-trip is bounded by
+/// [`REFRESH_HTTP_TIMEOUT`], and [`REFRESH_LOCK_TIMEOUT`] is sized above the worst-case
+/// lock-hold ([`MAX_REFRESH_ROUND_TRIPS`] sequential bounded calls — the MCP path makes
+/// two, codex one); combined with `flock(2)` auto-release on holder death, a live holder
+/// still progressing always releases before a waiter's deadline. A timeout therefore
+/// signals a genuinely abnormal state — and proceeding unserialised
+/// would re-present `RT_old` and risk the exact family revocation this lock exists to
+/// prevent, strictly worse than a transient retry. So we return
+/// [`RefreshLock::TimedOut`] (logged at `error!`) and the caller surfaces a retryable
+/// error instead of refreshing. A filesystem error opening the sidecar returns
+/// [`RefreshLock::Unavailable`] — best-effort degrade (proceed) rather than block
+/// every refresh on a broken lock dir.
+///
+/// Reuse-safety on the happy path comes from loading the refresh token *inside* the
+/// lock: a process that waited then loads the token the winner just wrote, so it
+/// never re-presents a rotated `RT_old`. Re-checking expiry after acquiring is an
+/// additional optimisation that skips a redundant network refresh — `get_valid_token`
+/// does this explicitly, and the MCP path gets it free from rmcp's
+/// `initialize_from_store()` reload + `get_access_token` (which returns early when the
+/// token is already fresh). `force_refresh` intentionally skips that optimisation and
+/// always refreshes (it runs on a 401, where the clock-fresh token is already
+/// known-bad); it stays reuse-safe because it, too, loads inside the lock.
+#[cfg(unix)]
+pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> RefreshLock {
+    lock_tenant_refresh_until(auth, tenant, REFRESH_LOCK_TIMEOUT).await
+}
+
+/// [`lock_tenant_refresh`] with an injectable deadline so tests can drive the
+/// fail-closed timeout path in milliseconds instead of [`REFRESH_LOCK_TIMEOUT`].
+#[cfg(unix)]
+async fn lock_tenant_refresh_until(
+    auth: &Path,
+    tenant: &str,
+    timeout: std::time::Duration,
+) -> RefreshLock {
+    use std::os::unix::io::AsRawFd;
+    let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
+    // Open the lock fd once; re-issue `flock` on it each retry instead of
+    // re-opening (and re-`create_dir_all`-ing) the same file every 100 ms.
+    let file = match open_lock_file(&lock) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(tenant, error = %e, "refresh lock unavailable; proceeding unserialised");
+            return RefreshLock::Unavailable;
+        }
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // SAFETY: valid fd held by `file`; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return RefreshLock::Held(AuthFileLock { file });
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK/EAGAIN (both `ErrorKind::WouldBlock`) = another holder is
+        // refreshing; any other errno is a real failure we degrade on.
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            tracing::warn!(tenant, error = %err, "refresh lock unavailable; proceeding unserialised");
+            return RefreshLock::Unavailable;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Fail-closed (see fn doc): the refresh is HTTP-bounded shorter than this
+            // deadline, so a timeout is abnormal. Logged at error! so the rare
+            // contended refresh is alertable; the caller turns this into a transient
+            // retryable error rather than re-presenting RT_old.
+            tracing::error!(
+                tenant,
+                "timed out waiting for refresh lock; failing closed (refresh deferred)"
+            );
+            return RefreshLock::TimedOut;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 pub fn load_tokens() -> Result<TokenStore> {
     let path = auth_path();
     let map = read_auth_file(&path).map_err(|_| {
@@ -232,10 +498,9 @@ pub fn load_tokens() -> Result<TokenStore> {
 }
 
 fn save_tokens(store: &TokenStore) -> Result<()> {
-    let path = auth_path();
-    let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(&path, &map)
+    with_auth_locked(&auth_path(), |map| {
+        map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
+    })
 }
 
 /// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
@@ -283,36 +548,46 @@ impl CredentialStore for McpCredentialStore {
 
     async fn save(&self, mut credentials: StoredCredentials) -> Result<(), AuthError> {
         use oauth2::{RefreshToken, TokenResponse};
-        let mut map = read_auth_file(&self.path).unwrap_or_default();
 
         // OAuth 2.1 §10.4: when a refresh response omits `refresh_token`, the
         // prior one stays valid. rmcp's `refresh_token()` rebuilds the stored
         // credentials from the refresh response alone, so a rotating-but-omitting
         // AS would lose our fallback — splice the prior refresh_token back in.
+        // The prior-read happens inside the lock (re-read) so two writers can't
+        // race the splice. The whole RMW funnels through `with_auth_locked` so an
+        // interleaving codex `save_tokens` never lost-updates this MCP entry.
         let incoming_has_refresh = credentials
             .token_response
             .as_ref()
             .and_then(|tr| tr.refresh_token())
             .is_some_and(|rt| !rt.secret().is_empty());
-        if !incoming_has_refresh {
-            if let Some(AuthEntry::Mcp(old)) = map.get(&self.key) {
-                let prior = old
-                    .token_response
-                    .as_ref()
-                    .and_then(|tr| tr.refresh_token())
-                    .map(|rt| rt.secret().to_string())
-                    .filter(|s| !s.is_empty());
+        let key = self.key.clone();
+        with_auth_locked(&self.path, move |map| {
+            if !incoming_has_refresh {
+                let prior = match map.get(&key) {
+                    Some(AuthEntry::Mcp(old)) => old
+                        .token_response
+                        .as_ref()
+                        .and_then(|tr| tr.refresh_token())
+                        .map(|rt| rt.secret().to_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
                 if let (Some(prior), Some(tr)) = (prior, credentials.token_response.as_mut()) {
                     tr.set_refresh_token(Some(RefreshToken::new(prior)));
                 }
             }
-        }
-
-        map.insert(self.key.clone(), AuthEntry::Mcp(credentials));
-        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
+            map.insert(key.clone(), AuthEntry::Mcp(credentials));
+        })
+        .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
+        // Same global lock as every other writer, but with a delete-on-empty tail
+        // `with_auth_locked` can't express (it always writes), so `clear` acquires
+        // the shared `lock_global` directly rather than funnelling through it.
+        let _guard =
+            lock_global(&self.path).map_err(|e| AuthError::InternalError(e.to_string()))?;
         let mut map = match read_auth_file(&self.path) {
             Ok(m) => m,
             Err(_) => return Ok(()),
@@ -329,15 +604,50 @@ impl CredentialStore for McpCredentialStore {
 }
 
 pub async fn get_valid_token() -> Result<String> {
-    let mut store = load_tokens()?;
-    if store.is_expired() {
-        store = refresh_token(&store).await?;
-        save_tokens(&store)?;
+    // 1. Fast path: a fresh token needs no lock.
+    let store = load_tokens()?;
+    if !store.is_expired() {
+        return Ok(store.access_token);
     }
-    Ok(store.access_token)
+    // 2. Serialise the refresh for the codex tenant — held across the network
+    //    call so a second process does not present the same RT_old (§5.4 (b)).
+    //    Fail closed on a contended-lock timeout: surface a retryable error rather
+    //    than refresh unserialised (which would risk §10.4 family revocation).
+    #[cfg(unix)]
+    let _refresh_guard = match lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await {
+        RefreshLock::Held(g) => Some(g),
+        RefreshLock::Unavailable => None,
+        RefreshLock::TimedOut => {
+            return Err(anyhow!(
+                "codex token refresh is busy (refresh lock contended); retry shortly"
+            ))
+        }
+    };
+    // 3. Double-check: another process may have refreshed while we waited.
+    let store = load_tokens()?;
+    if !store.is_expired() {
+        return Ok(store.access_token);
+    }
+    // 4. Exactly one network refresh per tenant per expiry (tenant lock held).
+    let fresh = refresh_token(&store).await?;
+    // 5. Commit under the global file lock.
+    save_tokens(&fresh)?;
+    Ok(fresh.access_token)
 }
 
 pub async fn force_refresh() -> Result<String> {
+    // Serialise even a forced refresh so two of them can't both rotate RT_old.
+    // Fail closed on timeout (see get_valid_token) rather than refresh unserialised.
+    #[cfg(unix)]
+    let _refresh_guard = match lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await {
+        RefreshLock::Held(g) => Some(g),
+        RefreshLock::Unavailable => None,
+        RefreshLock::TimedOut => {
+            return Err(anyhow!(
+                "codex token refresh is busy (refresh lock contended); retry shortly"
+            ))
+        }
+    };
     let store = load_tokens()?;
     let new_store = refresh_token(&store).await?;
     save_tokens(&new_store)?;
@@ -346,7 +656,11 @@ pub async fn force_refresh() -> Result<String> {
 
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     let client_id = codex_client_id();
-    let client = reqwest::Client::new();
+    // Bound the refresh so the per-tenant lock (held across this call) is provably
+    // released before another process's lock deadline — see REFRESH_HTTP_TIMEOUT.
+    let client = reqwest::Client::builder()
+        .timeout(REFRESH_HTTP_TIMEOUT)
+        .build()?;
     let resp = client
         .post(&store.token_endpoint)
         .form(&[
@@ -847,6 +1161,7 @@ mod tests {
             token_url: "https://example.com/token".to_string(),
             provider_name: "anthropic-mcp".to_string(),
             resource: None,
+            created_at: 0,
         }
     }
 
@@ -1089,5 +1404,96 @@ mod tests {
         // under test.
         let pending = map.get("mcp-pending:srv");
         assert!(matches!(pending, Some(AuthEntry::Pending(_))));
+    }
+
+    #[test]
+    fn with_auth_locked_merges_concurrent_tenants_no_lost_update() {
+        // Two locked RMWs against the same file — the codex tenant and an MCP
+        // tenant — must both survive: the second writer re-reads inside the lock
+        // and merges, instead of clobbering the first (the §5.4 lost-update fix).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        with_auth_locked(&path, |m| {
+            m.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        })
+        .unwrap();
+        with_auth_locked(&path, |m| {
+            m.insert("github".to_string(), AuthEntry::Mcp(make_mcp_creds()));
+        })
+        .unwrap();
+
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 2, "second write merged, did not lost-update");
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        assert!(matches!(map.get("github"), Some(AuthEntry::Mcp(_))));
+    }
+
+    #[test]
+    fn with_auth_locked_gcs_stale_pending_but_keeps_fresh_and_tokens() {
+        // ADR §7: a locked write opportunistically sweeps `Pending` entries older
+        // than 15 min, while fresh pending state and real tenants are untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Seed through the un-GC'd writer so the stale entry exists pre-sweep.
+        let mut seed = HashMap::new();
+        seed.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        seed.insert(
+            "mcp-pending:stale".to_string(),
+            AuthEntry::Pending(make_pending()), // created_at = 0 → ancient
+        );
+        seed.insert(
+            "mcp-pending:fresh".to_string(),
+            AuthEntry::Pending(PendingPasteLogin {
+                created_at: now,
+                ..make_pending()
+            }),
+        );
+        write_auth_file(&path, &seed).unwrap();
+
+        with_auth_locked(&path, |_m| {}).unwrap();
+
+        let map = read_auth_file(&path).unwrap();
+        assert!(
+            map.get("mcp-pending:stale").is_none(),
+            "stale pending swept"
+        );
+        assert!(
+            matches!(map.get("mcp-pending:fresh"), Some(AuthEntry::Pending(_))),
+            "fresh pending kept"
+        );
+        assert!(map.get("codex").is_some(), "real tenant untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_tenant_refresh_fails_closed_when_contended() {
+        // §5.4 (b), fail-closed: while one holder keeps the tenant refresh lock, a
+        // second acquire must hit the deadline and return `TimedOut` — the signal
+        // the caller turns into a retryable error instead of refreshing unserialised
+        // (which would re-present RT_old). Once released, acquisition succeeds again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let held = lock_tenant_refresh(&path, "codex").await;
+        assert!(matches!(held, RefreshLock::Held(_)), "first acquire holds");
+
+        let contended =
+            lock_tenant_refresh_until(&path, "codex", std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(contended, RefreshLock::TimedOut),
+            "second acquire fails closed while the lock is held"
+        );
+
+        drop(held);
+        let after = lock_tenant_refresh(&path, "codex").await;
+        assert!(
+            matches!(after, RefreshLock::Held(_)),
+            "acquire succeeds once the holder releases"
+        );
     }
 }
