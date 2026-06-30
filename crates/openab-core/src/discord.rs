@@ -2273,10 +2273,12 @@ impl Handler {
                 return;
             }
 
-            // Send the captured output (truncated to Discord's 2000-char limit).
+            // Send the captured output as plain text (no code block) so URLs are
+            // clickable in Discord.
             let output = strip_ansi_codes(&collected_lines.join("\n"));
-            let prefix = "🔐 **Agent Authentication**\n```\n";
-            let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+            let output = ensure_url_separation(&output);
+            let prefix = "🔐 **Agent Authentication**\n\n";
+            let suffix = "\n\nFollow the instructions above. Waiting for authorization...";
             // Discord enforces the 2000-char limit in UTF-16 code units; budget and
             // truncate by UTF-16 units rather than Unicode scalar values. See
             // `truncate_to_utf16_budget` for the testable implementation.
@@ -3245,6 +3247,16 @@ fn strip_ansi_codes(s: &str) -> String {
     ANSI_RE.replace_all(s, "").into_owned()
 }
 
+/// Ensure URLs are not glued to preceding text after ANSI stripping.
+/// Discord's markdown parser collapses list-continuation whitespace when a Link
+/// node is adjacent to a Text node, causing `accounthttps://...` rendering.
+/// This inserts a newline before any URL that immediately follows a non-whitespace char.
+fn ensure_url_separation(s: &str) -> String {
+    static URL_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?P<prev>\S)(?P<url>https?://)").unwrap());
+    URL_RE.replace_all(s, "${prev}\n${url}").into_owned()
+}
+
 /// Truncate `body` so that, prefixed by `prefix` and suffixed by `suffix`, the
 /// whole message fits within `limit` measured in **UTF-16 code units** — which
 /// is how Discord enforces its 2000-character message cap. Truncation only ever
@@ -3349,6 +3361,40 @@ mod tests {
     fn strip_ansi_removes_non_sgr_sequences() {
         let input = "\x1b[?25lhello\x1b[?25h \x1b(Bworld";
         assert_eq!(strip_ansi_codes(input), "hello world");
+    }
+
+    // --- ensure_url_separation tests ---
+
+    #[test]
+    fn url_separation_inserts_newline_when_glued() {
+        assert_eq!(
+            ensure_url_separation("accounthttps://auth.openai.com/codex/device"),
+            "account\nhttps://auth.openai.com/codex/device"
+        );
+    }
+
+    #[test]
+    fn url_separation_preserves_existing_space() {
+        assert_eq!(
+            ensure_url_separation("account https://auth.openai.com"),
+            "account https://auth.openai.com"
+        );
+    }
+
+    #[test]
+    fn url_separation_preserves_existing_newline() {
+        assert_eq!(
+            ensure_url_separation("account\nhttps://auth.openai.com"),
+            "account\nhttps://auth.openai.com"
+        );
+    }
+
+    #[test]
+    fn url_separation_handles_http() {
+        assert_eq!(
+            ensure_url_separation("clickhttp://example.com"),
+            "click\nhttp://example.com"
+        );
     }
 
     // --- resolve_mentions tests ---

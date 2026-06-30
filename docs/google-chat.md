@@ -1,5 +1,37 @@
 # Google Chat Setup
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the google-chat adapter directly. Set `GOOGLE_CHAT_ENABLED=true` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + google-chat)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `GOOGLE_CHAT_ENABLED=true` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect a Google Chat app to OpenAB via the Custom Gateway.
 
 ```
@@ -118,9 +150,6 @@ allow_all_channels = true
 allow_all_users = true
 
 [agent]
-command = "kiro-cli"
-args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
 ```
 
 ## Features

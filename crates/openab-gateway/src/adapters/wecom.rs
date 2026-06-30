@@ -137,7 +137,7 @@ fn decrypt_message(
         .decode(encrypted)
         .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
 
-    if cipher_bytes.is_empty() || cipher_bytes.len() % 16 != 0 {
+    if cipher_bytes.is_empty() || !cipher_bytes.len().is_multiple_of(16) {
         anyhow::bail!("ciphertext length {} not a multiple of 16", cipher_bytes.len());
     }
 

@@ -1,5 +1,23 @@
 # OpenShell
 
+> ⚠️ **NOT RECOMMENDED (June 2026)**
+>
+> OpenSHELL support is **paused** and not recommended for use at this time.
+>
+> **Reason:** Recent OpenSHELL updates enforce mandatory Network Policy Enforcement
+> and require all sandbox traffic to pass through an L7 proxy. This prevents direct
+> outbound connections — including the WebSocket (WSS) connection to Discord Gateway
+> that OpenAB requires for real-time communication.
+>
+> Unless OAB's networking layer is refactored to be fully HTTP/HTTPS proxy-aware
+> (tunneling WSS through OpenSHELL's L7 proxy), the integration cannot function.
+>
+> **Status:** Blocked. We will re-evaluate when:
+> - OpenSHELL provides a relaxed policy option (e.g., outbound WSS allowlist), or
+> - OAB completes a proxy-aware networking refactor.
+>
+> See [PR #1113](https://github.com/openabdev/openab/pull/1113) for full context.
+
 Run OAB inside an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox for isolated, policy-enforced execution.
 
 ## Architecture

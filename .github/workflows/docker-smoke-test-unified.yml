@@ -30,10 +30,16 @@ jobs:
         with:
           context: .
           file: Dockerfile.unified
-          target: builder
+          target: local_builder
           load: true
           tags: openab-builder:local
           cache-to: type=gha,scope=unified-smoke-builder,mode=max
+
+      - name: Verify override path (BUILDER_IMAGE=prebuilt)
+        run: DOCKER_BUILDKIT=1 docker build --build-arg BUILDER_IMAGE=openab-builder:local --target kiro -t openab-override-test:test -f Dockerfile.unified .
+
+      - name: Verify binary exists via override path
+        run: docker run --rm --entrypoint which openab-override-test:test openab
 
   smoke-test-unified:
     if: github.event.pull_request.draft == false
@@ -47,6 +53,7 @@ jobs:
           - { name: codex, agent: "codex-acp" }
           - { name: copilot, agent: "copilot" }
           - { name: cursor, agent: "cursor-agent" }
+          - { name: devin, agent: "devin" }
           - { name: gemini, agent: "gemini" }
           - { name: grok, agent: "grok" }
           - { name: hermes, agent: "hermes-acp" }

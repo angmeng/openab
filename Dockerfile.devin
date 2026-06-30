@@ -16,24 +16,29 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Cursor Agent CLI (pinned version)
-# Tarball source: https://downloads.cursor.com/lab/<version>/linux/<arch>/agent-cli-package.tar.gz
-# URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
-# If Cursor changes this pattern, the build fails with curl 404. Monitor
-# https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
-ARG CURSOR_VERSION=2026.06.19-20-24-33-653a7fb
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
-    curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
-      -o /tmp/cursor.tar.gz && \
-    tar xzf /tmp/cursor.tar.gz -C /opt && \
-    mv /opt/dist-package /opt/cursor-agent && \
-    ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent && \
-    rm /tmp/cursor.tar.gz
+# Install Devin CLI (pinned version with SHA256 verification)
+ARG DEVIN_VERSION=2026.8.18
+ARG DEVIN_SHA256_AMD64=dd4bba20593086bf708474792c11ab0c9428be5b2419ff5c182ec5f1099a0661
+ARG DEVIN_SHA256_ARM64=127e7a8baf2e09cb0fd23871af989dc9e32e3bfa7f497b1f6560cc52f5bf19c6
+ARG TARGETPLATFORM
+RUN set -eux; \
+    case "${TARGETPLATFORM:-linux/amd64}" in \
+      "linux/amd64") arch=x86_64-unknown-linux; sha="${DEVIN_SHA256_AMD64}" ;; \
+      "linux/arm64") arch=aarch64-unknown-linux; sha="${DEVIN_SHA256_ARM64}" ;; \
+      *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://static.devin.ai/cli/${DEVIN_VERSION}/devin-${DEVIN_VERSION}-${arch}.tar.gz" \
+      -o /tmp/devin.tar.gz && \
+    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/devin.tar.gz -C /tmp && \
+    install -m 0755 /tmp/bin/devin /usr/local/bin/devin && \
+    rm -rf /tmp/devin* /tmp/bin /tmp/share
 
-# Install gh CLI (for auth and token management)
+# Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
@@ -47,13 +52,13 @@ WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 
-RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
+RUN chown -R agent:agent /home/agent
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND="cursor-agent acp"
-ENV OPENAB_AGENT_AUTH_COMMAND="cursor-agent login"
+ENV OPENAB_AGENT_COMMAND="devin acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="devin auth login --force-manual-token-flow"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

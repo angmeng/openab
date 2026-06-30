@@ -19,6 +19,7 @@ on:
           - codex
           - copilot
           - cursor
+          - devin
           - gemini
           - grok
           - hermes

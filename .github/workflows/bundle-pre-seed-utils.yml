@@ -1,0 +1,192 @@
+name: Bundle pre_seed utils
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_cli_version:
+        description: 'AWS CLI v2 version (leave empty for latest)'
+        required: false
+        default: ''
+      ghpool_version:
+        description: 'ghpool version (leave empty for latest)'
+        required: false
+        default: ''
+      upload_s3:
+        description: 'Also upload to S3 (openab-state-pahud/shared/utils.tar.gz)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  ARTIFACT_NAME: pre-seed-utils
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      aws_cli_version: ${{ steps.versions.outputs.aws_cli_version }}
+      ghpool_version: ${{ steps.versions.outputs.ghpool_version }}
+    steps:
+      - name: Resolve versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # AWS CLI version
+          if [ -n "${{ inputs.aws_cli_version }}" ]; then
+            AWS_VER="${{ inputs.aws_cli_version }}"
+          else
+            AWS_VER=$(curl -fsSL https://raw.githubusercontent.com/aws/aws-cli/v2/CHANGELOG.rst | grep -m1 '^[0-9]' | cut -d' ' -f1)
+            echo "Resolved latest AWS CLI: $AWS_VER"
+          fi
+          echo "aws_cli_version=${AWS_VER}" >> "$GITHUB_OUTPUT"
+
+          # ghpool version
+          if [ -n "${{ inputs.ghpool_version }}" ]; then
+            GHP_VER="${{ inputs.ghpool_version }}"
+          else
+            GHP_VER=$(gh release view --repo openabdev/ghpool --json tagName -q '.tagName' | sed 's/^v//')
+            echo "Resolved latest ghpool: $GHP_VER"
+          fi
+          echo "ghpool_version=${GHP_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Resolved Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "- AWS CLI: ${{ steps.versions.outputs.aws_cli_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghpool: ${{ steps.versions.outputs.ghpool_version }}" >> "$GITHUB_STEP_SUMMARY"
+
+  bundle:
+    needs: resolve
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest, awscli_arch: x86_64, ghpool_arch: linux-x64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, awscli_arch: aarch64, ghpool_arch: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Install AWS CLI v2
+        run: |
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${{ matrix.awscli_arch }}-${{ needs.resolve.outputs.aws_cli_version }}.zip" -o /tmp/awscli.zip
+          unzip -q /tmp/awscli.zip -d /tmp
+          /tmp/aws/install --install-dir ./aws-cli --bin-dir ./bin
+          rm -rf /tmp/aws /tmp/awscli.zip
+
+      - name: Download ghp from ghpool release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GHP_VER="${{ needs.resolve.outputs.ghpool_version }}"
+          gh release download "v${GHP_VER}" \
+            --repo openabdev/ghpool \
+            --pattern "ghpool-${GHP_VER}-${{ matrix.ghpool_arch }}.tar.gz" \
+            --dir /tmp
+          tar -xzf /tmp/ghpool-${GHP_VER}-${{ matrix.ghpool_arch }}.tar.gz -C /tmp
+          # ghpool tarball contains 'ghp' binary
+          cp /tmp/ghp ./bin/ghp
+          chmod +x ./bin/ghp
+
+      - name: Download gh CLI
+        run: |
+          GH_VERSION=$(gh --version | head -1 | awk '{print $3}')
+          # Use the runner's gh binary directly
+          cp $(which gh) ./bin/gh
+          chmod +x ./bin/gh
+
+      - name: Fix symlinks to be relative
+        run: |
+          # AWS CLI installer creates absolute symlinks in bin/ — replace with relative
+          rm -f ./bin/aws ./bin/aws_completer
+
+          # Find the installed version directory
+          VERSION_DIR=$(ls ./aws-cli/v2/ | grep -v current)
+          
+          # Recreate relative symlinks
+          cd aws-cli/v2 && rm -f current && ln -sf "$VERSION_DIR" current && cd ../..
+          cd bin && ln -sf ../aws-cli/v2/current/bin/aws aws && ln -sf ../aws-cli/v2/current/bin/aws_completer aws_completer && cd ..
+
+      - name: Verify symlinks
+        run: |
+          echo "=== bin/ ==="
+          ls -la ./bin/
+          echo "=== aws-cli/v2/ ==="
+          ls -la ./aws-cli/v2/
+          echo "=== resolve test ==="
+          ./bin/aws --version
+          ./bin/ghp --version || true
+
+      - name: Create tarball
+        run: |
+          tar -czf utils-${{ matrix.arch }}.tar.gz ./bin ./aws-cli
+          ls -lh utils-${{ matrix.arch }}.tar.gz
+          echo "### Contents" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tar -tvf utils-${{ matrix.arch }}.tar.gz | grep -E "(\->|bin/)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ matrix.arch }}
+          path: utils-${{ matrix.arch }}.tar.gz
+          retention-days: 30
+
+  release:
+    needs: [resolve, bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.ARTIFACT_NAME }}-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="pre-seed-utils-v${{ needs.resolve.outputs.aws_cli_version }}-ghp${{ needs.resolve.outputs.ghpool_version }}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "pre_seed utils (AWS CLI ${{ needs.resolve.outputs.aws_cli_version }} + ghp ${{ needs.resolve.outputs.ghpool_version }})" \
+            --notes "Bundled pre_seed utilities for OAB fleet.
+
+          **Contents:**
+          - AWS CLI v${{ needs.resolve.outputs.aws_cli_version }}
+          - ghp v${{ needs.resolve.outputs.ghpool_version }} (ghpool shim)
+          - gh CLI (from runner)
+
+          **Usage:** Add to \`[hooks.pre_seed].sources\` as S3 URI after uploading." \
+            artifacts/utils-x86_64.tar.gz \
+            artifacts/utils-aarch64.tar.gz
+
+  upload-s3:
+    needs: [resolve, bundle]
+    if: inputs.upload_s3
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-x86_64
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp utils-x86_64.tar.gz s3://openab-state-pahud/shared/utils.tar.gz
+          echo "✅ Uploaded to s3://openab-state-pahud/shared/utils.tar.gz"

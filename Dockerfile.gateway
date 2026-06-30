@@ -33,7 +33,7 @@ RUN touch crates/openab-gateway/src/main.rs crates/openab-gateway/src/lib.rs && 
     fi
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash -u 1000 gateway

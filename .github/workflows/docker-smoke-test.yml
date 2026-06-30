@@ -31,6 +31,7 @@ jobs:
           - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "", build_args: "" }
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio", build_args: "" }
+          - { dockerfile: Dockerfile.devin, suffix: "-devin", agent: "devin", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "", build_args: "" }
           - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "", build_args: "" }
           - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "", build_args: "" }

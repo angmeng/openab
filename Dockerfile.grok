@@ -15,7 +15,7 @@ COPY src/ src/
 RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Create agent user first so WORKDIR gets correct ownership
 RUN useradd -m -u 1000 agent

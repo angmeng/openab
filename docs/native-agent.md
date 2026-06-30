@@ -27,17 +27,41 @@ openab-agent
 env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 ```
 
+### Configuration file (config.json)
+
+A small JSON file next to `auth.json` (default `<auth dir>/config.json`,
+overridable with `OPENAB_CONFIG_PATH`) declares the default model and params, so
+a deployment can set them in a file instead of only via env vars. **Secrets never
+go here** — credentials stay in the locked `auth.json` store.
+
+```jsonc
+{
+  "model": "anthropic/claude-sonnet-4-6",  // single provider/model string
+  "max_tokens": 8192                         // optional
+}
+```
+
+Resolution is **env-over-config**: `OPENAB_AGENT_MODEL` / `OPENAB_AGENT_MAX_TOKENS`
+override the file, so a pod's injected env stays authoritative over a baked
+config. A missing file is fine (empty config); a malformed file is logged and
+ignored (the agent then falls back to env / built-in defaults). Unknown keys are
+tolerated for forward-compatibility.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Anthropic model id, optionally `provider/`-qualified (e.g. `claude-opus-4-8`, `anthropic/claude-opus-4-8`). No hardcoded default — dateless 4.6+ IDs are fixed canonical IDs that retire each generation, so the agent fails loud if unset rather than pin a model that will eventually 404. Overrides `model` in [config.json](#configuration-file-configjson). |
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |
-| `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens |
-| `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom OAuth client ID |
+| `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens. Overrides `max_tokens` in config.json. |
+| `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom Codex OAuth client ID |
+| `OPENAB_AGENT_ANTHROPIC_CLIENT_ID` | Claude Code's client | Custom Anthropic OAuth client ID |
 | `OPENAB_AGENT_MAX_TOOL_LOOPS` | `50` | Max tool-call iterations per prompt before the agent gives up |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key (alternative to OAuth) |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key. Highest-precedence Anthropic credential (see [Anthropic credentials](#anthropic-credentials)). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Pre-provisioned long-lived Claude Pro/Max subscription token (from `claude setup-token`). Fleet route — no interactive login, no `auth.json` write. |
+| `OPENAB_CONFIG_PATH` | `<auth dir>/config.json` | Override the config-file path. |
 
 ## Authentication
 
@@ -69,13 +93,33 @@ openab-agent auth codex-device
 
 Note: Device flow currently has limited scopes and may not work with all models.
 
-### API Key (Anthropic)
+### Anthropic credentials
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
+Three ways to authenticate Anthropic, resolved in this **precedence** (ADR §5.3):
 
-No login needed — set the env var and the agent auto-detects it.
+1. **API key** — `export ANTHROPIC_API_KEY=sk-ant-...`. No login; auto-detected.
+2. **Pre-provisioned subscription token (fleet route)** — `export CLAUDE_CODE_OAUTH_TOKEN=...`
+   (mint once with `claude setup-token`; ~1-year Claude Pro/Max token). Sent as a
+   `Bearer` subscription token with the Claude Code identity headers — no
+   interactive login, no `auth.json` write, no refresh. Recommended for pods (inject
+   as a k8s secret).
+3. **Interactive Claude Pro/Max OAuth** — browser PKCE login, refreshed from the
+   stored `anthropic-oauth` tenant in `auth.json`:
+
+   ```bash
+   openab-agent auth anthropic-oauth            # browser
+   openab-agent auth anthropic-oauth --no-browser  # paste code#state
+   ```
+
+A higher-precedence source's own errors (e.g. a key set but no model) surface
+rather than silently falling through to a lower one.
+
+### Adding an OAuth vendor
+
+Subscription-OAuth providers are declared as a single `OAuthVendor` descriptor
+(`auth.rs`, ADR §5.1) — namespace, client id, authorize/token URLs, redirect,
+scope, token-body encoding. The shared PKCE/device/refresh driver reads the
+descriptor, so a new vendor is a new descriptor, not a new hand-rolled flow.
 
 ## Custom System Prompt
 

@@ -17,7 +17,7 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 RUN cd openab-agent && cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install gh CLI

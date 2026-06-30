@@ -15,7 +15,7 @@ COPY src/ src/
 RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 # Create agent user first so WORKDIR gets correct ownership
 RUN useradd -m -u 1000 agent

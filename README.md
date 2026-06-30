@@ -4,7 +4,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
@@ -22,11 +22,10 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
 │   User       │            │  Custom Gateway  │              │ mimo acp         │
 ├──────────────┤            │  (standalone)    │              │ grok agent stdio │
-├──────────────┤            │  (standalone)    │              │ agy-acp          │
-│  Feishu/Lark │◄───WS──────│                  │              │ pi-acp           │
-│   User       │            │                  │              └──────────────────┘
-├──────────────┤            │                  │
-│ Google Chat  │◄──webhook──│                  │
+│  Feishu/Lark │◄───WS──────│                  │              │ devin acp        │
+│   User       │            │                  │              │ agy-acp          │
+├──────────────┤            │                  │              │ pi-acp           │
+│ Google Chat  │◄──webhook──│                  │              └──────────────────┘
 │   User       │            └──────────────────┘
 └──────────────┘
 ```
@@ -39,7 +38,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
 - **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Antigravity, Pi via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
@@ -173,6 +172,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Hermes Agent | `hermes-acp` | Native | [docs/hermes.md](docs/hermes.md) |
 | Grok Build | `grok agent stdio` | Native | [docs/grok.md](docs/grok.md) |
+| Devin | `devin acp` | Native | [docs/devin.md](docs/devin.md) |
 | Antigravity | `agy-acp` | [agy-acp](agy-acp/) | [docs/antigravity.md](docs/antigravity.md) |
 | Pi | `pi-acp` | [pi-acp](https://www.npmjs.com/package/pi-acp) | [docs/pi.md](docs/pi.md) |
 | **Native Agent** | `openab-agent` | Built-in (Rust) | [docs/native-agent.md](docs/native-agent.md) |

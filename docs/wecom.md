@@ -1,5 +1,37 @@
 # WeCom (企业微信) Setup
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the wecom adapter directly. Set `WECOM_CORP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + wecom)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `WECOM_CORP_ID` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect a WeCom (Enterprise WeChat) bot to OpenAB via the Custom Gateway.
 
 ```
@@ -84,9 +116,6 @@ allow_all_channels = true
 allow_all_users = true
 
 [agent]
-command = "claude-agent-acp"
-args = []
-working_dir = "/home/node"
 env = { CLAUDE_CODE_OAUTH_TOKEN = "${OPENAB_AUTH_TOKEN}" }
 
 [pool]

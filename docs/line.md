@@ -1,5 +1,37 @@
 # LINE Setup
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the line adapter directly. Set `LINE_CHANNEL_SECRET` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + line)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `LINE_CHANNEL_SECRET` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect a LINE bot to OpenAB via the Custom Gateway.
 
 ```
@@ -66,9 +98,6 @@ platform = "line"
 # allowed_channels = ["C1234567890abcdef"] # restrict to specific chat/group IDs
 
 [agent]
-command = "kiro-cli"
-args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
 ```
 
 > **Tip:** To find a LINE user ID, check the gateway logs — the sender ID is logged for each incoming message. By default all users and channels are allowed. Setting `allowed_users` or `allowed_channels` automatically restricts access to only those listed.

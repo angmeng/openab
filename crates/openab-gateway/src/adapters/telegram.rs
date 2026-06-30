@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Base URL for Telegram Bot API. Extracted as constant for consistency
 /// with LINE's `LINE_API_BASE` and to enable future mock testing.
@@ -102,6 +102,34 @@ pub async fn webhook(
     headers: axum::http::HeaderMap,
     Json(update): Json<TelegramUpdate>,
 ) -> axum::http::StatusCode {
+    // Log source IP for monitoring (phase 1: observe before enforcing)
+    // Priority: CF-Connecting-IP (edge proxy, non-spoofable) > X-Real-IP > X-Forwarded-For
+    // NOTE: XFF leftmost entry is client-supplied and spoofable. Phase 2 must implement
+    // trusted proxy configuration for accurate IP extraction when enforcement is enabled.
+    let source_ip = headers.get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()))
+        .or_else(|| {
+            headers.get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let is_telegram_subnet = check_telegram_subnet(&source_ip);
+    tracing::info!(
+        source_ip = %source_ip,
+        is_telegram = is_telegram_subnet,
+        "telegram webhook received"
+    );
+
+    if state.telegram_trusted_source_only && !is_telegram_subnet {
+        warn!(source_ip = %source_ip, "webhook rejected: source IP not in Telegram subnet");
+        return axum::http::StatusCode::FORBIDDEN;
+    }
+
     if let Some(ref expected) = state.telegram_secret_token {
         let provided = headers
             .get("x-telegram-bot-api-secret-token")
@@ -237,6 +265,27 @@ fn chunk_text(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
+/// Check if an IP is within Telegram's known webhook source subnets.
+/// See: <https://core.telegram.org/bots/webhooks>
+/// Subnets: 149.154.160.0/20, 91.108.4.0/22
+fn check_telegram_subnet(ip_str: &str) -> bool {
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 149.154.160.0/20 → 149.154.160.0 - 149.154.175.255
+            let in_range1 = octets[0] == 149 && octets[1] == 154 && (160..=175).contains(&octets[2]);
+            // 91.108.4.0/22 → 91.108.4.0 - 91.108.7.255
+            let in_range2 = octets[0] == 91 && octets[1] == 108 && (4..=7).contains(&octets[2]);
+            in_range1 || in_range2
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 fn is_markdown_parse_error(description: &str) -> bool {
     let desc_lower = description.to_lowercase();
     desc_lower.contains("can't find end")
@@ -286,6 +335,13 @@ fn is_complex_markdown(text: &str) -> bool {
     })
 }
 
+/// Compute a stable draft_id from channel + thread to avoid collisions in forum topics.
+fn compute_draft_id(chat_id: &str, thread_id: &Option<String>) -> i64 {
+    let chan: i64 = chat_id.parse::<i64>().unwrap_or(1).abs();
+    let tid: i64 = thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
+    (chan.wrapping_add(tid)) % 1_000_000 + 1
+}
+
 /// Send a rich message via Bot API 10.1 sendRichMessage.
 ///
 /// Design: we pass agent markdown directly via InputRichMessage.markdown.
@@ -317,6 +373,7 @@ async fn send_rich_message(
 ///
 /// Design: ephemeral 30-second preview. Caller must follow up with
 /// sendRichMessage to persist. Same draft_id = animated transition.
+///
 /// Wired but unused until gateway streaming infrastructure integrates.
 #[allow(dead_code)]
 async fn send_rich_message_draft(
@@ -424,9 +481,7 @@ pub async fn handle_reply(
                     &reply.content.text
                 };
                 // Combine channel + thread to avoid draft_id collision in forum topics
-                let chan: i64 = reply.channel.id.parse::<i64>().unwrap_or(1).abs();
-                let tid: i64 = reply.channel.thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
-                let draft_id: i64 = (chan.wrapping_add(tid)) % 1_000_000 + 1;
+                let draft_id = compute_draft_id(&reply.channel.id, &reply.channel.thread_id);
                 let _ = send_rich_message_draft(client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text).await;
             }
             // else: rich_messages=false with dummy ref — silently drop (no real msg to edit)
@@ -451,30 +506,14 @@ pub async fn handle_reply(
     if reply.command.as_deref() == Some("add_reaction")
         || reply.command.as_deref() == Some("remove_reaction")
     {
-        // Send thinking draft on reaction changes — reflects agent state
-        if rich_messages && reply.command.as_deref() == Some("add_reaction") {
-            let thinking_text = match reply.content.text.as_str() {
-                "👀" => Some("<tg-thinking>Looking...</tg-thinking>"),
-                "🤔" => Some("<tg-thinking>Thinking...</tg-thinking>"),
-                "👨\u{200d}💻" => Some("<tg-thinking>Writing code...</tg-thinking>"),
-                "🔥" => Some("<tg-thinking>Working...</tg-thinking>"),
-                "⚡" => Some("<tg-thinking>Running tools...</tg-thinking>"),
-                _ => None,
-            };
-            if let Some(text) = thinking_text {
-                let chan: i64 = reply.channel.id.parse::<i64>().unwrap_or(1).abs();
-                let tid: i64 = reply.channel.thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
-                let draft_id: i64 = (chan.wrapping_add(tid)) % 1_000_000 + 1;
-                let _ = send_rich_message_draft(
-                    client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text,
-                ).await;
-            }
-        }
-
         let msg_key = format!("{}:{}", reply.channel.id, reply.reply_to);
         let emoji = &reply.content.text;
         let tg_emoji = match emoji.as_str() {
             "🆗" => "👍",
+            // Mood faces are used on platforms that support multiple reactions (Discord).
+            // On Telegram (single reaction, non-premium), skip them to keep 👍 as the
+            // final "done" indicator instead of replacing it with a random face.
+            "😊" | "😎" | "🫡" | "🤓" | "😏" | "✌️" | "💪" | "🦾" => return,
             other => other,
         };
         let is_add = reply.command.as_deref() == Some("add_reaction");
@@ -482,9 +521,10 @@ pub async fn handle_reply(
             let mut reactions = reaction_state.lock().await;
             let set = reactions.entry(msg_key.clone()).or_default();
             if is_add {
-                if !set.contains(&tg_emoji.to_string()) {
-                    set.push(tg_emoji.to_string());
-                }
+                // Telegram private chats only allow 1 reaction per message (non-premium).
+                // Replace all existing reactions with the new one instead of accumulating.
+                set.clear();
+                set.push(tg_emoji.to_string());
             } else {
                 set.retain(|e| e != tg_emoji);
             }
@@ -501,16 +541,35 @@ pub async fn handle_reply(
                 .unwrap_or_default()
         };
         let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/setMessageReaction");
-        let _ = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "chat_id": reply.channel.id,
-                "message_id": reply.reply_to,
-                "reaction": current,
-            }))
-            .send()
-            .await
-            .map_err(|e| error!("telegram reaction error: {e}"));
+        let msg_id: i64 = match reply.reply_to.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(reply_to = %reply.reply_to, chat_id = %reply.channel.id, error = %e, "invalid message_id for reaction, skipping");
+                return;
+            }
+        };
+        let body = serde_json::json!({
+            "chat_id": reply.channel.id,
+            "message_id": msg_id,
+            "reaction": current,
+        });
+        debug!(
+            chat_id = %reply.channel.id,
+            message_id = msg_id,
+            emoji = %tg_emoji,
+            is_add,
+            "telegram reaction"
+        );
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(status = %status, body = %text, "setMessageReaction failed");
+                }
+            }
+            Err(e) => error!("telegram reaction error: {e}"),
+        }
         return;
     }
 
@@ -895,6 +954,28 @@ mod tests {
         assert!(is_markdown_parse_error("can't parse entities in message text"));
         assert!(!is_markdown_parse_error("Unauthorized"));
         assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn test_check_telegram_subnet() {
+        // 149.154.160.0/20 boundaries
+        assert!(!check_telegram_subnet("149.154.159.255"));
+        assert!(check_telegram_subnet("149.154.160.0"));
+        assert!(check_telegram_subnet("149.154.175.255"));
+        assert!(!check_telegram_subnet("149.154.176.0"));
+        // 91.108.4.0/22 boundaries
+        assert!(!check_telegram_subnet("91.108.3.255"));
+        assert!(check_telegram_subnet("91.108.4.0"));
+        assert!(check_telegram_subnet("91.108.7.255"));
+        assert!(!check_telegram_subnet("91.108.8.0"));
+        // Invalid inputs
+        assert!(!check_telegram_subnet("unknown"));
+        assert!(!check_telegram_subnet(""));
+        assert!(!check_telegram_subnet("not-an-ip"));
+        assert!(!check_telegram_subnet("::1"));
+        // Non-Telegram IPs
+        assert!(!check_telegram_subnet("8.8.8.8"));
+        assert!(!check_telegram_subnet("192.168.1.1"));
     }
 
     #[test]

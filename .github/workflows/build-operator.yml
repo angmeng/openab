@@ -30,7 +30,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # All agent variants built from Dockerfile.unified targets.
-  AGENTS: "kiro,claude,codex,copilot,cursor,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
+  AGENTS: "kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
 
 jobs:
   resolve-tag:
@@ -107,7 +107,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.unified
-          target: builder
+          target: local_builder
           platforms: ${{ matrix.platform.os }}
           # Always push builder — it's an internal image needed by build-agents.
           # dry_run only gates the final agent image push + manifest creation.
@@ -154,10 +154,7 @@ jobs:
             BUILDER_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.resolve-tag.outputs.chart_version }}-${{ matrix.platform.arch }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
           no-cache: ${{ inputs.no_cache == true }}
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.resolve-tag.outputs.chart_version }}-${{ matrix.platform.arch }}
-            ${{ inputs.no_cache != true && format('type=gha,scope=unified-builder-{0}', matrix.platform.arch) || '' }}
-            ${{ inputs.no_cache != true && format('type=gha,scope=unified-agent-{0}-{1}', matrix.agent, matrix.platform.arch) || '' }}
+          cache-from: ${{ inputs.no_cache != true && format('type=gha,scope=unified-agent-{0}-{1}', matrix.agent, matrix.platform.arch) || '' }}
           cache-to: ${{ inputs.no_cache != true && format('type=gha,scope=unified-agent-{0}-{1},mode=max', matrix.agent, matrix.platform.arch) || '' }}
 
       - name: Export digest

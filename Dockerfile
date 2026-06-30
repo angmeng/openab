@@ -28,7 +28,7 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
     fi
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)

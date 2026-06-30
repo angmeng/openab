@@ -207,6 +207,33 @@ pub struct HooksConfig {
     pub pre_shutdown: Option<HookConfig>,
 }
 
+impl HooksConfig {
+    /// Returns true if any lifecycle hook (pre_seed, pre_boot, pre_shutdown) is configured.
+    pub fn any_configured(&self) -> bool {
+        self.pre_seed.as_ref().is_some_and(|p| !p.sources.is_empty())
+            || self.pre_boot.is_some()
+            || self.pre_shutdown.is_some()
+    }
+
+    /// Fail fast if hooks are configured on an unsupported platform.
+    ///
+    /// Lifecycle hooks (pre_seed tarball extraction, pre_boot/pre_shutdown shell
+    /// scripts) assume a Unix environment and only ever run inside Linux containers.
+    /// Rather than silently misbehaving on Windows, refuse to start.
+    pub fn ensure_platform_supported(&self) -> anyhow::Result<()> {
+        #[cfg(not(unix))]
+        {
+            if self.any_configured() {
+                anyhow::bail!(
+                    "lifecycle hooks ([hooks.pre_seed], [hooks.pre_boot], [hooks.pre_shutdown]) \
+                     are only supported on Unix platforms; remove them to run on this platform"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the pre_seed phase.
 /// Downloads and extracts zip archives from S3 before pre_boot.
 #[derive(Debug, Clone, Deserialize)]
@@ -1512,6 +1539,65 @@ fn default_ambient_context_flushes() -> usize {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn hooks_any_configured_false_when_empty() {
+        let h = HooksConfig::default();
+        assert!(!h.any_configured());
+        // Empty pre_seed sources don't count as configured
+        let h2 = HooksConfig {
+            pre_seed: Some(PreSeedConfig {
+                sources: vec![],
+                target: None,
+                region: None,
+                endpoint_url: None,
+                max_bytes: default_max_zip_bytes(),
+                timeout_seconds: default_pre_seed_timeout(),
+                on_failure: OnFailure::default(),
+            }),
+            pre_boot: None,
+            pre_shutdown: None,
+        };
+        assert!(!h2.any_configured());
+    }
+
+    fn sample_hook() -> HookConfig {
+        HookConfig {
+            script: None,
+            inline: Some("echo hi".to_string()),
+            url: None,
+            sha256: None,
+            timeout_seconds: 60,
+            on_failure: OnFailure::default(),
+        }
+    }
+
+    #[test]
+    fn hooks_any_configured_true_with_pre_boot() {
+        let h = HooksConfig {
+            pre_seed: None,
+            pre_boot: Some(sample_hook()),
+            pre_shutdown: None,
+        };
+        assert!(h.any_configured());
+    }
+
+    #[test]
+    fn ensure_platform_supported_ok_when_no_hooks() {
+        // No hooks configured → always Ok regardless of platform
+        assert!(HooksConfig::default().ensure_platform_supported().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_platform_supported_ok_on_unix_with_hooks() {
+        let h = HooksConfig {
+            pre_seed: None,
+            pre_boot: Some(sample_hook()),
+            pre_shutdown: None,
+        };
+        assert!(h.ensure_platform_supported().is_ok());
+    }
 
     const MINIMAL_TOML: &str = r#"
 [discord]

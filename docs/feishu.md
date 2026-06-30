@@ -1,5 +1,37 @@
 # Feishu / Lark
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the feishu adapter directly. Set `FEISHU_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + feishu)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `FEISHU_APP_ID` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect OpenAB to Feishu (China) or Lark (international) so users can chat with an AI agent in DMs or group chats.
 
 ## Prerequisites

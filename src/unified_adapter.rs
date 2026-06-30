@@ -162,19 +162,25 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
-        let reply = self.build_reply(&msg.channel, emoji, Some("add_reaction"), None);
+        let mut reply = self.build_reply(&msg.channel, emoji, Some("add_reaction"), None);
+        // Use the actual platform message_id (not origin_event_id which is a UUID)
+        reply.reply_to = msg.message_id.clone();
         self.dispatch_reply(&reply).await;
         Ok(())
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
-        let reply = self.build_reply(&msg.channel, emoji, Some("remove_reaction"), None);
+        let mut reply = self.build_reply(&msg.channel, emoji, Some("remove_reaction"), None);
+        // Use the actual platform message_id (not origin_event_id which is a UUID)
+        reply.reply_to = msg.message_id.clone();
         self.dispatch_reply(&reply).await;
         Ok(())
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
-        let reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
+        let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
+        // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
+        reply.reply_to = msg.message_id.clone();
         self.dispatch_reply(&reply).await;
         Ok(())
     }
@@ -195,6 +201,20 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     }
 
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        false // Webhook platforms don't support streaming edits
+        // TELEGRAM_STREAMING env var is the explicit override (true/false).
+        // If not set, default to `true` when Telegram Rich Messages are enabled
+        // (implies sendRichMessageDraft support), `false` otherwise.
+        // This ensures Telegram-only deployments get streaming out of the box,
+        // while multi-platform deployments stay safe by default.
+        if let Ok(v) = std::env::var("TELEGRAM_STREAMING") {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        self.gw_state.telegram_rich_messages
+    }
+
+    fn show_streaming_placeholder(&self) -> bool {
+        // No placeholder needed — Telegram uses sendRichMessageDraft for streaming preview.
+        // The draft mechanism handles the "typing" indicator natively.
+        false
     }
 }

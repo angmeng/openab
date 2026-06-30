@@ -319,7 +319,7 @@ mod tests {
         for (i, chunk) in chunks.iter().enumerate() {
             let fence_count = chunk.lines().filter(|l| l.starts_with("```")).count();
             assert!(
-                fence_count % 2 == 0,
+                fence_count.is_multiple_of(2),
                 "chunk {i} has unbalanced fences ({fence_count}):\n{chunk}"
             );
         }

@@ -62,7 +62,7 @@ jobs:
           fi
 
           # Resolve variants
-          ALLOWED="kiro,claude,codex,copilot,cursor,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
+          ALLOWED="kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
           if [ "$VARIANTS_INPUT" = "all" ] || [ -z "$VARIANTS_INPUT" ]; then
             VARIANTS="$ALLOWED"
           else
@@ -121,7 +121,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.unified
-          target: builder
+          target: local_builder
           platforms: ${{ matrix.platform.os }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.matrix.outputs.tag }}-${{ matrix.platform.arch }}
@@ -168,9 +168,6 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.matrix.outputs.tag }}-${{ matrix.platform.arch }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.matrix.outputs.tag }}-${{ matrix.platform.arch }}
-            type=gha,scope=builder-${{ matrix.platform.arch }}
 
       - name: Export digest
         run: |

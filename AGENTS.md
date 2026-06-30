@@ -75,9 +75,17 @@ Never leak `DISCORD_BOT_TOKEN` or other OAB credentials to the agent.
 
 ### 4. Dockerfile Discipline
 
-There are 11 Dockerfiles: `Dockerfile`, `Dockerfile.antigravity`, `Dockerfile.claude`, `Dockerfile.codex`, `Dockerfile.copilot`, `Dockerfile.cursor`, `Dockerfile.gemini`, `Dockerfile.grok`, `Dockerfile.hermes`, `Dockerfile.opencode`, `Dockerfile.pi`.
+The primary Dockerfile is `Dockerfile.unified` (multi-target, all variants). Legacy per-agent Dockerfiles exist but are deprecated.
 
-A change to one MUST be evaluated against ALL. Common layers (base image, openab binary, tini) are shared — update all or explain why not.
+A change to common layers (base image, openab binary, tini) affects ALL variants — test broadly.
+
+**Builder image is pinned by digest** in `Dockerfile.unified`. Do NOT change `rust:1-bookworm` to an unpinned rolling tag. The digest prevents silent glibc upgrades that break runtime compatibility. Update it only when intentionally upgrading the Rust toolchain:
+
+```bash
+docker pull rust:1-bookworm
+docker inspect rust:1-bookworm --format '{{index .RepoDigests 0}}'
+# Update the @sha256:... in Dockerfile.unified
+```
 
 ### 5. Cross-Platform
 

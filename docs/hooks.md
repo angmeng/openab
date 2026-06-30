@@ -2,6 +2,8 @@
 
 OpenAB supports lifecycle hooks that run at specific points during the container lifecycle. All lifecycle phases are configured in `config.toml` under the `[hooks]` table.
 
+> **Platform support:** Lifecycle hooks are **Unix-only** (Linux/macOS). They rely on Unix symlinks (`pre_seed` tarball extraction) and POSIX shell scripts (`pre_boot`/`pre_shutdown`), and are only ever exercised inside Linux containers. If any hook (`pre_seed`, `pre_boot`, or `pre_shutdown`) is configured while running on **Windows**, OpenAB **fails fast at startup** rather than misbehaving silently. Remove the `[hooks.*]` config to run on Windows.
+
 ## Lifecycle Order
 
 ```

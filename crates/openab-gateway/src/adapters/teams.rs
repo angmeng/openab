@@ -652,21 +652,8 @@ mod tests {
         let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
 
         Arc::new(crate::AppState {
-            telegram_bot_token: None,
-            telegram_secret_token: None,
-            telegram_rich_messages: false,
-            line_channel_secret: None,
-            line_access_token: None,
             teams: Some(TeamsAdapter::new(make_config(vec![]))),
-            teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            feishu: None,
-            google_chat: None,
-            wecom: None,
-            ws_token: None,
-            event_tx,
-            reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
-            client: reqwest::Client::new(),
+            ..crate::AppState::test_default(event_tx)
         })
     }
 

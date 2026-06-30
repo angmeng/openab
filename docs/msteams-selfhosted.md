@@ -1,5 +1,40 @@
 # Microsoft Teams Setup (Self-Hosted)
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the Teams adapter directly. Set `TEAMS_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + Teams)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
+
+---
+
+## Standalone Gateway Mode (Legacy)
+
 Connect a Microsoft Teams bot to OpenAB via the Custom Gateway using a self-hosted Docker Compose stack.
 
 ```
