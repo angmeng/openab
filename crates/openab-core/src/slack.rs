@@ -36,6 +36,16 @@ const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
 const CREATE_CHANNEL_MARKER_PREFIX: &str = "<<openab-create-channel ";
 const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
 
+/// Marker syntax for setting a channel's description (Slack calls it the channel
+/// "purpose") — e.g. the S6 `Branches:` block that a PM bot mirrors into the ticket
+/// channel. Line-anchored like the others. `channel=` is optional (defaults to the
+/// channel the reply is posted in); `text="…"` is the purpose, with literal `\n`
+/// decoded to real newlines for multi-line blocks. Needs `channels:manage` /
+/// `groups:write` (same scope the create path uses).
+/// `<<openab-set-purpose [channel=C123] text="Branches:\n  be: …\n  fe: …">>`
+const SET_PURPOSE_MARKER_PREFIX: &str = "<<openab-set-purpose ";
+const SET_PURPOSE_MARKER_SUFFIX: &str = ">>";
+
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
 /// outside this map will fall back to `grey_question`.
@@ -595,6 +605,21 @@ impl SlackAdapter {
         Ok(channel_id)
     }
 
+    /// Set a channel's description (Slack calls this the channel "purpose") —
+    /// e.g. the S6 `Branches:` block. Required bot scope: `channels:manage`
+    /// (public) / `groups:write` (private) — the same scope the create path uses.
+    /// `api_post` turns a non-`ok` Slack response into an `Err` carrying the code
+    /// (e.g. `missing_scope`, `not_in_channel`), so the caller surfaces it.
+    async fn set_channel_purpose_in_slack(&self, channel_id: &str, purpose: &str) -> Result<()> {
+        self.api_post(
+            "conversations.setPurpose",
+            serde_json::json!({ "channel": channel_id, "purpose": purpose }),
+        )
+        .await?;
+        info!(channel_id = %channel_id, "slack: channel purpose (description) set");
+        Ok(())
+    }
+
     /// Resolve a Slack user ID to display name via users.info API.
     /// Results are cached for 5 minutes to avoid hitting Slack rate limits.
     async fn resolve_user_name(&self, user_id: &str) -> Option<String> {
@@ -908,6 +933,28 @@ impl ChatAdapter for SlackAdapter {
                 confirmation
             } else {
                 format!("{residual}\n\n{confirmation}")
+            };
+            return self.send_plain_text(channel, &body).await;
+        }
+
+        // Set a channel's description (Slack "purpose") — e.g. the S6 Branches:
+        // block a PM bot mirrors into the ticket channel. Stripped before posting
+        // regardless of outcome; failure is surfaced (never silent).
+        if let Some((residual, spec)) = extract_set_purpose_marker(content) {
+            let target = spec.channel.as_deref().unwrap_or(channel.channel_id.as_str());
+            let outcome = self.set_channel_purpose_in_slack(target, &spec.purpose).await;
+            let residual = residual.trim();
+            let body = match outcome {
+                Ok(()) if residual.is_empty() => "📌 Channel description updated.".to_string(),
+                Ok(()) => residual.to_string(),
+                Err(e) => {
+                    let err = format!("⚠️ Failed to set channel description: {e}");
+                    if residual.is_empty() {
+                        err
+                    } else {
+                        format!("{residual}\n\n{err}")
+                    }
+                }
             };
             return self.send_plain_text(channel, &body).await;
         }
@@ -2556,6 +2603,81 @@ fn parse_create_channel_args(inner: &str) -> Option<CreateChannelSpec> {
     })
 }
 
+struct SetPurposeSpec {
+    /// Target channel id. `None` = the channel the reply is posted in.
+    channel: Option<String>,
+    /// Purpose text, with `\n`/`\t` already decoded to real whitespace.
+    purpose: String,
+}
+
+/// Parse outbound text for a single set-purpose marker
+/// `<<openab-set-purpose [channel=C123] text="…">>`. Line-anchored like the
+/// create-channel marker (must occupy its own trimmed line). Returns the residual
+/// text (marker line stripped) plus the spec.
+fn extract_set_purpose_marker(content: &str) -> Option<(String, SetPurposeSpec)> {
+    if !content.contains(SET_PURPOSE_MARKER_PREFIX) {
+        return None;
+    }
+
+    let mut spec: Option<SetPurposeSpec> = None;
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if spec.is_none()
+            && trimmed.starts_with(SET_PURPOSE_MARKER_PREFIX)
+            && trimmed.ends_with(SET_PURPOSE_MARKER_SUFFIX)
+        {
+            let inner = trimmed[SET_PURPOSE_MARKER_PREFIX.len()
+                ..trimmed.len() - SET_PURPOSE_MARKER_SUFFIX.len()]
+                .trim();
+            if let Some(parsed) = parse_set_purpose_args(inner) {
+                spec = Some(parsed);
+                continue; // strip the marker line from output
+            }
+            // invalid marker (no text) — drop the line so we don't leak it
+            continue;
+        }
+        kept_lines.push(line);
+    }
+
+    spec.map(|s| (kept_lines.join("\n"), s))
+}
+
+/// Parse the inner args of a set-purpose marker. Grammar:
+///   text="<free text, \n = newline>"   (required)
+///   channel=<C-id>                      (optional; default = current channel)
+fn parse_set_purpose_args(inner: &str) -> Option<SetPurposeSpec> {
+    // Pull out text="..." first (it may contain spaces/decoded newlines), then
+    // parse the rest as whitespace-separated tokens.
+    let mut rest = inner.to_string();
+    let mut purpose: Option<String> = None;
+    if let Some(start) = rest.find("text=\"") {
+        let after = start + "text=\"".len();
+        if let Some(end_rel) = rest[after..].find('"') {
+            let t = &rest[after..after + end_rel];
+            if !t.trim().is_empty() {
+                // decode literal \n / \t so multi-line blocks (Branches:) render
+                purpose = Some(t.replace("\\n", "\n").replace("\\t", "\t"));
+            }
+            let end = after + end_rel + 1;
+            rest.replace_range(start..end, " ");
+        }
+    }
+
+    let mut channel: Option<String> = None;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("channel=") {
+            let v = v.trim().trim_start_matches('#');
+            if !v.is_empty() {
+                channel = Some(v.to_string());
+            }
+        }
+    }
+
+    purpose.map(|purpose| SetPurposeSpec { channel, purpose })
+}
+
 /// Normalize a requested channel name to Slack's rules: lowercase, only
 /// `a-z0-9` plus hyphen/underscore, spaces/`.`/`/`→hyphen, ≤80 chars.
 fn normalize_channel_name(raw: &str) -> String {
@@ -2853,6 +2975,34 @@ mod tests {
         assert!(!invite_accepted(&owner, Some("TEAMMATE")));
         // fail closed: unknown/absent inviter is rejected when the gate is on
         assert!(!invite_accepted(&owner, None));
+    }
+
+    // --- set-purpose marker ---
+
+    #[test]
+    fn set_purpose_marker_parses_channel_and_decodes_newlines() {
+        let content =
+            "done\n<<openab-set-purpose channel=C123 text=\"Branches:\\n  be: AT-1-x-be\">>\nok";
+        let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        assert_eq!(residual, "done\nok");
+        assert_eq!(spec.channel.as_deref(), Some("C123"));
+        assert_eq!(spec.purpose, "Branches:\n  be: AT-1-x-be");
+    }
+
+    #[test]
+    fn set_purpose_marker_channel_defaults_to_none() {
+        let content = "<<openab-set-purpose text=\"hello\">>";
+        let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        assert_eq!(residual, "");
+        assert!(spec.channel.is_none());
+        assert_eq!(spec.purpose, "hello");
+    }
+
+    #[test]
+    fn set_purpose_marker_absent_or_empty_text_is_none() {
+        assert!(extract_set_purpose_marker("no marker here").is_none());
+        // marker present but empty text → dropped (returns None spec), line stripped
+        assert!(extract_set_purpose_marker("<<openab-set-purpose text=\"\">>").is_none());
     }
 
     // --- builder tests ---
