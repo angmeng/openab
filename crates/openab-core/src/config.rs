@@ -494,6 +494,14 @@ pub struct SlackConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Per-surface override: users allowed to interact in **DMs only**. When
+    /// non-empty, DM messages are gated against THIS list instead of
+    /// `allowed_users` (channel @mentions still use `allowed_users`). Empty
+    /// (default) = DMs fall back to `allowed_users`, preserving prior behaviour.
+    /// Typical use: `dm_allowed_users = ["<owner-uid>"]` so only the owner can
+    /// DM the bot, while the whole team can @mention it in shared channels.
+    #[serde(default)]
+    pub dm_allowed_users: Vec<String>,
     #[serde(default)]
     pub allow_bot_messages: AllowBots,
     /// Bot User IDs (U...) allowed to interact when allow_bot_messages is
