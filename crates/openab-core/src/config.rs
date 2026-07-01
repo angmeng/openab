@@ -502,6 +502,15 @@ pub struct SlackConfig {
     /// DM the bot, while the whole team can @mention it in shared channels.
     #[serde(default)]
     pub dm_allowed_users: Vec<String>,
+    /// Users whose channel invites the bot will ACCEPT. When the bot is added to
+    /// a channel, it self-heals its `allowed_channels` so it starts listening
+    /// there. When this list is non-empty, that self-heal only happens if the
+    /// **inviter** is in this list (owner-only invites); invites from anyone else
+    /// are ignored (the bot stays a silent, non-listening member). Empty
+    /// (default) = accept any invite, preserving prior behaviour.
+    /// Typical use: `invite_allowed_users = ["<owner-uid>"]`.
+    #[serde(default)]
+    pub invite_allowed_users: Vec<String>,
     #[serde(default)]
     pub allow_bot_messages: AllowBots,
     /// Bot User IDs (U...) allowed to interact when allow_bot_messages is
