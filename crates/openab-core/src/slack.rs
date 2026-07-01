@@ -979,11 +979,19 @@ impl ChatAdapter for SlackAdapter {
 
         // Set a channel's description (Slack "purpose") — e.g. the S6 Branches:
         // block a PM bot mirrors into the ticket channel (send-once path). The
-        // shared helper applies setPurpose once + reports the outcome; the marker
-        // is stripped so it never reaches the channel.
-        if let Some(body) = self.apply_set_purpose_marker(channel, content).await {
-            return self.send_plain_text(channel, &body).await;
-        }
+        // shared helper applies setPurpose once + reports the outcome, then we fall
+        // through with the marker-stripped body so a `<<openab-send-file>>` marker in
+        // the SAME reply is still handled below (and the raw marker never reaches
+        // Slack). If there's no file marker either, the body posts via the normal
+        // path at the end of this function.
+        let purpose_body: String;
+        let content: &str = match self.apply_set_purpose_marker(channel, content).await {
+            Some(body) => {
+                purpose_body = body;
+                &purpose_body
+            }
+            None => content,
+        };
 
         // Scan for file-send markers `<<openab-send-file PATH>>`. If found,
         // intercept: post the residual text (caption) first, then upload each
