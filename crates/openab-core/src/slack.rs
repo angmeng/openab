@@ -43,6 +43,10 @@ const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
 /// decoded to real newlines for multi-line blocks. Needs `channels:manage` /
 /// `groups:write` (same scope the create path uses).
 /// `<<openab-set-purpose [channel=C123] text="Branches:\n  be: …\n  fe: …">>`
+///
+/// Like the file-send marker, this MUST be neutralized in relay bodies — see
+/// `relay::strip_file_send_markers` (keep the prefix string in sync there) — so a
+/// peer-relayed message can't trigger a channel-description write.
 const SET_PURPOSE_MARKER_PREFIX: &str = "<<openab-set-purpose ";
 const SET_PURPOSE_MARKER_SUFFIX: &str = ">>";
 
