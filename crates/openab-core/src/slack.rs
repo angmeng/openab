@@ -940,19 +940,45 @@ impl ChatAdapter for SlackAdapter {
         // Set a channel's description (Slack "purpose") — e.g. the S6 Branches:
         // block a PM bot mirrors into the ticket channel. Stripped before posting
         // regardless of outcome; failure is surfaced (never silent).
-        if let Some((residual, spec)) = extract_set_purpose_marker(content) {
-            let target = spec.channel.as_deref().unwrap_or(channel.channel_id.as_str());
-            let outcome = self.set_channel_purpose_in_slack(target, &spec.purpose).await;
+        if let Some((residual, maybe_spec)) = extract_set_purpose_marker(content) {
             let residual = residual.trim();
-            let body = match outcome {
-                Ok(()) if residual.is_empty() => "📌 Channel description updated.".to_string(),
-                Ok(()) => residual.to_string(),
-                Err(e) => {
-                    let err = format!("⚠️ Failed to set channel description: {e}");
-                    if residual.is_empty() {
-                        err
-                    } else {
-                        format!("{residual}\n\n{err}")
+            let Some(spec) = maybe_spec else {
+                // Marker present but malformed — already stripped; post the residual
+                // (or a note) so the raw marker never leaks to the channel.
+                let body = if residual.is_empty() {
+                    "⚠️ (ignored a malformed set-purpose marker)".to_string()
+                } else {
+                    residual.to_string()
+                };
+                return self.send_plain_text(channel, &body).await;
+            };
+            let current = channel.channel_id.as_str();
+            let target = spec.channel.as_deref().unwrap_or(current);
+            // Authorization: a marker may only set the CURRENT channel's description
+            // or one already in the runtime allowlist (channels the bot operates in).
+            // Without this, a prompt-injected marker could rewrite ANY channel the
+            // bot token can manage (create-channel is stricter still — DM-only).
+            let authorized =
+                target == current || self.allowed_channels.read().await.contains(target);
+            let body = if !authorized {
+                let refuse =
+                    format!("⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist");
+                if residual.is_empty() {
+                    refuse
+                } else {
+                    format!("{residual}\n\n{refuse}")
+                }
+            } else {
+                match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
+                    Ok(()) if residual.is_empty() => "📌 Channel description updated.".to_string(),
+                    Ok(()) => residual.to_string(),
+                    Err(e) => {
+                        let err = format!("⚠️ Failed to set channel description: {e}");
+                        if residual.is_empty() {
+                            err
+                        } else {
+                            format!("{residual}\n\n{err}")
+                        }
                     }
                 }
             };
@@ -2614,34 +2640,36 @@ struct SetPurposeSpec {
 /// `<<openab-set-purpose [channel=C123] text="…">>`. Line-anchored like the
 /// create-channel marker (must occupy its own trimmed line). Returns the residual
 /// text (marker line stripped) plus the spec.
-fn extract_set_purpose_marker(content: &str) -> Option<(String, SetPurposeSpec)> {
+fn extract_set_purpose_marker(content: &str) -> Option<(String, Option<SetPurposeSpec>)> {
     if !content.contains(SET_PURPOSE_MARKER_PREFIX) {
         return None;
     }
 
+    let mut saw_marker = false;
     let mut spec: Option<SetPurposeSpec> = None;
     let mut kept_lines: Vec<&str> = Vec::new();
 
     for line in content.split('\n') {
         let trimmed = line.trim();
-        if spec.is_none()
+        if !saw_marker
             && trimmed.starts_with(SET_PURPOSE_MARKER_PREFIX)
             && trimmed.ends_with(SET_PURPOSE_MARKER_SUFFIX)
         {
+            saw_marker = true;
             let inner = trimmed[SET_PURPOSE_MARKER_PREFIX.len()
                 ..trimmed.len() - SET_PURPOSE_MARKER_SUFFIX.len()]
                 .trim();
-            if let Some(parsed) = parse_set_purpose_args(inner) {
-                spec = Some(parsed);
-                continue; // strip the marker line from output
-            }
-            // invalid marker (no text) — drop the line so we don't leak it
+            // parse may fail (empty/invalid text) → spec stays None, but the line is
+            // stripped either way so the raw marker never leaks to the channel.
+            spec = parse_set_purpose_args(inner);
             continue;
         }
         kept_lines.push(line);
     }
 
-    spec.map(|s| (kept_lines.join("\n"), s))
+    // Outer Some = "a marker line was seen and stripped"; inner Option = the parsed
+    // spec (None if malformed → caller just posts the stripped residual).
+    saw_marker.then(|| (kept_lines.join("\n"), spec))
 }
 
 /// Parse the inner args of a set-purpose marker. Grammar:
@@ -2984,6 +3012,7 @@ mod tests {
         let content =
             "done\n<<openab-set-purpose channel=C123 text=\"Branches:\\n  be: AT-1-x-be\">>\nok";
         let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        let spec = spec.expect("valid spec");
         assert_eq!(residual, "done\nok");
         assert_eq!(spec.channel.as_deref(), Some("C123"));
         assert_eq!(spec.purpose, "Branches:\n  be: AT-1-x-be");
@@ -2993,16 +3022,23 @@ mod tests {
     fn set_purpose_marker_channel_defaults_to_none() {
         let content = "<<openab-set-purpose text=\"hello\">>";
         let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        let spec = spec.expect("valid spec");
         assert_eq!(residual, "");
         assert!(spec.channel.is_none());
         assert_eq!(spec.purpose, "hello");
     }
 
     #[test]
-    fn set_purpose_marker_absent_or_empty_text_is_none() {
+    fn set_purpose_marker_absent_is_none_malformed_is_stripped_not_leaked() {
+        // no marker at all → None
         assert!(extract_set_purpose_marker("no marker here").is_none());
-        // marker present but empty text → dropped (returns None spec), line stripped
-        assert!(extract_set_purpose_marker("<<openab-set-purpose text=\"\">>").is_none());
+        // marker present but empty text → seen+stripped (Some residual), spec None,
+        // so the caller posts the residual and the raw marker never leaks (P3 fix).
+        let (residual, spec) =
+            extract_set_purpose_marker("before\n<<openab-set-purpose text=\"\">>\nafter")
+                .expect("marker seen");
+        assert_eq!(residual, "before\nafter");
+        assert!(spec.is_none());
     }
 
     // --- builder tests ---
