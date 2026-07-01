@@ -1107,6 +1107,42 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        // Set-purpose marker on the STREAMING path. Slack defaults to
+        // `streaming=true`, where the final reply is finalized via edit_message
+        // (stream_finish → edit_message), NOT send_message — so the send_message
+        // interception is bypassed there. Apply the side-effect and strip the
+        // marker so it never displays, then fall through to the normal render with
+        // the cleaned text. conversations.setPurpose is idempotent, so the repeated
+        // edits of the degraded post+edit path are harmless; failure is logged here
+        // (the send-once path in send_message is the one that surfaces it to the user).
+        let cleaned: String;
+        let content: &str =
+            if let Some((residual, maybe_spec)) = extract_set_purpose_marker(content) {
+                if let Some(spec) = maybe_spec {
+                    let current = msg.channel.channel_id.as_str();
+                    let target = spec.channel.as_deref().unwrap_or(current);
+                    let authorized =
+                        target == current || self.allowed_channels.read().await.contains(target);
+                    if authorized {
+                        if let Err(e) =
+                            self.set_channel_purpose_in_slack(target, &spec.purpose).await
+                        {
+                            warn!(channel_id = %target, error = %e, "slack: set-purpose (streaming) failed");
+                        }
+                    } else {
+                        warn!(channel_id = %target, "slack: set-purpose (streaming) refused — not current channel or allowlisted");
+                    }
+                }
+                cleaned = if residual.trim().is_empty() {
+                    "📌 Channel description updated.".to_string()
+                } else {
+                    residual
+                };
+                &cleaned
+            } else {
+                content
+            };
+
         // Marker handling for the streaming path: OpenAB streams the final agent
         // response via repeated edit_message calls against a placeholder. If the
         // text contains file-send markers, strip them from the edit (so the
