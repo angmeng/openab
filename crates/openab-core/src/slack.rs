@@ -1309,6 +1309,7 @@ pub async fn run_slack_adapter(
     allow_all_channels: bool,
     allow_all_users: bool,
     allowed_users: HashSet<String>,
+    dm_allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
@@ -1750,6 +1751,7 @@ pub async fn run_slack_adapter(
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_users = allowed_users.clone();
+                                                let dm_allowed_users = dm_allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 if is_bot {
@@ -1768,6 +1770,7 @@ pub async fn run_slack_adapter(
                                                         allow_all_channels,
                                                         allow_all_users,
                                                         &allowed_users,
+                                                        &dm_allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
                                                     )
@@ -1861,6 +1864,28 @@ async fn get_socket_mode_url(app_token: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no url in apps.connections.open response"))
 }
 
+/// Decide whether a human sender is denied by the Slack user allow-lists,
+/// applying the per-surface DM override. Pure so the security gate is unit-tested
+/// (see tests below) and can't silently regress.
+///
+/// - In a DM with a non-empty `dm_allowed_users`: gate strictly against that list
+///   (owner-only DMs), ignoring `allow_all_users` and `allowed_users`.
+/// - Otherwise (channel, or DM with no override): the historical rule —
+///   allowed unless `allow_all_users` is false AND the sender isn't in `allowed_users`.
+fn slack_user_denied(
+    is_dm: bool,
+    allow_all_users: bool,
+    allowed_users: &HashSet<String>,
+    dm_allowed_users: &HashSet<String>,
+    user_id: &str,
+) -> bool {
+    if is_dm && !dm_allowed_users.is_empty() {
+        !dm_allowed_users.contains(user_id)
+    } else {
+        !allow_all_users && !allowed_users.contains(user_id)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
@@ -1870,6 +1895,7 @@ async fn handle_message(
     allow_all_channels: bool,
     allow_all_users: bool,
     allowed_users: &HashSet<String>,
+    dm_allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
@@ -1910,14 +1936,27 @@ async fn handle_message(
         return;
     }
 
-    // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead)
-    if !is_bot_msg && !allow_all_users && !allowed_users.contains(&user_id) {
-        // 2026-06-03 (洺哥): silently ignore denied users — no 🚫 reaction. The
-        // reaction marked non-allowlisted senders in shared channels, but it
-        // surfaces the bot's presence to people it won't talk to, which reads as
-        // rude. Log-only denial is quieter; the user simply gets no response.
-        tracing::info!(user_id, "denied Slack user, ignoring (no reaction)");
-        return;
+    // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead).
+    // Per-surface gate: in DMs, a non-empty `dm_allowed_users` REPLACES `allowed_users`
+    // (and ignores allow_all_users) so the owner can lock DMs to themselves while the
+    // full team keeps channel @mention access. Empty dm list → DMs fall back to the
+    // channel list, preserving prior behaviour.
+    if !is_bot_msg {
+        let denied = slack_user_denied(
+            is_dm,
+            allow_all_users,
+            allowed_users,
+            dm_allowed_users,
+            &user_id,
+        );
+        if denied {
+            // 2026-06-03 (洺哥): silently ignore denied users — no 🚫 reaction. The
+            // reaction marked non-allowlisted senders in shared channels, but it
+            // surfaces the bot's presence to people it won't talk to, which reads as
+            // rude. Log-only denial is quieter; the user simply gets no response.
+            tracing::info!(user_id, is_dm, "denied Slack user, ignoring (no reaction)");
+            return;
+        }
     }
 
     // Capture the native-streaming recipient for THIS turn, now that the sender has
@@ -2732,6 +2771,45 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- user gate (per-surface DM override) ---
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dm_override_locks_dm_to_owner_but_not_channel() {
+        let team = set(&["OWNER", "MEMBER"]);
+        let dm = set(&["OWNER"]);
+        // DM: only the owner passes; a team member is denied.
+        assert!(!slack_user_denied(true, false, &team, &dm, "OWNER"));
+        assert!(slack_user_denied(true, false, &team, &dm, "MEMBER"));
+        // Channel: the DM override does not apply — the full team list gates.
+        assert!(!slack_user_denied(false, false, &team, &dm, "MEMBER"));
+        assert!(slack_user_denied(false, false, &team, &dm, "STRANGER"));
+    }
+
+    #[test]
+    fn empty_dm_override_falls_back_to_allowed_users() {
+        let team = set(&["OWNER", "MEMBER"]);
+        let dm = HashSet::new();
+        // Both surfaces use allowed_users (prior behaviour) when dm list is empty.
+        assert!(!slack_user_denied(true, false, &team, &dm, "MEMBER"));
+        assert!(slack_user_denied(true, false, &team, &dm, "STRANGER"));
+        assert!(!slack_user_denied(false, false, &team, &dm, "MEMBER"));
+    }
+
+    #[test]
+    fn allow_all_users_bypasses_channel_but_dm_override_still_wins() {
+        let empty = HashSet::new();
+        let dm = set(&["OWNER"]);
+        // allow_all_users opens the channel to anyone...
+        assert!(!slack_user_denied(false, true, &empty, &empty, "ANYONE"));
+        // ...but a DM override, being non-empty, still restricts DMs to the owner.
+        assert!(slack_user_denied(true, true, &empty, &dm, "ANYONE"));
+        assert!(!slack_user_denied(true, true, &empty, &dm, "OWNER"));
+    }
 
     // --- builder tests ---
 
