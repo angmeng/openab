@@ -476,6 +476,8 @@ async fn main() -> anyhow::Result<()> {
             slack_cfg.allowed_users.into_iter().collect();
         let slack_dm_allowed_users: std::collections::HashSet<String> =
             slack_cfg.dm_allowed_users.into_iter().collect();
+        let slack_invite_allowed_users: std::collections::HashSet<String> =
+            slack_cfg.invite_allowed_users.into_iter().collect();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
@@ -484,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_all_users,
                 slack_allowed_users,
                 slack_dm_allowed_users,
+                slack_invite_allowed_users,
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,

@@ -1310,6 +1310,7 @@ pub async fn run_slack_adapter(
     allow_all_users: bool,
     allowed_users: HashSet<String>,
     dm_allowed_users: HashSet<String>,
+    invite_allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
@@ -1456,11 +1457,26 @@ pub async fn run_slack_adapter(
                                                 // restart (2026-06-04 — symmetric with the create-channel path).
                                                 // Still falls through to skip_subtype below (no agent dispatch for
                                                 // a join notice).
+                                                //
+                                                // invite_allowed_users gate (2026-07-01): if set, only self-heal
+                                                // when the INVITER is authorised (owner-only invites). Otherwise the
+                                                // bot was dragged in by someone it doesn't take orders from — stay a
+                                                // silent, non-listening member. Empty list = accept any invite.
                                                 if subtype == "channel_join"
                                                     && bot_uid_opt.as_deref().is_some()
                                                     && event_user_id == bot_uid_opt.as_deref()
                                                 {
-                                                    adapter.allow_channel_now(channel_id, "invited").await;
+                                                    let inviter = event["inviter"].as_str();
+                                                    if invite_accepted(&invite_allowed_users, inviter) {
+                                                        adapter.allow_channel_now(channel_id, "invited").await;
+                                                    } else {
+                                                        info!(
+                                                            channel_id,
+                                                            inviter = inviter.unwrap_or("<none>"),
+                                                            "slack: ignoring channel invite from unauthorised inviter \
+                                                             (invite_allowed_users set); bot stays silent here"
+                                                        );
+                                                    }
                                                 }
 
                                                 // Skip non-message subtypes
@@ -1884,6 +1900,16 @@ fn slack_user_denied(
     } else {
         !allow_all_users && !allowed_users.contains(user_id)
     }
+}
+
+/// Decide whether a channel invite should be accepted (bot starts listening).
+/// Pure + unit-tested. Empty `invite_allowed_users` = accept any invite (prior
+/// behaviour). Non-empty = accept only if the inviter is known AND in the list.
+/// An absent inviter (Slack omitted the field) with a non-empty list is REJECTED
+/// — fail closed, since we can't verify the invite came from an authorised user.
+fn invite_accepted(invite_allowed_users: &HashSet<String>, inviter: Option<&str>) -> bool {
+    invite_allowed_users.is_empty()
+        || inviter.is_some_and(|inv| invite_allowed_users.contains(inv))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2809,6 +2835,24 @@ mod tests {
         // ...but a DM override, being non-empty, still restricts DMs to the owner.
         assert!(slack_user_denied(true, true, &empty, &dm, "ANYONE"));
         assert!(!slack_user_denied(true, true, &empty, &dm, "OWNER"));
+    }
+
+    // --- channel invite gate ---
+
+    #[test]
+    fn empty_invite_list_accepts_any_invite() {
+        let empty = HashSet::new();
+        assert!(invite_accepted(&empty, Some("ANYONE")));
+        assert!(invite_accepted(&empty, None)); // prior behaviour: no gate
+    }
+
+    #[test]
+    fn non_empty_invite_list_is_owner_only() {
+        let owner = set(&["OWNER"]);
+        assert!(invite_accepted(&owner, Some("OWNER")));
+        assert!(!invite_accepted(&owner, Some("TEAMMATE")));
+        // fail closed: unknown/absent inviter is rejected when the gate is on
+        assert!(!invite_accepted(&owner, None));
     }
 
     // --- builder tests ---
