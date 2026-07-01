@@ -620,6 +620,46 @@ impl SlackAdapter {
         Ok(())
     }
 
+    /// Process a set-purpose marker in outbound content: apply the side-effect
+    /// ONCE (if the marker is valid and the target is authorized) and return the
+    /// message body to display — the stripped residual plus a refuse/error note
+    /// (empty note on success, where the updated description speaks for itself).
+    /// Returns `None` when there is no marker (caller keeps the original content).
+    ///
+    /// Shared by the send-once path (`send_message`) and the streaming finalizer
+    /// (`stream_finish`) so the side-effect runs exactly once per reply and the
+    /// outcome is reported accurately in both — NOT per streaming delta.
+    async fn apply_set_purpose_marker(&self, channel: &ChannelRef, content: &str) -> Option<String> {
+        let (residual, maybe_spec) = extract_set_purpose_marker(content)?;
+        let residual = residual.trim();
+        let note = match maybe_spec {
+            None => "⚠️ (ignored a malformed set-purpose marker)".to_string(),
+            Some(spec) => {
+                let current = channel.channel_id.as_str();
+                let target = spec.channel.as_deref().unwrap_or(current);
+                // Authorization: only the current channel or one already in the
+                // runtime allowlist — a prompt-injected `channel=` must not be able
+                // to rewrite any channel the bot token can manage.
+                let authorized =
+                    target == current || self.allowed_channels.read().await.contains(target);
+                if !authorized {
+                    format!("⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist")
+                } else {
+                    match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
+                        Ok(()) => String::new(),
+                        Err(e) => format!("⚠️ Failed to set channel description: {e}"),
+                    }
+                }
+            }
+        };
+        Some(match (residual.is_empty(), note.is_empty()) {
+            (true, true) => "📌 Channel description updated.".to_string(),
+            (true, false) => note,
+            (false, true) => residual.to_string(),
+            (false, false) => format!("{residual}\n\n{note}"),
+        })
+    }
+
     /// Resolve a Slack user ID to display name via users.info API.
     /// Results are cached for 5 minutes to avoid hitting Slack rate limits.
     async fn resolve_user_name(&self, user_id: &str) -> Option<String> {
@@ -938,50 +978,10 @@ impl ChatAdapter for SlackAdapter {
         }
 
         // Set a channel's description (Slack "purpose") — e.g. the S6 Branches:
-        // block a PM bot mirrors into the ticket channel. Stripped before posting
-        // regardless of outcome; failure is surfaced (never silent).
-        if let Some((residual, maybe_spec)) = extract_set_purpose_marker(content) {
-            let residual = residual.trim();
-            let Some(spec) = maybe_spec else {
-                // Marker present but malformed — already stripped; post the residual
-                // (or a note) so the raw marker never leaks to the channel.
-                let body = if residual.is_empty() {
-                    "⚠️ (ignored a malformed set-purpose marker)".to_string()
-                } else {
-                    residual.to_string()
-                };
-                return self.send_plain_text(channel, &body).await;
-            };
-            let current = channel.channel_id.as_str();
-            let target = spec.channel.as_deref().unwrap_or(current);
-            // Authorization: a marker may only set the CURRENT channel's description
-            // or one already in the runtime allowlist (channels the bot operates in).
-            // Without this, a prompt-injected marker could rewrite ANY channel the
-            // bot token can manage (create-channel is stricter still — DM-only).
-            let authorized =
-                target == current || self.allowed_channels.read().await.contains(target);
-            let body = if !authorized {
-                let refuse =
-                    format!("⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist");
-                if residual.is_empty() {
-                    refuse
-                } else {
-                    format!("{residual}\n\n{refuse}")
-                }
-            } else {
-                match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
-                    Ok(()) if residual.is_empty() => "📌 Channel description updated.".to_string(),
-                    Ok(()) => residual.to_string(),
-                    Err(e) => {
-                        let err = format!("⚠️ Failed to set channel description: {e}");
-                        if residual.is_empty() {
-                            err
-                        } else {
-                            format!("{residual}\n\n{err}")
-                        }
-                    }
-                }
-            };
+        // block a PM bot mirrors into the ticket channel (send-once path). The
+        // shared helper applies setPurpose once + reports the outcome; the marker
+        // is stripped so it never reaches the channel.
+        if let Some(body) = self.apply_set_purpose_marker(channel, content).await {
             return self.send_plain_text(channel, &body).await;
         }
 
@@ -1107,41 +1107,25 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
-        // Set-purpose marker on the STREAMING path. Slack defaults to
-        // `streaming=true`, where the final reply is finalized via edit_message
-        // (stream_finish → edit_message), NOT send_message — so the send_message
-        // interception is bypassed there. Apply the side-effect and strip the
-        // marker so it never displays, then fall through to the normal render with
-        // the cleaned text. conversations.setPurpose is idempotent, so the repeated
-        // edits of the degraded post+edit path are harmless; failure is logged here
-        // (the send-once path in send_message is the one that surfaces it to the user).
+        // Set-purpose marker on the streaming DELTAS: strip it from the displayed
+        // text so it never flashes mid-stream, but do NOT run the side-effect here
+        // (edit_message is called on every cumulative delta in the degraded post+edit
+        // path — running setPurpose per delta would spam the API and can't report an
+        // accurate outcome). The side-effect runs exactly once at finalization
+        // (stream_finish) or on the send-once path (send_message).
         let cleaned: String;
-        let content: &str =
-            if let Some((residual, maybe_spec)) = extract_set_purpose_marker(content) {
-                if let Some(spec) = maybe_spec {
-                    let current = msg.channel.channel_id.as_str();
-                    let target = spec.channel.as_deref().unwrap_or(current);
-                    let authorized =
-                        target == current || self.allowed_channels.read().await.contains(target);
-                    if authorized {
-                        if let Err(e) =
-                            self.set_channel_purpose_in_slack(target, &spec.purpose).await
-                        {
-                            warn!(channel_id = %target, error = %e, "slack: set-purpose (streaming) failed");
-                        }
-                    } else {
-                        warn!(channel_id = %target, "slack: set-purpose (streaming) refused — not current channel or allowlisted");
-                    }
+        let content: &str = match extract_set_purpose_marker(content) {
+            Some((residual, _)) => {
+                if residual.trim().is_empty() {
+                    // The delta so far is just the marker — nothing to show yet;
+                    // leave the placeholder until the next delta / finalization.
+                    return Ok(());
                 }
-                cleaned = if residual.trim().is_empty() {
-                    "📌 Channel description updated.".to_string()
-                } else {
-                    residual
-                };
+                cleaned = residual;
                 &cleaned
-            } else {
-                content
-            };
+            }
+            None => content,
+        };
 
         // Marker handling for the streaming path: OpenAB streams the final agent
         // response via repeated edit_message calls against a placeholder. If the
@@ -1332,6 +1316,12 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
+        // Apply any set-purpose side-effect ONCE here (the streaming finalizer), with
+        // accurate success/refuse/error reporting, and swap the marker out for the
+        // display body. Both the edit_message replace and the postMessage fallback
+        // below then receive marker-free text, so the side-effect never double-fires.
+        let transformed = self.apply_set_purpose_marker(&msg.channel, final_content).await;
+        let final_content = transformed.as_deref().unwrap_or(final_content);
         let ts = &msg.message_id;
         let active = {
             let map = self.streams.lock().await;
