@@ -179,6 +179,13 @@ pub struct SlackAdapter {
     /// each potentially containing the file-send marker. Without dedup we'd
     /// re-upload the same file dozens of times. Cleared once per session restart.
     file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
+    /// Dedup for the `<<openab-set-purpose>>` side-effect, same rationale as
+    /// `file_upload_cache`: finalization can arrive via send_message, a direct
+    /// edit_message (cosmetic post+edit path), or stream_finish, and edit_message
+    /// may fire per streaming delta — so key on (channel, thread, purpose) and
+    /// call `conversations.setPurpose` at most once per unique description.
+    /// Rolled back on failure/refusal so a corrected retry can re-apply.
+    purpose_set_cache: tokio::sync::Mutex<HashSet<String>>,
     /// Channel allowlist (from `[slack].allowed_channels`), shared mutable so a
     /// channel the bot CREATES (via the `<<openab-create-channel>>` marker) or is
     /// INVITED into can be added at runtime — otherwise the bot is deaf in its
@@ -227,6 +234,7 @@ impl SlackAdapter {
             streams: tokio::sync::Mutex::new(HashMap::new()),
             event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
+            purpose_set_cache: tokio::sync::Mutex::new(HashSet::new()),
             allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
             config_path,
         }
@@ -632,32 +640,57 @@ impl SlackAdapter {
     async fn apply_set_purpose_marker(&self, channel: &ChannelRef, content: &str) -> Option<String> {
         let (residual, maybe_spec) = extract_set_purpose_marker(content)?;
         let residual = residual.trim();
-        let note = match maybe_spec {
-            None => "⚠️ (ignored a malformed set-purpose marker)".to_string(),
-            Some(spec) => {
-                let current = channel.channel_id.as_str();
-                let target = spec.channel.as_deref().unwrap_or(current);
-                // Authorization: only the current channel or one already in the
-                // runtime allowlist — a prompt-injected `channel=` must not be able
-                // to rewrite any channel the bot token can manage.
-                let authorized =
-                    target == current || self.allowed_channels.read().await.contains(target);
-                if !authorized {
-                    format!("⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist")
-                } else {
-                    match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
-                        Ok(()) => String::new(),
-                        Err(e) => format!("⚠️ Failed to set channel description: {e}"),
-                    }
-                }
+        // Compose the display body: stripped residual + an optional note.
+        let body = |note: &str| -> String {
+            match (residual.is_empty(), note.is_empty()) {
+                (true, true) => "📌 Channel description updated.".to_string(),
+                (true, false) => note.to_string(),
+                (false, true) => residual.to_string(),
+                (false, false) => format!("{residual}\n\n{note}"),
             }
         };
-        Some(match (residual.is_empty(), note.is_empty()) {
-            (true, true) => "📌 Channel description updated.".to_string(),
-            (true, false) => note,
-            (false, true) => residual.to_string(),
-            (false, false) => format!("{residual}\n\n{note}"),
-        })
+
+        let Some(spec) = maybe_spec else {
+            // Malformed marker: no side-effect, just strip + surface (idempotent).
+            return Some(body("⚠️ (ignored a malformed set-purpose marker)"));
+        };
+
+        let current = channel.channel_id.as_str();
+        let target = spec.channel.as_deref().unwrap_or(current);
+
+        // Dedup: apply a given (channel, thread, purpose) at most once. edit_message
+        // fires per streaming delta and finalization can arrive via several sinks, so
+        // without this the same description would be written repeatedly.
+        let key = format!(
+            "{target}\u{1f}{}\u{1f}{}",
+            channel.thread_id.as_deref().unwrap_or(""),
+            spec.purpose
+        );
+        let claimed = self.purpose_set_cache.lock().await.insert(key.clone());
+        if !claimed {
+            // Already applied this exact description in this thread — just display.
+            return Some(body(""));
+        }
+
+        // Authorization: only the current channel or one already in the runtime
+        // allowlist — a prompt-injected `channel=` must not rewrite any channel the
+        // bot token can manage. Roll back the claim so a corrected retry can re-apply.
+        let authorized =
+            target == current || self.allowed_channels.read().await.contains(target);
+        if !authorized {
+            self.purpose_set_cache.lock().await.remove(&key);
+            return Some(body(&format!(
+                "⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist"
+            )));
+        }
+
+        match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
+            Ok(()) => Some(body("")),
+            Err(e) => {
+                self.purpose_set_cache.lock().await.remove(&key);
+                Some(body(&format!("⚠️ Failed to set channel description: {e}")))
+            }
+        }
     }
 
     /// Resolve a Slack user ID to display name via users.info API.
@@ -1115,21 +1148,15 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
-        // Set-purpose marker on the streaming DELTAS: strip it from the displayed
-        // text so it never flashes mid-stream, but do NOT run the side-effect here
-        // (edit_message is called on every cumulative delta in the degraded post+edit
-        // path — running setPurpose per delta would spam the API and can't report an
-        // accurate outcome). The side-effect runs exactly once at finalization
-        // (stream_finish) or on the send-once path (send_message).
+        // Set-purpose marker: apply the side-effect (deduped via purpose_set_cache)
+        // and swap in the display body. Finalization can arrive HERE directly — the
+        // cosmetic post+edit path finalizes via edit_message, not stream_finish — so
+        // the side-effect must run here too; the cache makes the repeated cumulative-
+        // delta edits of the degraded path safe (setPurpose fires once per purpose).
         let cleaned: String;
-        let content: &str = match extract_set_purpose_marker(content) {
-            Some((residual, _)) => {
-                if residual.trim().is_empty() {
-                    // The delta so far is just the marker — nothing to show yet;
-                    // leave the placeholder until the next delta / finalization.
-                    return Ok(());
-                }
-                cleaned = residual;
+        let content: &str = match self.apply_set_purpose_marker(&msg.channel, content).await {
+            Some(b) => {
+                cleaned = b;
                 &cleaned
             }
             None => content,
@@ -1324,12 +1351,9 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
-        // Apply any set-purpose side-effect ONCE here (the streaming finalizer), with
-        // accurate success/refuse/error reporting, and swap the marker out for the
-        // display body. Both the edit_message replace and the postMessage fallback
-        // below then receive marker-free text, so the side-effect never double-fires.
-        let transformed = self.apply_set_purpose_marker(&msg.channel, final_content).await;
-        let final_content = transformed.as_deref().unwrap_or(final_content);
+        // Set-purpose markers are handled in edit_message (which this calls below)
+        // and send_message (the fallback), both deduped via purpose_set_cache — so
+        // the side-effect fires once regardless of which finalization sink runs.
         let ts = &msg.message_id;
         let active = {
             let map = self.streams.lock().await;
