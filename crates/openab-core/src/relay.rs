@@ -43,6 +43,13 @@ pub(crate) const CLOSER_LINE: &str = "<<openab-relay-end>>";
 const FILE_SEND_MARKER_PREFIX: &str = "<<openab-send-file ";
 const FILE_SEND_MARKER_SUFFIX: &str = ">>";
 
+/// Set-purpose marker prefix — mirrored from `slack.rs` `SET_PURPOSE_MARKER_PREFIX`.
+/// Also neutralized in relay bodies: unlike file-send it has no DM-only guard and
+/// its `target == current` authz would pass on a relayed body, so a relayed
+/// `<<openab-set-purpose …>>` could otherwise mutate the target channel's
+/// description. Shares the `>>` suffix. Keep in sync with slack.rs.
+const SET_PURPOSE_MARKER_PREFIX: &str = "<<openab-set-purpose ";
+
 /// v4: max allowed prefix_template length. Well below smallest peer
 /// message_limit (Discord 2000, Slack 4000). Prevents format::split_message
 /// from char-by-char splitting an overlong template mid-string.
@@ -348,20 +355,25 @@ pub fn format_relay_body(template: &str, persona: &str, platform: &str, body: &s
     }
 }
 
-/// Strip `<<openab-send-file PATH>>` marker lines from a relay body before
-/// peer dispatch. Same line-anchored rules as the file-send extractor itself.
+/// Strip OpenAB control markers (`<<openab-send-file …>>` and
+/// `<<openab-set-purpose …>>`) from a relay body before peer dispatch. Same
+/// line-anchored rules as the extractors themselves.
 ///
-/// Prevents Slack-targeted relay bodies from triggering unintended file
-/// uploads via `slack.rs:620` file-send extractor.
+/// Prevents Slack-targeted relay bodies from triggering unintended side effects:
+/// file uploads (file-send extractor) or channel-description writes (set-purpose
+/// marker, which has no DM-only guard and would pass its `target == current` authz
+/// on a relayed body).
 pub fn strip_file_send_markers(body: &str) -> String {
-    if !body.contains(FILE_SEND_MARKER_PREFIX) {
+    if !body.contains(FILE_SEND_MARKER_PREFIX) && !body.contains(SET_PURPOSE_MARKER_PREFIX) {
         return body.to_string();
     }
     body.split('\n')
         .filter(|line| {
             let trimmed = line.trim();
-            !(trimmed.starts_with(FILE_SEND_MARKER_PREFIX)
-                && trimmed.ends_with(FILE_SEND_MARKER_SUFFIX))
+            let is_marker = |prefix: &str| {
+                trimmed.starts_with(prefix) && trimmed.ends_with(FILE_SEND_MARKER_SUFFIX)
+            };
+            !(is_marker(FILE_SEND_MARKER_PREFIX) || is_marker(SET_PURPOSE_MARKER_PREFIX))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -652,6 +664,21 @@ mod tests {
     #[test]
     fn strip_fast_path_no_marker() {
         let body = "plain text";
+        let r = strip_file_send_markers(body);
+        assert_eq!(r, body);
+    }
+
+    #[test]
+    fn strip_removes_set_purpose_marker_lines() {
+        // a relayed body must not be able to rewrite a channel description
+        let body = "hi\n<<openab-set-purpose text=\"Branches:\\n be: x\">>\nbye";
+        let r = strip_file_send_markers(body);
+        assert_eq!(r, "hi\nbye");
+    }
+
+    #[test]
+    fn strip_preserves_inline_set_purpose_text() {
+        let body = "use `<<openab-set-purpose text=\"x\">>` to set it";
         let r = strip_file_send_markers(body);
         assert_eq!(r, body);
     }

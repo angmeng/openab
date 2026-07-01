@@ -36,6 +36,20 @@ const FILE_SEND_MAX_BYTES: u64 = 100 * 1024 * 1024;
 const CREATE_CHANNEL_MARKER_PREFIX: &str = "<<openab-create-channel ";
 const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
 
+/// Marker syntax for setting a channel's description (Slack calls it the channel
+/// "purpose") — e.g. the S6 `Branches:` block that a PM bot mirrors into the ticket
+/// channel. Line-anchored like the others. `channel=` is optional (defaults to the
+/// channel the reply is posted in); `text="…"` is the purpose, with literal `\n`
+/// decoded to real newlines for multi-line blocks. Needs `channels:manage` /
+/// `groups:write` (same scope the create path uses).
+/// `<<openab-set-purpose [channel=C123] text="Branches:\n  be: …\n  fe: …">>`
+///
+/// Like the file-send marker, this MUST be neutralized in relay bodies — see
+/// `relay::strip_file_send_markers` (keep the prefix string in sync there) — so a
+/// peer-relayed message can't trigger a channel-description write.
+const SET_PURPOSE_MARKER_PREFIX: &str = "<<openab-set-purpose ";
+const SET_PURPOSE_MARKER_SUFFIX: &str = ">>";
+
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
 /// outside this map will fall back to `grey_question`.
@@ -169,6 +183,13 @@ pub struct SlackAdapter {
     /// each potentially containing the file-send marker. Without dedup we'd
     /// re-upload the same file dozens of times. Cleared once per session restart.
     file_upload_cache: tokio::sync::Mutex<HashSet<String>>,
+    /// Dedup for the `<<openab-set-purpose>>` side-effect, same rationale as
+    /// `file_upload_cache`: finalization can arrive via send_message, a direct
+    /// edit_message (cosmetic post+edit path), or stream_finish, and edit_message
+    /// may fire per streaming delta — so key on (channel, thread, purpose) and
+    /// call `conversations.setPurpose` at most once per unique description.
+    /// Rolled back on failure/refusal so a corrected retry can re-apply.
+    purpose_set_cache: tokio::sync::Mutex<HashSet<String>>,
     /// Channel allowlist (from `[slack].allowed_channels`), shared mutable so a
     /// channel the bot CREATES (via the `<<openab-create-channel>>` marker) or is
     /// INVITED into can be added at runtime — otherwise the bot is deaf in its
@@ -217,6 +238,7 @@ impl SlackAdapter {
             streams: tokio::sync::Mutex::new(HashMap::new()),
             event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
+            purpose_set_cache: tokio::sync::Mutex::new(HashSet::new()),
             allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
             config_path,
         }
@@ -595,6 +617,86 @@ impl SlackAdapter {
         Ok(channel_id)
     }
 
+    /// Set a channel's description (Slack calls this the channel "purpose") —
+    /// e.g. the S6 `Branches:` block. Required bot scope: `channels:manage`
+    /// (public) / `groups:write` (private) — the same scope the create path uses.
+    /// `api_post` turns a non-`ok` Slack response into an `Err` carrying the code
+    /// (e.g. `missing_scope`, `not_in_channel`), so the caller surfaces it.
+    async fn set_channel_purpose_in_slack(&self, channel_id: &str, purpose: &str) -> Result<()> {
+        self.api_post(
+            "conversations.setPurpose",
+            serde_json::json!({ "channel": channel_id, "purpose": purpose }),
+        )
+        .await?;
+        info!(channel_id = %channel_id, "slack: channel purpose (description) set");
+        Ok(())
+    }
+
+    /// Process a set-purpose marker in outbound content: apply the side-effect
+    /// ONCE (if the marker is valid and the target is authorized) and return the
+    /// message body to display — the stripped residual plus a refuse/error note
+    /// (empty note on success, where the updated description speaks for itself).
+    /// Returns `None` when there is no marker (caller keeps the original content).
+    ///
+    /// Shared by the send-once path (`send_message`) and the streaming finalizer
+    /// (`stream_finish`) so the side-effect runs exactly once per reply and the
+    /// outcome is reported accurately in both — NOT per streaming delta.
+    async fn apply_set_purpose_marker(&self, channel: &ChannelRef, content: &str) -> Option<String> {
+        let (residual, maybe_spec) = extract_set_purpose_marker(content)?;
+        let residual = residual.trim();
+        // Compose the display body: stripped residual + an optional note.
+        let body = |note: &str| -> String {
+            match (residual.is_empty(), note.is_empty()) {
+                (true, true) => "📌 Channel description updated.".to_string(),
+                (true, false) => note.to_string(),
+                (false, true) => residual.to_string(),
+                (false, false) => format!("{residual}\n\n{note}"),
+            }
+        };
+
+        let Some(spec) = maybe_spec else {
+            // Malformed marker: no side-effect, just strip + surface (idempotent).
+            return Some(body("⚠️ (ignored a malformed set-purpose marker)"));
+        };
+
+        let current = channel.channel_id.as_str();
+        let target = spec.channel.as_deref().unwrap_or(current);
+
+        // Dedup: apply a given (channel, thread, purpose) at most once. edit_message
+        // fires per streaming delta and finalization can arrive via several sinks, so
+        // without this the same description would be written repeatedly.
+        let key = format!(
+            "{target}\u{1f}{}\u{1f}{}",
+            channel.thread_id.as_deref().unwrap_or(""),
+            spec.purpose
+        );
+        let claimed = self.purpose_set_cache.lock().await.insert(key.clone());
+        if !claimed {
+            // Already applied this exact description in this thread — just display.
+            return Some(body(""));
+        }
+
+        // Authorization: only the current channel or one already in the runtime
+        // allowlist — a prompt-injected `channel=` must not rewrite any channel the
+        // bot token can manage. Roll back the claim so a corrected retry can re-apply.
+        let authorized =
+            target == current || self.allowed_channels.read().await.contains(target);
+        if !authorized {
+            self.purpose_set_cache.lock().await.remove(&key);
+            return Some(body(&format!(
+                "⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist"
+            )));
+        }
+
+        match self.set_channel_purpose_in_slack(target, &spec.purpose).await {
+            Ok(()) => Some(body("")),
+            Err(e) => {
+                self.purpose_set_cache.lock().await.remove(&key);
+                Some(body(&format!("⚠️ Failed to set channel description: {e}")))
+            }
+        }
+    }
+
     /// Resolve a Slack user ID to display name via users.info API.
     /// Results are cached for 5 minutes to avoid hitting Slack rate limits.
     async fn resolve_user_name(&self, user_id: &str) -> Option<String> {
@@ -912,6 +1014,22 @@ impl ChatAdapter for SlackAdapter {
             return self.send_plain_text(channel, &body).await;
         }
 
+        // Set a channel's description (Slack "purpose") — e.g. the S6 Branches:
+        // block a PM bot mirrors into the ticket channel (send-once path). The
+        // shared helper applies setPurpose once + reports the outcome, then we fall
+        // through with the marker-stripped body so a `<<openab-send-file>>` marker in
+        // the SAME reply is still handled below (and the raw marker never reaches
+        // Slack). If there's no file marker either, the body posts via the normal
+        // path at the end of this function.
+        let purpose_body: String;
+        let content: &str = match self.apply_set_purpose_marker(channel, content).await {
+            Some(body) => {
+                purpose_body = body;
+                &purpose_body
+            }
+            None => content,
+        };
+
         // Scan for file-send markers `<<openab-send-file PATH>>`. If found,
         // intercept: post the residual text (caption) first, then upload each
         // file via Slack's files API. Returns the MessageRef of the last action.
@@ -1034,6 +1152,20 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        // Set-purpose marker: apply the side-effect (deduped via purpose_set_cache)
+        // and swap in the display body. Finalization can arrive HERE directly — the
+        // cosmetic post+edit path finalizes via edit_message, not stream_finish — so
+        // the side-effect must run here too; the cache makes the repeated cumulative-
+        // delta edits of the degraded path safe (setPurpose fires once per purpose).
+        let cleaned: String;
+        let content: &str = match self.apply_set_purpose_marker(&msg.channel, content).await {
+            Some(b) => {
+                cleaned = b;
+                &cleaned
+            }
+            None => content,
+        };
+
         // Marker handling for the streaming path: OpenAB streams the final agent
         // response via repeated edit_message calls against a placeholder. If the
         // text contains file-send markers, strip them from the edit (so the
@@ -1223,6 +1355,9 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
+        // Set-purpose markers are handled in edit_message (which this calls below)
+        // and send_message (the fallback), both deduped via purpose_set_cache — so
+        // the side-effect fires once regardless of which finalization sink runs.
         let ts = &msg.message_id;
         let active = {
             let map = self.streams.lock().await;
@@ -2556,6 +2691,83 @@ fn parse_create_channel_args(inner: &str) -> Option<CreateChannelSpec> {
     })
 }
 
+struct SetPurposeSpec {
+    /// Target channel id. `None` = the channel the reply is posted in.
+    channel: Option<String>,
+    /// Purpose text, with `\n`/`\t` already decoded to real whitespace.
+    purpose: String,
+}
+
+/// Parse outbound text for a single set-purpose marker
+/// `<<openab-set-purpose [channel=C123] text="…">>`. Line-anchored like the
+/// create-channel marker (must occupy its own trimmed line). Returns the residual
+/// text (marker line stripped) plus the spec.
+fn extract_set_purpose_marker(content: &str) -> Option<(String, Option<SetPurposeSpec>)> {
+    if !content.contains(SET_PURPOSE_MARKER_PREFIX) {
+        return None;
+    }
+
+    let mut saw_marker = false;
+    let mut spec: Option<SetPurposeSpec> = None;
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if !saw_marker
+            && trimmed.starts_with(SET_PURPOSE_MARKER_PREFIX)
+            && trimmed.ends_with(SET_PURPOSE_MARKER_SUFFIX)
+        {
+            saw_marker = true;
+            let inner = trimmed[SET_PURPOSE_MARKER_PREFIX.len()
+                ..trimmed.len() - SET_PURPOSE_MARKER_SUFFIX.len()]
+                .trim();
+            // parse may fail (empty/invalid text) → spec stays None, but the line is
+            // stripped either way so the raw marker never leaks to the channel.
+            spec = parse_set_purpose_args(inner);
+            continue;
+        }
+        kept_lines.push(line);
+    }
+
+    // Outer Some = "a marker line was seen and stripped"; inner Option = the parsed
+    // spec (None if malformed → caller just posts the stripped residual).
+    saw_marker.then(|| (kept_lines.join("\n"), spec))
+}
+
+/// Parse the inner args of a set-purpose marker. Grammar:
+///   text="<free text, \n = newline>"   (required)
+///   channel=<C-id>                      (optional; default = current channel)
+fn parse_set_purpose_args(inner: &str) -> Option<SetPurposeSpec> {
+    // Pull out text="..." first (it may contain spaces/decoded newlines), then
+    // parse the rest as whitespace-separated tokens.
+    let mut rest = inner.to_string();
+    let mut purpose: Option<String> = None;
+    if let Some(start) = rest.find("text=\"") {
+        let after = start + "text=\"".len();
+        if let Some(end_rel) = rest[after..].find('"') {
+            let t = &rest[after..after + end_rel];
+            if !t.trim().is_empty() {
+                // decode literal \n / \t so multi-line blocks (Branches:) render
+                purpose = Some(t.replace("\\n", "\n").replace("\\t", "\t"));
+            }
+            let end = after + end_rel + 1;
+            rest.replace_range(start..end, " ");
+        }
+    }
+
+    let mut channel: Option<String> = None;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("channel=") {
+            let v = v.trim().trim_start_matches('#');
+            if !v.is_empty() {
+                channel = Some(v.to_string());
+            }
+        }
+    }
+
+    purpose.map(|purpose| SetPurposeSpec { channel, purpose })
+}
+
 /// Normalize a requested channel name to Slack's rules: lowercase, only
 /// `a-z0-9` plus hyphen/underscore, spaces/`.`/`/`→hyphen, ≤80 chars.
 fn normalize_channel_name(raw: &str) -> String {
@@ -2853,6 +3065,42 @@ mod tests {
         assert!(!invite_accepted(&owner, Some("TEAMMATE")));
         // fail closed: unknown/absent inviter is rejected when the gate is on
         assert!(!invite_accepted(&owner, None));
+    }
+
+    // --- set-purpose marker ---
+
+    #[test]
+    fn set_purpose_marker_parses_channel_and_decodes_newlines() {
+        let content =
+            "done\n<<openab-set-purpose channel=C123 text=\"Branches:\\n  be: AT-1-x-be\">>\nok";
+        let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        let spec = spec.expect("valid spec");
+        assert_eq!(residual, "done\nok");
+        assert_eq!(spec.channel.as_deref(), Some("C123"));
+        assert_eq!(spec.purpose, "Branches:\n  be: AT-1-x-be");
+    }
+
+    #[test]
+    fn set_purpose_marker_channel_defaults_to_none() {
+        let content = "<<openab-set-purpose text=\"hello\">>";
+        let (residual, spec) = extract_set_purpose_marker(content).expect("marker");
+        let spec = spec.expect("valid spec");
+        assert_eq!(residual, "");
+        assert!(spec.channel.is_none());
+        assert_eq!(spec.purpose, "hello");
+    }
+
+    #[test]
+    fn set_purpose_marker_absent_is_none_malformed_is_stripped_not_leaked() {
+        // no marker at all → None
+        assert!(extract_set_purpose_marker("no marker here").is_none());
+        // marker present but empty text → seen+stripped (Some residual), spec None,
+        // so the caller posts the residual and the raw marker never leaks (P3 fix).
+        let (residual, spec) =
+            extract_set_purpose_marker("before\n<<openab-set-purpose text=\"\">>\nafter")
+                .expect("marker seen");
+        assert_eq!(residual, "before\nafter");
+        assert!(spec.is_none());
     }
 
     // --- builder tests ---
