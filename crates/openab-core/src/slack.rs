@@ -38,10 +38,11 @@ const CREATE_CHANNEL_MARKER_SUFFIX: &str = ">>";
 
 /// Marker syntax for setting a channel's description (Slack calls it the channel
 /// "purpose") — e.g. the S6 `Branches:` block that a PM bot mirrors into the ticket
-/// channel. Line-anchored like the others. `channel=` is optional (defaults to the
-/// channel the reply is posted in); `text="…"` is the purpose, with literal `\n`
-/// decoded to real newlines for multi-line blocks. Needs `channels:manage` /
-/// `groups:write` (same scope the create path uses).
+/// channel. Line-anchored like the others. `channel=` is optional and, when given,
+/// must equal the channel the reply is posted in (the only authorized target — a
+/// prompt-injected `channel=` must not reach across channels); `text="…"` is the
+/// purpose, with literal `\n` decoded to real newlines for multi-line blocks.
+/// Needs `channels:manage` / `groups:write` (same scope the create path uses).
 /// `<<openab-set-purpose [channel=C123] text="Branches:\n  be: …\n  fe: …">>`
 ///
 /// Like the file-send marker, this MUST be neutralized in relay bodies — see
@@ -676,15 +677,15 @@ impl SlackAdapter {
             return Some(body(""));
         }
 
-        // Authorization: only the current channel or one already in the runtime
-        // allowlist — a prompt-injected `channel=` must not rewrite any channel the
-        // bot token can manage. Roll back the claim so a corrected retry can re-apply.
-        let authorized =
-            target == current || self.allowed_channels.read().await.contains(target);
-        if !authorized {
+        // Authorization: only the channel the reply is posted in. The bot may
+        // describe any channel it's been invited into, but only from a conversation
+        // *inside* that channel — a prompt-injected `channel=` must not reach across
+        // to other channels (allowlisted or not). Roll back the claim so a corrected
+        // retry can re-apply.
+        if target != current {
             self.purpose_set_cache.lock().await.remove(&key);
             return Some(body(&format!(
-                "⚠️ set-purpose refused: `{target}` is not this channel or in the allowlist"
+                "⚠️ set-purpose refused: `{target}` is not this channel — descriptions can only be set from inside the target channel"
             )));
         }
 
