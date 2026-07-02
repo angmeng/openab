@@ -583,11 +583,26 @@ impl SessionPool {
                 "params": {"sessionId": session_id}
             }))?;
             tracing::info!(session_id, "reset: sending session/cancel");
-            use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
+            // Bound the cancel write: if the child's stdin is the thing that's
+            // wedged (pipe buffer full, agent not draining), this write would
+            // block forever and turn reset into a hang. Cancel is best-effort;
+            // the state cleanup below is the actual recovery.
+            let cancel_write = async {
+                use tokio::io::AsyncWriteExt;
+                let mut w = stdin.lock().await;
+                let _ = w.write_all(data.as_bytes()).await;
+                let _ = w.write_all(b"\n").await;
+                let _ = w.flush().await;
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(5), cancel_write)
+                .await
+                .is_err()
+            {
+                warn!(
+                    session_id,
+                    "reset: session/cancel write timed out; proceeding with state cleanup"
+                );
+            }
         }
 
         let mut state = self.state.write().await;

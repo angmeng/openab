@@ -627,9 +627,11 @@ async fn consumer_loop(
         // send, a stuck upload, a future hang the recv-loop's prompt_hard_timeout
         // doesn't cover) would pin this lane forever and silently queue every
         // later message on the same (thread, sender) key. Bound the whole batch
-        // with a wall-clock timeout; on expiry we log and loop, freeing the lane.
-        // The agent turn may keep running detached, but the lane is no longer
-        // blocked — the next message gets a fresh turn.
+        // with a wall-clock timeout; on expiry, reset the session (dropping the
+        // future frees the lane but leaves the wedged connection in the pool —
+        // without a reset the next message reacquires it and wedges again for a
+        // full watchdog period, forever) and tell the user, so silence doesn't
+        // masquerade as "still thinking".
         let watchdog = target.batch_watchdog_timeout();
         if tokio::time::timeout(
             watchdog,
@@ -649,8 +651,16 @@ async fn consumer_loop(
                 thread_key = %thread_key,
                 channel = %thread_channel.channel_id,
                 watchdog_secs = watchdog.as_secs(),
-                "dispatch_batch exceeded per-lane watchdog — abandoning batch so the lane can drain"
+                "dispatch_batch exceeded per-lane watchdog — resetting session and abandoning batch"
             );
+            let session_key = Dispatcher::session_key(&thread_channel);
+            target.reset_session(&session_key).await;
+            let _ = adapter
+                .send_message(
+                    &thread_channel,
+                    "⚠️ This turn timed out and the session was reset — please resend your last message.",
+                )
+                .await;
         }
     }
 }
