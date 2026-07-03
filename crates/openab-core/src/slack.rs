@@ -191,6 +191,11 @@ pub struct SlackAdapter {
     /// call `conversations.setPurpose` at most once per unique description.
     /// Rolled back on failure/refusal so a corrected retry can re-apply.
     purpose_set_cache: tokio::sync::Mutex<HashSet<String>>,
+    /// Peer-bot roster (name, user_id) from `~/.openab/known-bots.md`, loaded
+    /// once at construction. Powers the outbound `@Name` → `<@UID>` handoff
+    /// rewrite in send_message and the `peer_bots` field injected into
+    /// sender_context for bot-sender messages. Empty when the file is absent.
+    known_bots: Vec<(String, String)>,
     /// Channel allowlist (from `[slack].allowed_channels`), shared mutable so a
     /// channel the bot CREATES (via the `<<openab-create-channel>>` marker) or is
     /// INVITED into can be added at runtime — otherwise the bot is deaf in its
@@ -218,6 +223,10 @@ impl SlackAdapter {
         allowed_channels: HashSet<String>,
         config_path: Option<std::path::PathBuf>,
     ) -> Self {
+        let known_bots = known_bots_roster();
+        if !known_bots.is_empty() {
+            info!(count = known_bots.len(), "slack: loaded peer-bot roster (known-bots.md)");
+        }
         Self {
             // Bound every Slack Web API call; an unbounded inline gating call in the
             // read loop could otherwise stall the Socket Mode idle-timeout watchdog.
@@ -240,6 +249,7 @@ impl SlackAdapter {
             event_dedup: tokio::sync::Mutex::new(FifoSet::new(EVENT_DEDUP_MAX)),
             file_upload_cache: tokio::sync::Mutex::new(HashSet::new()),
             purpose_set_cache: tokio::sync::Mutex::new(HashSet::new()),
+            known_bots,
             allowed_channels: Arc::new(tokio::sync::RwLock::new(allowed_channels)),
             config_path,
         }
@@ -979,6 +989,18 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        // Handoff safety net: turn plain-text `@Name` peer-bot references into
+        // literal <@UID> mentions before any other processing, so every branch
+        // below (markers, plain post) inherits the rewrite. Without a literal
+        // mention the target bot's inbound gate silently drops the handoff.
+        let mention_resolved: String;
+        let content: &str = if self.known_bots.is_empty() || !content.contains('@') {
+            content
+        } else {
+            mention_resolved = resolve_peer_bot_mentions(content, &self.known_bots);
+            &mention_resolved
+        };
+
         // Owner-triggered channel creation (DM-only). Runs before the file-send
         // check so the marker line is stripped regardless of outcome.
         if let Some((residual, spec)) = extract_create_channel_marker(content) {
@@ -2430,6 +2452,23 @@ async fn handle_message(
             if let Some(tid) = obj.remove("thread_id") {
                 obj.insert("thread_ts".to_string(), tid);
             }
+            // Peer-bot roster for handoffs (injected rule A7c): a bot-sender
+            // message usually means a bot-to-bot exchange where our reply may
+            // need to hand the turn onward with a literal <@UID> mention. Give
+            // the agent the name→user_id map in-context so it doesn't have to
+            // guess (guessed plain-text names are how handoffs die). Self is
+            // excluded; human-sender messages stay lean.
+            if is_bot_msg && !adapter.known_bots.is_empty() {
+                let peers: serde_json::Map<String, serde_json::Value> = adapter
+                    .known_bots
+                    .iter()
+                    .filter(|(_, uid)| Some(uid.as_str()) != bot_id)
+                    .map(|(name, uid)| (name.clone(), serde_json::Value::String(uid.clone())))
+                    .collect();
+                if !peers.is_empty() {
+                    obj.insert("peer_bots".to_string(), serde_json::Value::Object(peers));
+                }
+            }
         }
         v.to_string()
     };
@@ -2559,6 +2598,92 @@ fn text_mentions_uid(text: &str, uid: &str) -> bool {
     let prefix = format!("<@{uid}");
     text.match_indices(&prefix)
         .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
+}
+
+/// Load the peer-bot roster from `~/.openab/known-bots.md` (the artifact
+/// `registry-sync.sh apply` generates; path overridable via
+/// OPENAB_KNOWN_BOTS_FILE — same convention as the team system prompt in
+/// acp/pool.rs). Returns (name, user_id) pairs. Fail-open: missing/unreadable
+/// file → empty roster → the mention resolver and peer_bots injection are
+/// no-ops. Loaded once at adapter construction: `apply registry` rewrites the
+/// file and schedules a bridge restart, so the roster is stable per process.
+fn known_bots_roster() -> Vec<(String, String)> {
+    let path = std::env::var("OPENAB_KNOWN_BOTS_FILE")
+        .unwrap_or_else(|_| "~/.openab/known-bots.md".to_string());
+    let resolved = match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(rest)),
+        None => Some(std::path::PathBuf::from(&path)),
+    };
+    resolved
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| parse_known_bots(&s))
+        .unwrap_or_default()
+}
+
+/// Parse the known-bots.md table: rows are
+/// `| \`U…\` | \`B…\` | Name | Owner | … |`. Only rows whose first cell is a
+/// backticked U-id count; header/separator rows fall out naturally.
+fn parse_known_bots(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                return None;
+            }
+            let cells: Vec<&str> = line.split('|').map(|c| c.trim().trim_matches('`')).collect();
+            // split on '|' yields a leading empty cell: [ "", uid, bot_id, name, … ]
+            let uid = cells.get(1)?.trim();
+            let name = cells.get(3)?.trim();
+            if uid.starts_with('U') && uid[1..].chars().all(|c| c.is_ascii_alphanumeric()) && !name.is_empty() {
+                Some((name.to_string(), uid.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Rewrite plain-text `@Name` tokens for known peer bots into literal `<@UID>`
+/// mentions. A plain `@Kuro` posted by the agent never fires the peer's
+/// app_mention (Slack only parses mentions built via autocomplete/API syntax),
+/// so a handoff written that way is silently dropped by the target's inbound
+/// gate and the flow dies (observed 2026-07-03: "Your move, Mochi."). Slack
+/// analog of relay::resolve_discord_mentions, with word-boundary +
+/// case-insensitive matching so `@Kuros` or `a@Kuro` are left alone. Names
+/// come from the known-bots roster; empty roster or no `@` → no-op.
+fn resolve_peer_bot_mentions(text: &str, roster: &[(String, String)]) -> String {
+    if roster.is_empty() || !text.contains('@') {
+        return text.to_string();
+    }
+    let mut names: Vec<&str> = roster.iter().map(|(n, _)| n.as_str()).collect();
+    // Longest-first so an alternation like (Baby|BabyCat) can't short-match.
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let alternation = names
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    // No lookbehind in the regex crate: capture the preceding boundary char
+    // (start-of-text or non-word, excluding '<' so `<@U…>` wire forms are
+    // untouched) and re-emit it in the replacement.
+    let rx = match regex::Regex::new(&format!(r"(?i)(^|[^\w<@])@({alternation})\b")) {
+        Ok(rx) => rx,
+        Err(_) => return text.to_string(),
+    };
+    let map: HashMap<String, &str> = roster
+        .iter()
+        .map(|(n, uid)| (n.to_lowercase(), uid.as_str()))
+        .collect();
+    rx.replace_all(text, |caps: &regex::Captures| {
+        match map.get(&caps[2].to_lowercase()) {
+            Some(uid) => format!("{}<@{}>", &caps[1], uid),
+            None => caps[0].to_string(),
+        }
+    })
+    .into_owned()
 }
 
 fn bot_id_matches_trusted(
@@ -3010,6 +3135,58 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- peer-bot roster + outbound handoff mention rewrite ---
+
+    const ROSTER_MD: &str = "\
+# Atlas AI Team — Known Bots
+
+| Slack user_id | Slack bot_id | Name | Owner | Owned domains | Primary domains |
+|---|---|---|---|---|---|
+| `U0B6FQF0GTD` | `B0B7GEE6GSC` | Ayako | Joe | atlas-frontend | — |
+| `U0B6NL6P1RT` | `B0B6VL2D24C` | Kuro | Kelvin | atlas-mobile | — |
+| `U0B9CTE36Q3` | `B0B93QEP9GX` | Mochi | Beng | atlas-qa | — |
+| `U0BBYPK0VEW` | `B0BC0JY85R7` | BabyCat | MinJie | atlas-frontend | — |
+";
+
+    #[test]
+    fn parse_known_bots_reads_table_rows_only() {
+        let roster = parse_known_bots(ROSTER_MD);
+        assert_eq!(roster.len(), 4); // header + separator rows excluded
+        assert!(roster.contains(&("Ayako".to_string(), "U0B6FQF0GTD".to_string())));
+        assert!(roster.contains(&("BabyCat".to_string(), "U0BBYPK0VEW".to_string())));
+    }
+
+    #[test]
+    fn peer_mention_rewrite_at_names_only() {
+        let roster = parse_known_bots(ROSTER_MD);
+        // @Name (any case) becomes a literal mention…
+        assert_eq!(
+            resolve_peer_bot_mentions("Your move, @Kuro.", &roster),
+            "Your move, <@U0B6NL6P1RT>."
+        );
+        assert_eq!(
+            resolve_peer_bot_mentions("@ayako take X", &roster),
+            "<@U0B6FQF0GTD> take X"
+        );
+        // …but a bare name without @ is narrative text, left alone.
+        assert_eq!(
+            resolve_peer_bot_mentions("Your move, Mochi.", &roster),
+            "Your move, Mochi."
+        );
+        // Word boundary: longer identifiers and infix @ are not rewritten.
+        assert_eq!(
+            resolve_peer_bot_mentions("@Kuros is not a bot; mail joe@kuro.dev", &roster),
+            "@Kuros is not a bot; mail joe@kuro.dev"
+        );
+        // Existing wire-form mentions pass through untouched.
+        assert_eq!(
+            resolve_peer_bot_mentions("<@U0B6NL6P1RT> already tagged", &roster),
+            "<@U0B6NL6P1RT> already tagged"
+        );
+        // Empty roster is a no-op.
+        assert_eq!(resolve_peer_bot_mentions("@Kuro hi", &[]), "@Kuro hi");
+    }
 
     // --- user gate (per-surface DM override) ---
 
