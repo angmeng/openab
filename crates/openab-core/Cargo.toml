@@ -21,7 +21,8 @@ futures-util = "0.3"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json", "blocking", "stream"] }
+bytes = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 unicode-width = "0.2"
@@ -51,6 +52,9 @@ http = { version = "1", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [features]
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]
 discord = ["dep:serenity"]
@@ -58,4 +62,5 @@ slack = []
 secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 config-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 pre-seed = ["dep:aws-sdk-s3", "dep:aws-config", "dep:zip", "dep:hex", "dep:flate2", "dep:tar"]
+filestore = ["dep:aws-sdk-s3", "dep:aws-config"]
 agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:urlencoding", "dep:hex", "dep:http", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]

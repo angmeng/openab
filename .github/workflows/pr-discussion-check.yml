@@ -30,7 +30,7 @@ jobs:
             const marker = '<!-- openab-pr-discussion-check -->';
             const label = 'closing-soon';
 
-            const hasDiscordUrl = /https:\/\/discord\.com\/channels\/\d+\/\d+/.test(body);
+            const hasDiscordUrl = /https:\/\/(discord\.com|discordapp\.com)\/channels\/\d+\/\d+/.test(body);
 
             const comments = await github.rest.issues.listComments({
               ...context.repo,

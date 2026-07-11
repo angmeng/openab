@@ -57,7 +57,33 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
 # streaming = true                      # enable streaming (typewriter) mode
+#                                       # note: LINE has no message-edit API, so it is always
+#                                       #       send-once (streaming is forced off to avoid
+#                                       #       posting duplicate, growing messages)
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
+
+# --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---
+# Config-authoritative with ${} expansion; each field falls back to its
+# TELEGRAM_* env var when unset, then to a default. Symmetric with [discord].
+# [telegram]
+# bot_token           = "${TELEGRAM_BOT_TOKEN}"     # env fallback: TELEGRAM_BOT_TOKEN
+# secret_token        = "${TELEGRAM_SECRET_TOKEN}"  # env fallback: TELEGRAM_SECRET_TOKEN
+# trusted_source_only = true            # reject IPs outside Telegram subnets (default false)
+# rich_messages       = true            # sendRichMessage rendering (default true)
+# streaming           = true            # override; defaults to follow rich_messages
+# webhook_path        = "/webhook/telegram"   # default /webhook/telegram
+
+# --- LINE (first-class trust section; replaces uniform GATEWAY_* env for LINE) ---
+# L3 identity trust for the LINE adapter (identity-trust-none ADR). Each field
+# falls back to its LINE_* env var when unset, then to deny-all. Channel
+# credentials stay on LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN env vars.
+# NOTE: relying on GATEWAY_ALLOW_ALL_USERS / GATEWAY_ALLOWED_USERS for LINE is
+# deprecated (warns at startup; becomes an error in Phase 2).
+# [line]
+# allow_all_users = false               # true = any user; omitted/false = deny-all except allowed_users
+#                                       # env fallback: LINE_ALLOW_ALL_USERS
+# allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
+#                                       # env fallback: LINE_ALLOWED_USERS (comma-separated)
 
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
@@ -166,6 +192,9 @@ session_ttl_hours = 24
 # prompt_hard_timeout_secs = 1800
 # Liveness-check cadence (sec) for the recv loop; see #732. Default: 30.
 # liveness_check_secs = 30
+# Grace (sec) past prompt_hard_timeout_secs before a hung in-flight session is
+# force-evicted from the pool. Default: 120.
+# hung_grace_secs = 120
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

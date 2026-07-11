@@ -40,6 +40,31 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
+/// Gateway platforms whose messaging API cannot edit a message after it is sent.
+///
+/// Cosmetic (typewriter) streaming works by posting a placeholder and then
+/// repeatedly editing it in place with the growing text. On a platform with no
+/// edit endpoint, each of those "edits" is delivered as a brand-new message
+/// instead — so the user sees the same reply posted several times, each copy
+/// longer than the last. Streaming is therefore force-disabled (send-once) for
+/// these platforms regardless of the configured `streaming` flag.
+///
+/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
+/// (The in-process unified adapter additionally hard-drops stray edit_message
+/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
+///
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
+/// for a *capability*. The right long-term model is a capability handshake at
+/// gateway-connect time ("can this adapter edit messages?"); until that exists,
+/// any new gateway platform that lacks a message-edit API MUST be added here.
+const NON_EDITABLE_PLATFORMS: &[&str] = &["line"];
+
+/// Whether cosmetic streaming (placeholder + in-place edits) is possible on
+/// `platform`. See `NON_EDITABLE_PLATFORMS`.
+fn platform_supports_streaming(platform: &str) -> bool {
+    !NON_EDITABLE_PLATFORMS.contains(&platform)
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -208,6 +233,7 @@ pub struct GatewayAdapter {
     platform_name: &'static str,
     streaming: bool,
     streaming_placeholder: bool,
+    telegram_rich_messages: bool,
 }
 
 impl GatewayAdapter {
@@ -217,6 +243,7 @@ impl GatewayAdapter {
         platform_name: &'static str,
         streaming: bool,
         streaming_placeholder: bool,
+        telegram_rich_messages: bool,
     ) -> Self {
         Self {
             ws_tx,
@@ -224,6 +251,7 @@ impl GatewayAdapter {
             platform_name,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         }
     }
 
@@ -705,6 +733,13 @@ impl ChatAdapter for GatewayAdapter {
     fn show_streaming_placeholder(&self) -> bool {
         self.streaming_placeholder
     }
+
+    fn renders_native_tables(&self, _platform: &str) -> bool {
+        // Telegram renders markdown tables natively via Rich Messages;
+        // skip the table→code-block pre-pass for that platform only when
+        // Rich Messages is confirmed enabled.
+        self.platform_name == "telegram" && self.telegram_rich_messages
+    }
 }
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
@@ -723,6 +758,7 @@ pub struct GatewayParams {
     pub trusted_bot_ids: Vec<String>,
     pub streaming: bool,
     pub streaming_placeholder: bool,
+    pub telegram_rich_messages: bool,
     pub stt: crate::config::SttConfig,
 }
 
@@ -731,6 +767,7 @@ pub async fn run_gateway_adapter(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
     router: Arc<crate::adapter::AdapterRouter>,
+    #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
@@ -743,8 +780,21 @@ pub async fn run_gateway_adapter(
     let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
-    let streaming = params.streaming;
+    // Cosmetic streaming edits a placeholder in place. On platforms without an
+    // edit API (e.g. LINE) every edit lands as a new message — growing
+    // duplicates — so force send-once mode there regardless of config.
+    let streaming = if params.streaming && !platform_supports_streaming(platform) {
+        warn!(
+            platform,
+            "streaming is enabled but this platform cannot edit messages; \
+             forcing send-once mode to avoid duplicate messages"
+        );
+        false
+    } else {
+        params.streaming
+    };
     let streaming_placeholder = params.streaming_placeholder;
+    let telegram_rich_messages = params.telegram_rich_messages;
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -795,6 +845,7 @@ pub async fn run_gateway_adapter(
             platform,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -946,10 +997,49 @@ pub async fn run_gateway_adapter(
                                             }
                                             "text_file" => {
                                                 if let Ok(bytes) = bytes_result {
-                                                    let text = String::from_utf8_lossy(&bytes);
-                                                    extra_blocks.push(ContentBlock::Text {
-                                                        text: format!("```{}\n{}\n```", att.filename, text),
-                                                    });
+                                                    let safe_filename: String = att.filename
+                                                        .chars()
+                                                        .filter(|c| !c.is_control())
+                                                        .take(200)
+                                                        .collect();
+                                                    let size = bytes.len() as u64;
+                                                    if size <= crate::media::TEXT_INLINE_LIMIT {
+                                                        let text = String::from_utf8_lossy(&bytes);
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                        });
+                                                    } else {
+                                                        // Large file — upload to filestore if available
+                                                        #[cfg(feature = "filestore")]
+                                                        if let Some(ref fs) = filestore {
+                                                            if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                                                extra_blocks.push(block);
+                                                            } else {
+                                                                // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                                                let size_kb = bytes.len() / 1024;
+                                                                tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!(
+                                                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                                                    ),
+                                                                });
+                                                            }
+                                                        } else {
+                                                            // No filestore configured — fall back to inline (original behavior)
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                        #[cfg(not(feature = "filestore"))]
+                                                        {
+                                                            // Feature not compiled — inline as before
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             }
                                             "audio" if stt_config.enabled => {
@@ -1132,6 +1222,8 @@ pub struct GatewayEventContext {
     pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
 }
 
 /// Process a single gateway event JSON string and submit to the dispatcher.
@@ -1140,6 +1232,28 @@ pub struct GatewayEventContext {
 ///
 /// This is the core event-handling logic extracted from the WebSocket handler,
 /// made available for the unified binary to call directly from axum webhook handlers.
+/// Throttle for request-access echoes: at most one echo per (platform, sender)
+/// per [`ECHO_WINDOW`], to prevent an untrusted spammer from being amplified by
+/// the bot's replies.
+static ECHO_THROTTLE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Returns true if an echo to `key` is allowed now (and records the timestamp).
+fn echo_allowed(key: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = ECHO_THROTTLE.lock().unwrap();
+    match map.get(key) {
+        Some(prev) if now.duration_since(*prev) < ECHO_WINDOW => false,
+        _ => {
+            map.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1147,18 +1261,74 @@ pub async fn process_gateway_event(
     let event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
 
-    // Shared filter logic
+    // Structural gating (bot filter + @mention) stays in should_skip_event.
+    // L2 (channel) + L3 (identity) are now enforced by the shared ingress gate
+    // (`router.gate_incoming`) below, so we neuter should_skip_event's channel/user
+    // checks here by passing allow-all for them.
+    let no_ids: HashSet<String> = HashSet::new();
     let filter = EventFilterParams {
-        allow_all_channels: ctx.allow_all_channels,
-        allowed_channels: &ctx.allowed_channels,
-        allow_all_users: ctx.allow_all_users,
-        allowed_users: &ctx.allowed_users,
+        allow_all_channels: true,
+        allowed_channels: &no_ids,
+        allow_all_users: true,
+        allowed_users: &no_ids,
         allow_bot_messages: ctx.allow_bot_messages,
         trusted_bot_ids: &ctx.trusted_bot_ids,
         bot_username: ctx.bot_username.as_deref(),
     };
     if should_skip_event(&event, &filter) {
         return Ok(false);
+    }
+
+    // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
+    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+    // evaluated against the channel allowlist like any other channel (the
+    // `allow_dm` surface semantics arrive with the per-platform trust flip).
+    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+    let decision =
+        ctx.router
+            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    match decision {
+        crate::trust::Decision::Allow => {}
+        crate::trust::Decision::DenyIdentity => {
+            // L3 identity deny → echo the sender their ID so they can request
+            // access (throttled to avoid amplification). Bots never reach here
+            // (should_skip_event handles bot admission; L3 is human-only).
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                "gateway event denied (identity); echoing request-access"
+            );
+            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
+            if echo_allowed(&throttle_key) {
+                let echo_channel = ChannelRef {
+                    platform: event.platform.clone(),
+                    channel_id: event.channel.id.clone(),
+                    thread_id: event.channel.thread_id.clone(),
+                    parent_id: None,
+                    origin_event_id: Some(event.event_id.clone()),
+                };
+                let echo = format!(
+                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
+                    event.sender.id
+                );
+                let _ = ctx.adapter.send_message(&echo_channel, &echo).await;
+            }
+            return Ok(false);
+        }
+        // DenyScope (and any future variant) → silent drop (scope is not a
+        // security boundary; no request-access echo).
+        _ => {
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                ?decision,
+                "gateway event denied (scope); silent"
+            );
+            return Ok(false);
+        }
     }
 
     tracing::info!(
@@ -1249,10 +1419,49 @@ pub async fn process_gateway_event(
             "text_file" => {
                 match bytes_result {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        extra_blocks.push(ContentBlock::Text {
-                            text: format!("```{}\n{}\n```", att.filename, text),
-                        });
+                        let safe_filename: String = att.filename
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect();
+                        let size = bytes.len() as u64;
+                        if size <= crate::media::TEXT_INLINE_LIMIT {
+                            let text = String::from_utf8_lossy(&bytes);
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                            });
+                        } else {
+                            // Large file — upload to filestore if available
+                            #[cfg(feature = "filestore")]
+                            if let Some(ref fs) = ctx.filestore {
+                                if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                    extra_blocks.push(block);
+                                } else {
+                                    // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                    let size_kb = bytes.len() / 1024;
+                                    tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                    extra_blocks.push(ContentBlock::Text {
+                                        text: format!(
+                                            "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                        ),
+                                    });
+                                }
+                            } else {
+                                // No filestore configured — fall back to inline (original behavior)
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                            #[cfg(not(feature = "filestore"))]
+                            {
+                                // Feature not compiled — inline as before
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
@@ -1394,6 +1603,39 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn line_cannot_stream_and_is_forced_send_once() {
+        // LINE has no message-edit API, so cosmetic streaming is impossible.
+        assert!(!platform_supports_streaming("line"));
+    }
+
+    #[test]
+    fn editable_platforms_still_allow_streaming() {
+        for platform in [
+            "telegram",
+            "slack",
+            "discord",
+            "feishu",
+            "teams",
+            "googlechat",
+            "wecom",
+        ] {
+            assert!(
+                platform_supports_streaming(platform),
+                "{platform} should still support streaming",
+            );
+        }
+    }
+
+    #[test]
+    fn echo_allowed_throttles_repeat_within_window() {
+        // Unique key so we don't collide with other tests touching the global map.
+        let key = "test-platform:test-sender-echo-throttle";
+        assert!(echo_allowed(key), "first echo should be allowed");
+        assert!(!echo_allowed(key), "immediate repeat should be throttled");
+        assert!(!echo_allowed(key), "still throttled within the window");
+    }
 
     fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
         serde_json::from_value(serde_json::json!({

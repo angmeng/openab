@@ -22,6 +22,11 @@ const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 /// JPEG quality for compressed output.
 const IMAGE_JPEG_QUALITY: u8 = 75;
 
+/// Maximum file size (in bytes) for inline text content in prompts.
+/// Files larger than this are routed to the filestore (when configured)
+/// instead of being embedded directly in the conversation context.
+pub const TEXT_INLINE_LIMIT: u64 = 512 * 1024; // 512 KB
+
 /// Error variants for `download_and_encode_image`.
 #[derive(Debug)]
 pub enum MediaFetchError {
@@ -465,21 +470,199 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 ///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 ///
+/// When a `filestore` is provided and the file exceeds 512 KB, the file is
+/// uploaded to the object store and a hint block with a presigned URL is
+/// returned instead of the file contents.
+///
 /// Note: the caller already guards total size via a total cap; the per-file
 /// MAX_SIZE check here is intentional defense-in-depth so this function remains
 /// self-contained and safe when called from other contexts.
+#[cfg(feature = "filestore")]
+pub async fn download_and_read_text_file(
+    url: &str,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+    filestore: Option<&crate::filestore::Filestore>,
+) -> Option<(ContentBlock, u64)> {
+    if size > TEXT_INLINE_LIMIT {
+        // When filestore is available, download the oversized file and upload it.
+        if let Some(fs) = filestore {
+            return download_and_upload_to_filestore(url, filename, size, auth_token, fs).await;
+        }
+        tracing::warn!(filename, size, "text file exceeds inline limit, skipping");
+        return None;
+    }
+
+    download_text_file_inner(url, filename, size, auth_token, filestore).await
+}
+
+/// Download a text-based file and return it as a ContentBlock::Text.
+/// Files larger than 512 KB are skipped to avoid bloating the prompt.
+///
+/// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
+///
+/// Note: the caller already guards total size via a total cap; the per-file
+/// MAX_SIZE check here is intentional defense-in-depth so this function remains
+/// self-contained and safe when called from other contexts.
+#[cfg(not(feature = "filestore"))]
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
 ) -> Option<(ContentBlock, u64)> {
-    const MAX_SIZE: u64 = 512 * 1024; // 512 KB
-
-    if size > MAX_SIZE {
-        tracing::warn!(filename, size, "text file exceeds 512KB limit, skipping");
+    if size > TEXT_INLINE_LIMIT {
+        tracing::warn!(filename, size, "text file exceeds inline limit, skipping");
         return None;
     }
+
+    download_text_file_inner(url, filename, auth_token).await
+}
+
+/// Shared implementation for downloading text files that are within the size limit.
+#[cfg(feature = "filestore")]
+async fn download_text_file_inner(
+    url: &str,
+    filename: &str,
+    _size: u64,
+    auth_token: Option<&str>,
+    filestore: Option<&crate::filestore::Filestore>,
+) -> Option<(ContentBlock, u64)> {
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    // Use extended timeout when filestore is available — Content-Length > 512KB
+    // may trigger streaming upload which needs the full 10-minute window.
+    let timeout = if filestore.is_some() {
+        std::time::Duration::from_secs(600)
+    } else {
+        std::time::Duration::from_secs(30)
+    };
+    let mut req = HTTP_CLIENT.get(url).timeout(timeout);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "text file download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "text file download failed");
+        return None;
+    }
+
+    // Mitigation for underreported size: if Content-Length reveals the file
+    // is larger than the inline limit (512 KB), route to streaming upload
+    // instead of buffering the entire file in memory.
+    if let Some(fs) = filestore {
+        if let Some(content_length) = resp.content_length() {
+            if content_length > TEXT_INLINE_LIMIT {
+                tracing::info!(
+                    url,
+                    content_length,
+                    "Content-Length exceeds inline limit, routing to streaming upload"
+                );
+                // Stream directly to S3 multipart upload
+                const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+                let stream = Box::pin(resp.bytes_stream());
+                let upload_result = tokio::time::timeout(
+                    STREAM_TIMEOUT,
+                    fs.stream_upload_and_presign(filename, stream, content_length, Some("text/plain; charset=utf-8")),
+                )
+                .await;
+                return match upload_result {
+                    Ok(Ok((presigned_url, actual_bytes))) => {
+                        let hint = crate::filestore::format_filestore_hint(
+                            filename, actual_bytes, &presigned_url, fs.presigned_ttl_secs(),
+                        );
+                        tracing::info!(filename, size = actual_bytes, "text file streamed to filestore (inline fallback)");
+                        Some((ContentBlock::Text { text: hint }, 0))
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(filename, error = %e, "filestore stream upload failed (inline fallback)");
+                        let size_kb = content_length / 1024;
+                        let hint = format!(
+                            "[File: {safe_filename}]\n\
+                             This file ({size_kb} KB) could not be uploaded to temporary storage \
+                             (upload failed). The file content is unavailable."
+                        );
+                        Some((ContentBlock::Text { text: hint }, 0))
+                    }
+                    Err(_) => {
+                        tracing::error!(filename, "filestore stream upload timed out (inline fallback)");
+                        let size_kb = content_length / 1024;
+                        let hint = format!(
+                            "[File: {safe_filename}]\n\
+                             This file ({size_kb} KB) upload timed out. \
+                             The file content is unavailable."
+                        );
+                        Some((ContentBlock::Text { text: hint }, 0))
+                    }
+                };
+            }
+        }
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "text file body read failed");
+            return None;
+        }
+    };
+    let actual_size = bytes.len() as u64;
+
+    // Defense-in-depth: verify actual download size
+    if actual_size > TEXT_INLINE_LIMIT {
+        // When filestore is available, upload the oversized download.
+        if let Some(fs) = filestore {
+            return upload_bytes_to_filestore(filename, &bytes, fs).await;
+        }
+        tracing::warn!(
+            filename,
+            size = actual_size,
+            "downloaded text file exceeds inline limit, skipping"
+        );
+        return None;
+    }
+
+    // from_utf8_lossy returns Cow::Borrowed for valid UTF-8 (zero-copy)
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+
+    // Dynamic fence: keep adding backticks until the fence doesn't appear in content
+    let mut fence = "```".to_string();
+    while text.contains(fence.as_str()) {
+        fence.push('`');
+    }
+
+    debug!(filename, bytes = text.len(), "text file inlined");
+    Some((
+        ContentBlock::Text {
+            text: format!("[File: {safe_filename}]\n{fence}\n{text}\n{fence}"),
+        },
+        actual_size,
+    ))
+}
+
+/// Shared implementation for downloading text files that are within the size limit.
+#[cfg(not(feature = "filestore"))]
+async fn download_text_file_inner(
+    url: &str,
+    filename: &str,
+    auth_token: Option<&str>,
+) -> Option<(ContentBlock, u64)> {
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
 
     let mut req = HTTP_CLIENT.get(url);
     if let Some(token) = auth_token {
@@ -507,11 +690,11 @@ pub async fn download_and_read_text_file(
     let actual_size = bytes.len() as u64;
 
     // Defense-in-depth: verify actual download size
-    if actual_size > MAX_SIZE {
+    if actual_size > TEXT_INLINE_LIMIT {
         tracing::warn!(
             filename,
             size = actual_size,
-            "downloaded text file exceeds 512KB limit, skipping"
+            "downloaded text file exceeds inline limit, skipping"
         );
         return None;
     }
@@ -528,7 +711,7 @@ pub async fn download_and_read_text_file(
     debug!(filename, bytes = text.len(), "text file inlined");
     Some((
         ContentBlock::Text {
-            text: format!("[File: {filename}]\n{fence}\n{text}\n{fence}"),
+            text: format!("[File: {safe_filename}]\n{fence}\n{text}\n{fence}"),
         },
         actual_size,
     ))
@@ -701,6 +884,293 @@ pub async fn download_to_disk(
             target_path.display(),
         ),
     })
+}
+
+/// Download an oversized file and upload it to the filestore using streaming
+/// multipart upload, returning a hint block.
+///
+/// Instead of buffering the entire file in memory, this streams download chunks
+/// directly to S3 multipart upload parts (~16 MB each), keeping memory usage
+/// bounded regardless of file size.
+#[cfg(feature = "filestore")]
+async fn download_and_upload_to_filestore(
+    url: &str,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+    filestore: &crate::filestore::Filestore,
+) -> Option<(ContentBlock, u64)> {
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    // Cap file size to prevent abuse (configurable, default 250 MB, max 500 MB).
+    let max_size = filestore.max_file_size();
+    if size > max_size {
+        tracing::warn!(filename, size, max = max_size, "text file exceeds filestore size limit, skipping");
+        return None;
+    }
+
+    // Timeout for the entire HTTP response (including body streaming).
+    // Must be >= STREAM_TIMEOUT since reqwest's timeout covers body consumption
+    // via bytes_stream(). Set to 10 minutes to allow for large file downloads
+    // on moderate connections (250 MB at ~0.5 MB/s).
+    const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    let mut req = HTTP_CLIENT.get(url).timeout(HTTP_TIMEOUT);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "text file download failed (filestore path)");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "text file download failed (filestore path)");
+        return None;
+    }
+
+    // Defense-in-depth: check Content-Length header if available (catches
+    // underreported platform size when the server provides the real size).
+    if let Some(content_length) = resp.content_length() {
+        if content_length > max_size {
+            tracing::warn!(
+                filename,
+                content_length,
+                max = max_size,
+                "Content-Length exceeds filestore size limit, skipping download"
+            );
+            return None;
+        }
+    }
+
+    // Stream directly to S3 multipart upload.
+    // 10-minute total timeout for the entire download+upload operation.
+    // 250 MB at 1 MB/s = ~250s; 500 MB at 1 MB/s = ~500s.
+    // 10 min (600s) provides headroom for moderate connections.
+    const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    let stream = Box::pin(resp.bytes_stream());
+
+    let upload_result = tokio::time::timeout(
+        STREAM_TIMEOUT,
+        filestore.stream_upload_and_presign(filename, stream, size, Some("text/plain; charset=utf-8")),
+    )
+    .await;
+
+    match upload_result {
+        Ok(Ok((presigned_url, actual_bytes))) => {
+            let hint = crate::filestore::format_filestore_hint(
+                filename,
+                actual_bytes,
+                &presigned_url,
+                filestore.presigned_ttl_secs(),
+            );
+            tracing::info!(filename, size = actual_bytes, "text file streamed to filestore");
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+        Ok(Err(e)) => {
+            tracing::error!(filename, error = %e, "filestore stream upload failed");
+            let size_kb = size / 1024;
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 This file ({size_kb} KB) could not be uploaded to temporary storage \
+                 (upload failed). The file content is unavailable."
+            );
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+        Err(_) => {
+            tracing::error!(filename, "filestore stream upload timed out (600s)");
+            let size_kb = size / 1024;
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 This file ({size_kb} KB) could not be uploaded to temporary storage \
+                 (upload timed out). The file content is unavailable."
+            );
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+    }
+}
+
+/// Upload already-downloaded bytes to the filestore and return the hint block.
+/// Public entry point for other modules (e.g. gateway) that already have the
+/// file bytes in memory and need to upload to filestore.
+#[cfg(feature = "filestore")]
+pub async fn upload_bytes_to_filestore_public(
+    filename: &str,
+    bytes: &[u8],
+    filestore: &crate::filestore::Filestore,
+) -> Option<(ContentBlock, u64)> {
+    upload_bytes_to_filestore(filename, bytes, filestore).await
+}
+
+/// Download any file (binary, PDF, video, zip, etc.) and upload to filestore.
+/// Returns a hint block with the presigned URL so the agent can fetch the file.
+///
+/// This is used for file types that were previously silently dropped (not text,
+/// not image, not audio). With filestore configured, the agent gets a URL to
+/// access any attachment.
+#[cfg(feature = "filestore")]
+pub async fn download_and_upload_any_file(
+    url: &str,
+    filename: &str,
+    size: u64,
+    content_type: Option<&str>,
+    auth_token: Option<&str>,
+    filestore: &crate::filestore::Filestore,
+) -> Option<(ContentBlock, u64)> {
+    let max_size = filestore.max_file_size();
+    if size > max_size {
+        tracing::warn!(filename, size, max = max_size, "file exceeds filestore size limit, skipping");
+        return None;
+    }
+
+    const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    let mut req = HTTP_CLIENT.get(url).timeout(HTTP_TIMEOUT);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "file download failed (filestore any-file path)");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "file download failed (filestore any-file path)");
+        return None;
+    }
+
+    // Content-Length pre-check
+    if let Some(content_length) = resp.content_length() {
+        if content_length > max_size {
+            tracing::warn!(filename, content_length, max = max_size, "Content-Length exceeds filestore limit");
+            return None;
+        }
+    }
+
+    // Stream to S3 multipart upload
+    const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    let stream = Box::pin(resp.bytes_stream());
+
+    let upload_result = tokio::time::timeout(
+        STREAM_TIMEOUT,
+        filestore.stream_upload_and_presign(filename, stream, size, content_type),
+    )
+    .await;
+
+    let mime = content_type.unwrap_or("application/octet-stream");
+    // Sanitize filename and MIME for prompt safety — strip control characters,
+    // newlines, and other injection vectors before embedding in hint text.
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let safe_mime: String = mime
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "/-+.;= ".contains(*c))
+        .take(100)
+        .collect();
+    match upload_result {
+        Ok(Ok((presigned_url, actual_bytes))) => {
+            let size_kb = actual_bytes / 1024;
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 Type: {safe_mime}\n\
+                 Size: {size_kb} KB\n\
+                 This file has been uploaded to temporary storage. \
+                 Fetch the contents using the URL below:\n\
+                 {presigned_url}\n\
+                 Note: this URL expires in {} minutes.",
+                filestore.presigned_ttl_secs() / 60
+            );
+            tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+        Ok(Err(e)) => {
+            tracing::error!(filename, error = %e, "filestore upload failed (any-file path)");
+            let size_kb = size / 1024;
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 Type: {safe_mime}\n\
+                 This file ({size_kb} KB) could not be uploaded to temporary storage. \
+                 The file content is unavailable."
+            );
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+        Err(_) => {
+            tracing::error!(filename, "filestore upload timed out (any-file path)");
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 Type: {safe_mime}\n\
+                 This file upload timed out. The file content is unavailable."
+            );
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+    }
+}
+
+/// Upload already-downloaded bytes to the filestore and return the hint block.
+#[cfg(feature = "filestore")]
+async fn upload_bytes_to_filestore(
+    filename: &str,
+    bytes: &[u8],
+    filestore: &crate::filestore::Filestore,
+) -> Option<(ContentBlock, u64)> {
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let actual_size = bytes.len() as u64;
+
+    // Centralized size cap — defense-in-depth regardless of which caller
+    // invokes this function (download_and_upload_to_filestore or the
+    // post-download fallback in download_text_file_inner).
+    let max_size = filestore.max_file_size();
+    if actual_size > max_size {
+        tracing::warn!(
+            filename,
+            size = actual_size,
+            max = max_size,
+            "file exceeds filestore size limit, skipping upload"
+        );
+        return None;
+    }
+
+    match filestore.upload_and_presign(filename, bytes).await {
+        Ok(presigned_url) => {
+            let hint = crate::filestore::format_filestore_hint(
+                filename,
+                actual_size,
+                &presigned_url,
+                filestore.presigned_ttl_secs(),
+            );
+            tracing::info!(filename, size = actual_size, "text file uploaded to filestore");
+            // Return 0 inline bytes — the file is stored externally, not inlined
+            // into the prompt. This prevents it from counting against the
+            // caller's aggregate size cap.
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+        Err(e) => {
+            tracing::error!(filename, error = %e, "filestore upload failed");
+            // Return a degraded hint so the agent knows the file exists
+            let size_kb = actual_size / 1024;
+            let hint = format!(
+                "[File: {safe_filename}]\n\
+                 This file ({size_kb} KB) could not be uploaded to temporary storage \
+                 (upload failed). The file content is unavailable."
+            );
+            Some((ContentBlock::Text { text: hint }, 0))
+        }
+    }
 }
 
 #[cfg(test)]

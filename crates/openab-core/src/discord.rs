@@ -7,6 +7,7 @@ use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
@@ -368,6 +369,9 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    /// Optional filestore for uploading file attachments.
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
     pub allow_user_messages: AllowUsers,
@@ -1080,18 +1084,35 @@ impl EventHandler for Handler {
                 }
                 // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
                 // Running total uses actual downloaded bytes for accurate accounting.
-                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
+                // When filestore is configured, skip the cap for files > 512KB (they'll
+                // be uploaded to S3, not inlined).
+                let attachment_size = u64::from(attachment.size);
+                #[cfg(feature = "filestore")]
+                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                #[cfg(not(feature = "filestore"))]
+                let skip_cap = false;
+                if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
                     tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
                     continue;
                 }
-                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
+                #[cfg(feature = "filestore")]
+                let text_file_result = media::download_and_read_text_file(
                     &attachment.url,
                     &attachment.filename,
-                    u64::from(attachment.size),
+                    attachment_size,
+                    None,
+                    self.filestore.as_deref(),
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let text_file_result = media::download_and_read_text_file(
+                    &attachment.url,
+                    &attachment.filename,
+                    attachment_size,
                     None,
                 )
-                .await
-                {
+                .await;
+                if let Some((block, actual_bytes)) = text_file_result {
                     text_file_bytes += actual_bytes;
                     text_file_count += 1;
                     debug!(filename = %attachment.filename, "adding text file attachment");
@@ -1156,6 +1177,26 @@ impl EventHandler for Handler {
                                 ));
                             }
                             None => {}
+                        }
+                        // For all other unsupported formats (PDF, ZIP, binary, etc.):
+                        // upload to filestore if available so the agent gets a presigned URL.
+                        #[cfg(feature = "filestore")]
+                        if !media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            if let Some(ref fs) = self.filestore {
+                                if let Some((block, _)) = media::download_and_upload_any_file(
+                                    &attachment.url,
+                                    &attachment.filename,
+                                    u64::from(attachment.size),
+                                    attachment.content_type.as_deref(),
+                                    None,
+                                    fs,
+                                ).await {
+                                    extra_blocks.push(block);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -1235,6 +1276,7 @@ impl EventHandler for Handler {
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
+        let gate_router = self.router.clone();
 
         tokio::spawn(async move {
             // Best-effort echo before the agent reply so the user can verify STT.
@@ -1249,6 +1291,35 @@ impl EventHandler for Handler {
 
             let sender_id = sender.sender_id.clone();
             let sender_name = sender.sender_name.clone();
+
+            // Shared ingress trust gate (L3 identity). Redundant-but-matching with
+            // Discord's own user check that already ran pre-dispatch, so it cannot
+            // deny anything already admitted (non-regressive). L2 (channel/thread/DM)
+            // stays in the adapter for Discord — its registry entry is L2-open.
+            //
+            // Bots are skipped here: Discord's `is_denied_user` has a `!is_bot`
+            // bypass (bot admission is handled separately by allow_bot_messages +
+            // trusted_bot_ids), and the shared L3 gate is human-identity only.
+            // Running it on bots would wrongly drop trusted bot-to-bot messages
+            // when allow_all_users=false (multi-agent). See PR #1270 review F1.
+            // Phase 1c makes this authoritative and removes the scattered check.
+            if l3_gate_applies(sender.is_bot) {
+                let decision = gate_router.gate_incoming(
+                    "discord",
+                    &thread_channel.channel_id,
+                    is_dm,
+                    &sender_id,
+                );
+                if !decision.is_allowed() {
+                    tracing::info!(
+                        sender = %sender_id,
+                        channel = %thread_channel.channel_id,
+                        ?decision,
+                        "discord message denied by trust gate"
+                    );
+                    return;
+                }
+            }
             let sender_json = serde_json::to_string(&sender).unwrap();
             let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
@@ -4179,6 +4250,15 @@ mod tests {
     fn denied_user_bot_skips_allowlist() {
         let allowed = HashSet::from([100]);
         assert!(!is_denied_user(true, false, &allowed, 999));
+    }
+
+    #[test]
+    fn l3_gate_skips_bots_admits_humans() {
+        // Regression guard (#1270 F1): the shared L3 identity gate must NOT run
+        // for bots — mirrors is_denied_user's !is_bot bypass. Otherwise trusted /
+        // mode-admitted bots would be denied when allow_all_users=false.
+        assert!(!l3_gate_applies(true)); // bot → gate skipped
+        assert!(l3_gate_applies(false)); // human → gate applies
     }
 
     // --- Trusted bot mention bypass tests ---

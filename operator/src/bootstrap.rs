@@ -273,6 +273,21 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         managed.execution_role = true;
         arn
     };
+    if imports.execution_role.is_none() {
+        // ECS uses the EXECUTION role (not the task role) to fetch
+        // `spec.secrets` values before the container starts. The managed
+        // AmazonECSTaskExecutionRolePolicy above covers ECR pulls and log
+        // delivery but not Secrets Manager, so without this, any manifest
+        // using `spec.secrets` fails at task launch with an AccessDenied on
+        // secretsmanager:GetSecretValue. Applied unconditionally (not just on
+        // first creation) so it self-heals existing bootstrap installs too —
+        // `put_role_policy` is idempotent.
+        iam.put_role_policy()
+            .role_name(EXECUTION_ROLE)
+            .policy_name("oab-secrets")
+            .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:*:*:secret:oab/*"}]}"#)
+            .send().await.ok();
+    }
 
     // Save partial state (in case subsequent steps fail)
     let mut state = BootstrapState {
@@ -400,9 +415,10 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
     eprintln!("   State saved to: s3://{bucket}/{STATE_KEY}");
     eprintln!("   You can now run: oabctl apply -f <manifest.yaml>");
 
-    // Save bucket to local config for future commands
+    // Save bucket and cluster to local config for future commands
     let mut local_cfg = crate::config::OabConfig::load().unwrap_or_default();
     local_cfg.bootstrap.bucket = Some(bucket);
+    local_cfg.defaults.cluster = cluster_name.to_string();
     local_cfg.save().ok();
 
     Ok(())

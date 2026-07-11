@@ -124,11 +124,55 @@ fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
     AgentCoreCancelStrategy::Stop
 }
 
+/// Configuration for the S3/R2-compatible object store used to upload
+/// file attachments and return presigned GET URLs.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg(feature = "filestore")]
+pub struct FilestoreConfig {
+    /// S3 bucket name.
+    pub bucket: String,
+    /// AWS region (e.g. "us-west-2").
+    pub region: String,
+    /// Optional custom endpoint URL (for Cloudflare R2 or MinIO).
+    pub endpoint: Option<String>,
+    /// Object key prefix. Default: "incoming/".
+    #[serde(default = "default_filestore_prefix")]
+    pub prefix: String,
+    /// Presigned URL TTL in seconds. Default: 3600 (1 hour).
+    #[serde(default = "default_filestore_presigned_ttl")]
+    pub presigned_ttl: u64,
+    /// Maximum file size in MB for filestore uploads. Default: 250 MB.
+    /// Cannot exceed 500 MB.
+    #[serde(default = "default_filestore_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Optional access key ID (falls back to AWS provider chain if unset).
+    pub access_key_id: Option<String>,
+    /// Optional secret access key (falls back to AWS provider chain if unset).
+    pub secret_access_key: Option<String>,
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_prefix() -> String {
+    "incoming/".to_string()
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_presigned_ttl() -> u64 {
+    3600
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_max_file_size_mb() -> u64 {
+    250
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub telegram: Option<TelegramConfig>,
+    pub line: Option<LineConfig>,
     pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -152,6 +196,9 @@ pub struct Config {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub ambient: AmbientConfig,
+    /// Optional filestore configuration for uploading large text attachments.
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<FilestoreConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -192,7 +239,9 @@ pub struct ExecSecretsConfig {
 
 impl Default for ExecSecretsConfig {
     fn default() -> Self {
-        Self { timeout_seconds: 10 }
+        Self {
+            timeout_seconds: 10,
+        }
     }
 }
 
@@ -210,7 +259,9 @@ pub struct HooksConfig {
 impl HooksConfig {
     /// Returns true if any lifecycle hook (pre_seed, pre_boot, pre_shutdown) is configured.
     pub fn any_configured(&self) -> bool {
-        self.pre_seed.as_ref().is_some_and(|p| !p.sources.is_empty())
+        self.pre_seed
+            .as_ref()
+            .is_some_and(|p| !p.sources.is_empty())
             || self.pre_boot.is_some()
             || self.pre_shutdown.is_some()
     }
@@ -595,6 +646,11 @@ pub struct GatewayConfig {
     /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.
     #[serde(default = "default_true")]
     pub streaming_placeholder: bool,
+    /// Whether the connected gateway renders tables natively (e.g. Telegram Rich Messages).
+    /// Default: true (matches Telegram default). Set false if Rich Messages is disabled
+    /// on the gateway daemon to preserve table code-block wrapping.
+    #[serde(default = "default_true")]
+    pub telegram_rich_messages: bool,
     /// Message dispatch mode. Default: per-message.
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
@@ -608,6 +664,206 @@ pub struct GatewayConfig {
 
 fn default_gateway_platform() -> String {
     "telegram".into()
+}
+
+/// First-class `[telegram]` configuration section (see ADR: first-class
+/// per-platform config). Config-authoritative with `${ENV}` expansion; every
+/// field falls back to its `TELEGRAM_*` environment variable when unset, then to
+/// a built-in default. This keeps env-only deployments working unchanged while
+/// letting `config.toml` be the single source of truth.
+///
+/// Resolution per field: `[telegram].field` (with `${}` expansion) → `TELEGRAM_*`
+/// env var → default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// Bot token. Env fallback: `TELEGRAM_BOT_TOKEN`.
+    pub bot_token: Option<String>,
+    /// Webhook secret token (L1 auth). Env fallback: `TELEGRAM_SECRET_TOKEN`.
+    pub secret_token: Option<String>,
+    /// Reject webhook requests whose source IP is outside Telegram's published
+    /// subnets (L1). Env fallback: `TELEGRAM_TRUSTED_SOURCE_ONLY` (default false).
+    pub trusted_source_only: Option<bool>,
+    /// Render rich-message drafts. Env fallback: `TELEGRAM_RICH_MESSAGES`
+    /// (default true).
+    pub rich_messages: Option<bool>,
+    /// Streaming override. When unset, streaming follows `rich_messages`.
+    /// Env fallback: `TELEGRAM_STREAMING`.
+    pub streaming: Option<bool>,
+    /// Webhook mount path. Env fallback: `TELEGRAM_WEBHOOK_PATH`
+    /// (default `/webhook/telegram`).
+    pub webhook_path: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Set `true` explicitly to allow all users. Env fallback:
+    /// `TELEGRAM_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// Telegram user IDs allowed to interact with the bot. Only checked when
+    /// `allow_all_users` resolves to `false`. Env fallback:
+    /// `TELEGRAM_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved Telegram settings (config → env → default applied).
+/// Plain types so the binary crate can hand them to the gateway crate without a
+/// type dependency.
+#[derive(Debug, Clone)]
+pub struct ResolvedTelegram {
+    pub bot_token: Option<String>,
+    pub secret_token: Option<String>,
+    pub trusted_source_only: bool,
+    pub rich_messages: bool,
+    pub streaming: Option<bool>,
+    pub webhook_path: String,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl TelegramConfig {
+    /// Resolve every field: config value (if set) → `TELEGRAM_*` env → default.
+    ///
+    /// String fields filter out empty strings produced by `${}` expansion of
+    /// unset env vars, so `bot_token = "${UNSET_VAR}"` correctly falls through
+    /// to the `TELEGRAM_BOT_TOKEN` env fallback rather than holding `Some("")`.
+    pub fn resolve(&self) -> ResolvedTelegram {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var("TELEGRAM_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
+        ResolvedTelegram {
+            bot_token: self
+                .bot_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok()),
+            secret_token: self
+                .secret_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_SECRET_TOKEN").ok()),
+            trusted_source_only: self
+                .trusted_source_only
+                .unwrap_or_else(|| env_flag_true_one("TELEGRAM_TRUSTED_SOURCE_ONLY")),
+            rich_messages: self
+                .rich_messages
+                .unwrap_or_else(|| env_flag_not_false("TELEGRAM_RICH_MESSAGES")),
+            streaming: self.streaming.or_else(|| {
+                std::env::var("TELEGRAM_STREAMING")
+                    .ok()
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            }),
+            webhook_path: self
+                .webhook_path
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_WEBHOOK_PATH").ok())
+                .unwrap_or_else(|| "/webhook/telegram".into()),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("TELEGRAM_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
+        }
+    }
+}
+
+/// `true` when env var == "1" or "true" (case-insensitive); default `false`.
+/// Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
+fn env_flag_true_one(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// `true` unless env var == "0" or "false" (case-insensitive); default `true`.
+/// Matches the legacy `TELEGRAM_RICH_MESSAGES` semantics.
+fn env_flag_not_false(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+/// First-class `[line]` section — L3 identity trust for the LINE adapter
+/// (identity-trust-none ADR, Phase 1). Mirrors [`TelegramConfig`]'s trust
+/// fields and resolution order: `[line].field` (with `${}` expansion) →
+/// `LINE_*` env var → default.
+///
+/// Trust-only by design: LINE channel credentials stay on the gateway env vars
+/// (`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN`) that the webhook
+/// adapter reads. Group policy (`open`/`members` for `"unknown"` senders) is a
+/// follow-up on #1355.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineConfig {
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Set `true` explicitly to allow all users. Env fallback:
+    /// `LINE_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// LINE user IDs (`U…`, 33 chars) allowed to interact with the bot. Only
+    /// checked when `allow_all_users` resolves to `false`. Env fallback:
+    /// `LINE_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE trust settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLine {
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl LineConfig {
+    /// Resolve every field: config value (if set) → `LINE_*` env → default.
+    /// Same shape as [`TelegramConfig::resolve`] for the shared trust fields.
+    pub fn resolve(&self) -> ResolvedLine {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var("LINE_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
+        ResolvedLine {
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("LINE_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
+        }
+    }
+
+    /// Whether any first-class LINE trust configuration exists — a `[line]`
+    /// section or `LINE_ALLOW_ALL_USERS` / `LINE_ALLOWED_USERS` env. Used by
+    /// the binary to decide whether LINE trust still rides on the deprecated
+    /// uniform `GATEWAY_*` seed (and to warn when it does).
+    pub fn env_trust_present() -> bool {
+        std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
 }
 
 /// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
@@ -668,8 +924,8 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         // If command was explicitly set but args was not, default args to []
         // to avoid leaking env-var args into a custom command.
         let args = match (cmd_explicit, raw.args) {
-            (_, Some(args)) => args,           // args explicitly set → use them
-            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (_, Some(args)) => args,               // args explicitly set → use them
+            (true, None) => Vec::new(),            // command set, args omitted → empty
             (false, None) => default_agent_args(), // neither set → env var
         };
         Ok(AgentConfig {
@@ -703,6 +959,16 @@ pub struct PoolConfig {
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
+    /// Grace period after `prompt_hard_timeout_secs` before a session stuck
+    /// with its connection mutex held is force-evicted from the pool.
+    #[serde(default = "default_hung_grace_secs")]
+    pub hung_grace_secs: u64,
+    /// Config options to set automatically after session creation.
+    /// Keys are config option IDs (e.g. "mode", "model"), values are the
+    /// desired values (e.g. "bypass", "swe-1-6").
+    /// Sent via `session/set_config_option` after each `session/new`.
+    #[serde(default)]
+    pub default_config_options: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -883,6 +1149,9 @@ pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
+pub(crate) fn default_hung_grace_secs() -> u64 {
+    120
+}
 fn default_true() -> bool {
     true
 }
@@ -932,6 +1201,8 @@ impl Default for PoolConfig {
             session_ttl_hours: default_ttl_hours(),
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
+            hung_grace_secs: default_hung_grace_secs(),
+            default_config_options: HashMap::new(),
         }
     }
 }
@@ -1055,9 +1326,9 @@ pub fn parse_s3_uri(uri: &str) -> anyhow::Result<(String, String)> {
     let rest = uri
         .strip_prefix("s3://")
         .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — must start with s3://"))?;
-    let (bucket, key) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>"))?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>")
+    })?;
     if bucket.is_empty() || key.is_empty() {
         anyhow::bail!("invalid s3:// URI '{uri}' — bucket and key must both be non-empty");
     }
@@ -1558,6 +1829,316 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn telegram_resolve_all_scenarios() {
+        // Single serialized test for all TelegramConfig::resolve() scenarios
+        // that touch TELEGRAM_* env vars. Consolidated to avoid race conditions
+        // under Rust's default parallel test execution (std::env is process-global).
+
+        // --- Clear all TELEGRAM_* env vars ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "TELEGRAM_ALLOWED_USERS",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        // --- Scenario 1: Config values win over env ---
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
+        let cfg = TelegramConfig {
+            bot_token: Some("cfg-token".into()),
+            secret_token: Some("cfg-secret".into()),
+            trusted_source_only: Some(true),
+            rich_messages: Some(false),
+            streaming: Some(true),
+            webhook_path: Some("/custom/tg".into()),
+            allow_all_users: None,
+            allowed_users: None,
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("cfg-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("cfg-secret"));
+        assert!(r.trusted_source_only);
+        assert!(!r.rich_messages);
+        assert_eq!(r.streaming, Some(true));
+        assert_eq!(r.webhook_path, "/custom/tg");
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+
+        // --- Scenario 2: All unset → built-in defaults ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(r.bot_token, None);
+        assert_eq!(r.secret_token, None);
+        assert!(!r.trusted_source_only); // default false
+        assert!(r.rich_messages); // default true
+        assert_eq!(r.streaming, None);
+        assert_eq!(r.webhook_path, "/webhook/telegram");
+
+        // --- Scenario 3: Env set, config unset → env values used (legacy semantics) ---
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
+        std::env::set_var("TELEGRAM_SECRET_TOKEN", "env-secret");
+        std::env::set_var("TELEGRAM_TRUSTED_SOURCE_ONLY", "true");
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "false");
+        std::env::set_var("TELEGRAM_STREAMING", "1");
+        std::env::set_var("TELEGRAM_WEBHOOK_PATH", "/env/tg");
+
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("env-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("env-secret"));
+        assert!(r.trusted_source_only);
+        assert!(!r.rich_messages); // "false" → false
+        assert_eq!(r.streaming, Some(true)); // "1" → true
+        assert_eq!(r.webhook_path, "/env/tg");
+
+        // --- Scenario 4: RICH_MESSAGES legacy semantics ---
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "0");
+        assert!(!TelegramConfig::default().resolve().rich_messages);
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "yes");
+        assert!(TelegramConfig::default().resolve().rich_messages);
+
+        // --- Scenario 5: STREAMING "false" → Some(false) ---
+        std::env::set_var("TELEGRAM_STREAMING", "false");
+        assert_eq!(TelegramConfig::default().resolve().streaming, Some(false));
+
+        // --- Scenario 6: Empty-string expansion edge case ---
+        // When `${}` expands to "" (env var unset at parse time), resolve()
+        // must treat it as absent and fall through to env fallback.
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "real-token");
+        std::env::set_var("TELEGRAM_SECRET_TOKEN", "real-secret");
+        std::env::remove_var("TELEGRAM_WEBHOOK_PATH");
+
+        let cfg = TelegramConfig {
+            bot_token: Some("".into()), // simulates ${UNSET_VAR} → ""
+            secret_token: Some("".into()),
+            webhook_path: Some("".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("real-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("real-secret"));
+        assert_eq!(r.webhook_path, "/webhook/telegram"); // env not set → default
+
+        // --- Scenario 7: allowed_users config wins over env; the separate
+        //     allow_all_users flag resolves independently (config → env →
+        //     auto-detect) and here falls through to the env var since the
+        //     config struct didn't set it explicitly ---
+        std::env::set_var("TELEGRAM_ALLOW_ALL_USERS", "true");
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", "999"); // must be ignored — config list wins
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec!["111".into(), "222".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.allowed_users, vec!["111".to_string(), "222".to_string()]);
+        assert!(r.allow_all_users); // from TELEGRAM_ALLOW_ALL_USERS=true, not auto-detect
+        std::env::remove_var("TELEGRAM_ALLOW_ALL_USERS");
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 8: empty list + no explicit flag → allow_all_users
+        //     defaults to false (identity-trust-none: deny-all by default) ---
+        let r = TelegramConfig::default().resolve();
+        assert!(r.allowed_users.is_empty());
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 9: non-empty list + no explicit flag → auto-detects
+        //     false (deny-all-except-list) ---
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec!["176096071".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.allowed_users, vec!["176096071".to_string()]);
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 10: TELEGRAM_ALLOWED_USERS env fallback (comma-separated,
+        //     trimmed) when config list is empty ---
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", " 111 , 222,333 ");
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(
+            r.allowed_users,
+            vec!["111".to_string(), "222".to_string(), "333".to_string()]
+        );
+        assert!(!r.allow_all_users); // default false (deny-all)
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 11: explicit allow_all_users = false matches
+        //     the deny-all default (no-op but valid config) ---
+        let cfg = TelegramConfig {
+            allow_all_users: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.resolve().allow_all_users);
+
+        // --- Scenario 12: explicit allow_all_users = true opts in to
+        //     allow-all (overrides deny-all default) ---
+        let cfg = TelegramConfig {
+            allow_all_users: Some(true),
+            ..Default::default()
+        };
+        assert!(cfg.resolve().allow_all_users);
+
+        // --- Scenario 13: explicit empty list (Some([])) overrides
+        //     TELEGRAM_ALLOWED_USERS env — config-authoritative even when
+        //     the list is empty (deny all, regardless of env) ---
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", "999,888");
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec![]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(r.allowed_users.is_empty()); // explicit empty wins over env
+        assert!(!r.allow_all_users);
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 14: TELEGRAM_ALLOW_ALL_USERS="" (empty string) must
+        //     resolve to false (deny-all), not true. Empty string is treated
+        //     as unset to avoid accidental fail-open. ---
+        std::env::set_var("TELEGRAM_ALLOW_ALL_USERS", "");
+        let r = TelegramConfig::default().resolve();
+        assert!(!r.allow_all_users); // empty string = unset = deny-all
+        std::env::remove_var("TELEGRAM_ALLOW_ALL_USERS");
+
+        // --- Cleanup ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "TELEGRAM_ALLOWED_USERS",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn telegram_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[telegram]
+bot_token = "tg-tok"
+secret_token = "tg-sec"
+trusted_source_only = true
+rich_messages = false
+streaming = true
+webhook_path = "/hook/tg"
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let tg = cfg.telegram.expect("telegram section");
+        assert_eq!(tg.bot_token.as_deref(), Some("tg-tok"));
+        assert_eq!(tg.secret_token.as_deref(), Some("tg-sec"));
+        assert_eq!(tg.trusted_source_only, Some(true));
+        assert_eq!(tg.rich_messages, Some(false));
+        assert_eq!(tg.streaming, Some(true));
+        assert_eq!(tg.webhook_path.as_deref(), Some("/hook/tg"));
+    }
+
+    #[test]
+    fn line_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[line]
+allow_all_users = false
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let line = cfg.line.expect("line section");
+        assert_eq!(line.allow_all_users, Some(false));
+        assert_eq!(
+            line.allowed_users.as_deref(),
+            Some(&["U1234567890abcdef0123456789abcdef".to_string()][..])
+        );
+
+        // Absent section → None (trust falls back to legacy GATEWAY_* seed).
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.line.is_none());
+    }
+
+    /// All `LINE_*` env scenarios in ONE test — std::env is process-global and
+    /// cargo runs tests in parallel, so splitting these would race (same
+    /// pattern as `telegram_resolve_all_scenarios`).
+    #[test]
+    fn line_resolve_all_scenarios() {
+        // --- Scenario 1: defaults — deny-all per identity-trust-none ADR ---
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+        assert!(r.allowed_users.is_empty());
+        assert!(!LineConfig::env_trust_present());
+
+        // --- Scenario 2: config wins over env ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "true");
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz"); // must be ignored — config list wins
+        let cfg = LineConfig {
+            allow_all_users: Some(false),
+            allowed_users: Some(vec!["Uaaa".into(), "Ubbb".into()]),
+        };
+        let r = cfg.resolve();
+        assert!(!r.allow_all_users);
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string()]
+        );
+
+        // --- Scenario 3: env fallback when config unset (comma-separated,
+        //     trimmed, empties dropped) ---
+        std::env::set_var("LINE_ALLOWED_USERS", " Uaaa , Ubbb,,Uccc ");
+        let r = LineConfig::default().resolve();
+        assert!(r.allow_all_users); // from LINE_ALLOW_ALL_USERS=true
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string(), "Uccc".to_string()]
+        );
+        assert!(LineConfig::env_trust_present());
+
+        // --- Scenario 4: empty-string env flag treated as unset → deny-all ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 5: "0"/"false" env values resolve false ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "0");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "false");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+
+        // --- Scenario 6: explicit empty config list = deny-all, ignores env ---
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz");
+        let cfg = LineConfig {
+            allow_all_users: None,
+            allowed_users: Some(vec![]),
+        };
+        let r = cfg.resolve();
+        assert!(r.allowed_users.is_empty());
+
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+    }
+
+    #[test]
     fn hooks_any_configured_false_when_empty() {
         let h = HooksConfig::default();
         assert!(!h.any_configured());
@@ -2026,10 +2607,9 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent
             assert_eq!(cfg.agent.command, "uv");
         }
         assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
-        assert!(cfg
-            .agent
-            .args
-            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(
+            &"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()
+        ));
     }
 
     #[test]
@@ -2073,7 +2653,9 @@ bot_token = "t"
 runtime_arn = "not-a-valid-arn"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2086,7 +2668,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2099,7 +2683,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]

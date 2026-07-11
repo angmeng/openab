@@ -1,0 +1,674 @@
+# oabctl — OAB Agent Provisioner
+
+`oabctl` is the CLI that provisions and manages OpenAB agents on Amazon ECS
+Fargate (with Kubernetes support planned). This doc covers day-to-day usage —
+installation, the manifest schema, ingress/webhooks, secrets, and bootstrap.
+For the tool's architecture and source layout, see
+[`operator/README.md`](../operator/README.md).
+
+## Installation
+
+`oabctl` ships attached to every `openab` release — it's built and uploaded to
+the same `openab-<version>` GitHub Release as soon as `charts/openab/Chart.yaml`
+is bumped on `main`, so it always tracks openab's own version:
+
+```bash
+# Download the latest release for your platform (linux-x86_64, linux-aarch64,
+# or macos-arm64) from:
+# https://github.com/openabdev/openab/releases/latest
+curl -L -o oabctl.tar.gz \
+  https://github.com/openabdev/openab/releases/latest/download/oabctl-<version>-<platform>.tar.gz
+tar xzf oabctl.tar.gz
+sudo mv oabctl /usr/local/bin/
+```
+
+Pre-beta builds (matching the rolling `pre-beta-<agent>` image tags, built
+hourly off `main`) are published to a rolling `oabctl-pre-beta` release —
+overwritten on every pre-beta build, so it always tracks the latest `main`:
+
+```bash
+curl -L -o oabctl.tar.gz \
+  https://github.com/openabdev/openab/releases/download/oabctl-pre-beta/oabctl-pre-beta-<platform>.tar.gz
+tar xzf oabctl.tar.gz
+sudo mv oabctl /usr/local/bin/
+```
+
+Or build from source (requires Rust):
+
+```bash
+cd operator && cargo build --release
+cp target/release/oabctl /usr/local/bin/
+```
+
+## Quick Start
+
+```bash
+# 1. Bootstrap infrastructure (one-time)
+oabctl bootstrap
+
+# 2. Create an agent (generates config + manifest)
+oabctl create my-bot
+
+# 3. Review generated files, then deploy
+oabctl apply -f my-bot/manifest.yaml --wait
+
+# 4. Done! Agent is running.
+oabctl exec my-bot -- bash
+```
+
+Or skip the review step:
+```bash
+oabctl create my-bot --auto-apply   # generate + deploy in one shot
+```
+
+## Complete Workflow
+
+### Step 1: Bootstrap (one-time)
+
+```bash
+oabctl bootstrap
+```
+
+Creates all required AWS infrastructure with one command. Shows a plan and asks for confirmation before creating anything.
+
+### Step 2: Create Agent (wizard)
+
+```bash
+oabctl create my-bot
+```
+
+Interactive wizard that:
+1. Selects backend platform (kiro/claude-code/codex/gemini/copilot/opencode)
+2. Selects release channel (stable/beta) → resolves official image URI
+3. Prompts for Discord bot token (masked input) → stores in Secrets Manager
+4. Prompts for STT API key (optional, masked) → stores in same secret
+5. Selects runtime (ECS)
+6. Selects capacity provider (FARGATE_SPOT/FARGATE)
+7. Selects VPC
+8. Auto-selects subnets (private+NAT priority, 2-3 AZ)
+9. Selects or creates security group
+10. Generates local files → confirms → applies
+
+Output:
+```
+my-bot/
+├── config.toml      ← OpenAB agent configuration
+└── manifest.yaml    ← oabctl deployment manifest
+```
+
+### Step 3: Day-to-day Operations
+
+```bash
+oabctl get oabservice                # list agents
+oabctl exec my-bot -- bash           # shell into container
+oabctl cp data.bin my-bot:/tmp/      # upload file
+oabctl sync ./skills my-bot:/home/agent/.kiro/skills/  # sync directory
+```
+
+### Updating Config
+
+```bash
+vim my-bot/config.toml                           # edit locally
+oabctl apply -f my-bot/manifest.yaml             # syncs config + redeploys
+oabctl apply -f my-bot/manifest.yaml --no-sync   # redeploy only (skip config sync)
+```
+
+### Fleet Deploy
+
+```bash
+oabctl apply -f fleet.yaml           # deploy 10+ agents from one file
+```
+
+## Configuration
+
+### Local Config (`~/.oabctl/config.toml`)
+
+Auto-created by `bootstrap`. Stores persistent settings:
+
+```toml
+[defaults]
+namespace = "prod"
+cluster = "oab"
+# region = "us-east-1"
+
+[bootstrap]
+bucket = "oab-control-plane-123456789"
+```
+
+**Priority:** config.toml > `OAB_CONTROL_PLANE_BUCKET` env var > auto-derive from account
+
+#### Cluster Resolution
+
+All commands use the same priority order to determine the target ECS cluster:
+
+| Priority | Source | Example |
+|----------|--------|---------|
+| 1 (highest) | `--cluster` CLI flag | `oabctl get oabservice --cluster my-cluster` |
+| 2 | `defaults.cluster` in `~/.oabctl/config.toml` | Set by `oabctl bootstrap` (including `--cluster` imports) |
+| 3 (lowest) | Built-in default | `"oab"` |
+
+- `oabctl bootstrap` writes the cluster name to config automatically — whether
+  it creates a new `oab` cluster or imports an existing one via `--cluster`.
+- Commands that support `--cluster` (e.g., `get`, `delete`) override config.
+- Commands without `--cluster` (e.g., `apply -f`, `delete -f`) always use config.
+- If config is missing (never bootstrapped), the built-in default `"oab"` is used.
+- If config exists but is malformed, commands fail with an error rather than
+  silently falling back to `"oab"`.
+
+### Agent Config (`{name}/config.toml`)
+
+Generated by `oabctl create`, uploaded to S3 via `apply --sync`. This is the OpenAB runtime configuration:
+
+```toml
+[secrets.refs]
+discord_bot_token = "aws-sm://oab/prod/my-bot#DISCORD_BOT_TOKEN"
+stt_api_key = "aws-sm://oab/prod/my-bot#STT_API_KEY"
+
+[discord]
+bot_token = "${secrets.discord_bot_token}"
+allow_all_channels = true
+allow_all_users = true
+max_bot_turns = 1000
+message_processing_mode = "per-thread"
+
+[agent]
+inherit_env = ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_REGION"]
+
+[pool]
+max_sessions = 5
+session_ttl_hours = 1
+
+[reactions]
+enabled = true
+
+[stt]
+enabled = true
+api_key = "${secrets.stt_api_key}"
+model = "whisper-large-v3-turbo"
+base_url = "https://api.groq.com/openai/v1"
+
+[cron]
+usercron_enabled = true
+usercron_path = "cronjob.toml"
+```
+
+Secrets are resolved by OpenAB at runtime using the task role's Secrets Manager permissions.
+
+## Manifest Schema (oab.dev/v2)
+
+### OABService — single agent
+
+```yaml
+apiVersion: oab.dev/v2
+kind: OABService
+metadata:
+  name: my-bot
+  namespace: prod
+spec:
+  image: ghcr.io/openabdev/openab:stable-kiro
+  resources:
+    cpu: "256"
+    memory: "512"
+  configFrom: s3://oab-control-plane-123456789/artifacts/prod/my-bot/config.toml
+  runtime:
+    type: ecs
+    capacityProvider: FARGATE_SPOT
+    taskRoleArn: arn:aws:iam::123456789012:role/oab-task-role-my-bot  # optional
+    networking:
+      subnets: [subnet-aaa, subnet-bbb]
+      securityGroups: [sg-xxx]
+```
+
+### Ingress — inbound webhooks (Telegram / LINE)
+
+Discord bots are outbound-only and need no ingress. Webhook platforms (Telegram,
+LINE, ...) POST *into* the task, so they need a public HTTPS endpoint. Adding an
+optional `spec.ingress` block makes `oabctl apply` provision the cheapest
+AWS-native path in one shot — API Gateway HTTP API → VPC Link → Cloud Map → the
+task — instead of running ~7 manual `aws` commands, replacing the manual steps
+implemented here. For a Kubernetes/Cloudflare-Tunnel alternative, see
+[`docs/refarch/telegram-cloudflare-tunnel.md`](refarch/telegram-cloudflare-tunnel.md).
+A dedicated AWS-native refarch doc covering this path in depth is tracked in
+[#1274](https://github.com/openabdev/openab/pull/1274); once merged it will be
+linked here.
+
+```yaml
+spec:
+  image: ghcr.io/openabdev/openab:beta-kiro
+  resources: { cpu: "256", memory: "512" }
+  configFrom: s3://.../config.toml
+  runtime:
+    type: ecs
+    capacityProvider: FARGATE_SPOT
+    networking:
+      subnets: [subnet-aaa, subnet-bbb]
+      securityGroups: [sg-xxx]
+  ingress:
+    type: apigateway          # only supported type (default)
+    cloudMapNamespace: oab    # reused across bots in the VPC (default: oab)
+    containerPort: 8080       # OpenAB listen port (default: 8080)
+    paths:
+      - /webhook/telegram
+      - /webhook/line
+```
+
+#### Minimal working manifest: Telegram on AWS
+
+The complete set of fields actually required to deploy a Telegram bot with
+ingress — everything else in the schema has a default. Save as a file and
+`oabctl apply -f <file>`:
+
+```yaml
+apiVersion: oab.dev/v2
+kind: OABService
+metadata:
+  name: my-telegram-bot
+  namespace: prod
+spec:
+  image: ghcr.io/openabdev/openab:stable-kiro
+  resources: { cpu: "256", memory: "512" }
+  configFrom: s3://<your-bucket>/config.toml
+  secrets:
+    TELEGRAM_BOT_TOKEN: "aws-sm://oab/telegram/my-telegram-bot#TELEGRAM_BOT_TOKEN"
+  runtime:
+    type: ecs
+    networking:
+      subnets: [subnet-aaa, subnet-bbb]
+      securityGroups: [sg-xxx]
+  ingress:
+    paths:
+      - /webhook/telegram
+```
+
+`spec.secrets.TELEGRAM_BOT_TOKEN` isn't required by the schema (`spec.secrets`
+defaults to empty), but without it the bot has no way to authenticate to
+Telegram and `apply` has nothing to call `setWebhook` with — include it for
+Telegram to actually work. `configFrom` must point at a `config.toml` with a
+matching `[telegram]` block (`webhook_path = "/webhook/telegram"`,
+`bot_token = "${TELEGRAM_BOT_TOKEN}"`) — see
+[docs/telegram.md](telegram.md) for the full config reference.
+
+On `apply` this reconciles (idempotently, reused by name):
+
+1. **Cloud Map** private DNS namespace (`<cloudMapNamespace>-<vpc-id>`, shared per-VPC) + a per-service **SRV** record (carries the container port; a plain A record does not work as a VPC-Link integration target)
+2. **ECS service registry** wiring (attached at service creation)
+3. **VPC Link** (`oab-vpc-link-<vpc-id>`, shared per-VPC), waits until `AVAILABLE`
+4. **API Gateway HTTP API** (`oab-webhook-<ns>-<name>`, one per bot) + `HTTP_PROXY` integration over the VPC Link, with an `overwrite:path` request parameter mapping so the backend receives the raw path (e.g. `/webhook/telegram`) instead of the stage-prefixed one (e.g. `/prod/webhook/telegram`) — see caveat below
+5. One **route** per path + a `prod` auto-deploy **stage**
+6. A self-referencing **security-group** inbound rule on `containerPort`
+
+`apply` then prints the stable webhook URL(s):
+
+```
+🔗 Webhook URL(s) for my-bot:
+   https://{api-id}.execute-api.{region}.amazonaws.com/prod/webhook/telegram
+   https://{api-id}.execute-api.{region}.amazonaws.com/prod/webhook/line
+```
+
+For Telegram, if `/webhook/telegram` is one of `spec.ingress.paths` and
+`spec.secrets` has a `TELEGRAM_BOT_TOKEN` entry, `apply` also registers the
+webhook URL with Telegram directly (calling `setWebhook` on your behalf) — no
+manual `curl` step needed. If `spec.secrets` also has a
+`TELEGRAM_SECRET_TOKEN` entry, it's passed through so Telegram signs every
+webhook request with it (see the security note below). This is best-effort
+and never fails `apply` — if it errors (bad token, network blip), `apply`
+still succeeds and prints a warning; register the webhook yourself with the
+printed URL in that case. LINE has no `setWebhook`-equivalent API, so its URL
+must still be registered manually in the LINE Developers console.
+
+> **Security note:** the API Gateway endpoint itself is public and unauthenticated
+> at the transport layer (no IAM auth, no API key). OpenAB's webhook handlers add
+> their own app-layer verification on top: Telegram validates the
+> `X-Telegram-Bot-Api-Secret-Token` header (`TELEGRAM_SECRET_TOKEN`) and the
+> request's source IP against Telegram's published webhook subnets; LINE
+> verifies an HMAC-SHA256 signature using `LINE_CHANNEL_SECRET`. Set
+> `TELEGRAM_SECRET_TOKEN` in `spec.secrets` to enable that check — `apply`
+> passes it to Telegram automatically as described above. `TELEGRAM_SECRET_TOKEN`
+> is Telegram's own `secret_token` hardening mechanism for `setWebhook`, not an
+> openab-specific convention — see the [official Telegram Bot API
+> docs](https://core.telegram.org/bots/api#setwebhook) for details.
+>
+> **Stage prefix stripped before it reaches the backend:** for private
+> (VPC_LINK) integrations, API Gateway forwards the *stage-prefixed* request
+> path to the backend by default (e.g. `/prod/webhook/telegram`, not
+> `/webhook/telegram`) — [documented AWS
+> behavior](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-private.html).
+> OpenAB's webhook router matches the exact configured path, so without
+> stripping the prefix every request 404s at the container despite the
+> integration and Cloud Map wiring being otherwise correct. `apply` sets an
+> `overwrite:path=$request.path` request parameter on the integration to strip
+> it, and self-heals existing integrations created before this fix by patching
+> the parameter in on the next `apply` — no manual intervention or recreate
+> needed.
+>
+> **Adding/fixing service discovery never requires recreating the service:**
+> if an existing ECS service has no Cloud Map registry, or has one pointing at a
+> different Cloud Map service than the one currently resolved for
+> `ingress.cloudMapNamespace` (e.g. the namespace was changed after the service
+> was created), `apply`'s `update_service` call attaches or replaces the
+> registry directly — ECS has supported adding/updating/removing
+> `serviceRegistries` on an existing service via a normal rolling replacement
+> (new tasks start with the new registry, old tasks stop once healthy — no
+> downtime gap) since March 2022. This requires the `AWSServiceRoleForECS`
+> service-linked role, which ECS creates automatically the first time any
+> service in the account uses service discovery — no setup needed.
+>
+> **Shared per-VPC (not per-account):** all ingress-enabled bots in the *same VPC*
+> share one VPC Link (`oab-vpc-link-<vpc-id>`) and one Cloud Map namespace
+> (`<cloudMapNamespace>-<vpc-id>`) — both are named by VPC ID so bots in different
+> VPCs never collide or reuse each other's link/namespace. A VPC Link's
+> subnets/security groups are fixed at creation and cannot be changed, so every
+> ingress bot in a given VPC must use the same `networking.subnets` /
+> `securityGroups` as whichever bot created that VPC's link first. `apply`
+> verifies the reused link's actual security groups match the manifest and warns
+> loudly on a mismatch (subnets aren't exposed by the API, so those can only be
+> reminded, not verified).
+>
+> **Teardown:** `oabctl delete oabservice <name>` (or `oabctl delete -f <manifest>`,
+> using the same file `apply -f` deployed it from) permanently removes the bot's
+> per-bot ingress resources — its exact Cloud Map service (resolved by the ECS
+> service's own registry ARN, not a name search, so same-named bots in different
+> VPCs/environments can't collide) and its HTTP API (`oab-webhook-<ns>-<name>`,
+> including the API resource itself this time, since the bot is gone for good) —
+> on a best-effort basis (it never blocks service deletion). If you instead edit
+> a manifest to remove `spec.ingress` while keeping the bot, `apply` runs the same
+> Cloud Map + routes/integration/stage cleanup automatically, but **keeps the HTTP
+> API** in case ingress is re-added later. The **shared** VPC Link and the
+> security-group inbound rule are always left in place for other bots. If the
+> Cloud Map service still has registered instances, teardown retries for ~25s
+> before falling back to a warning with the manual cleanup command.
+>
+> **Changing `paths`:** `apply` prunes routes on the bot's API that are no longer
+> in the manifest's `ingress.paths`, so renaming or removing a webhook path never
+> leaves a dangling route.
+>
+> **Per-bot API, no path collisions:** each ingress bot gets its own HTTP API, so
+> two bots can both use `/webhook/telegram` without clashing — each has a distinct
+> `{api-id}` endpoint URL that stays stable across recreates.
+
+### OABFleet — batch deploy
+
+```yaml
+apiVersion: oab.dev/v2
+kind: OABFleet
+metadata:
+  name: my-team
+  namespace: prod
+spec:
+  template:
+    image: ghcr.io/openabdev/openab:stable-kiro
+    resources: { cpu: "256", memory: "512" }
+    runtime:
+      type: ecs
+      capacityProvider: FARGATE_SPOT
+      networking: { subnets: [...], securityGroups: [...] }
+  agents:
+    - name: bot-a
+      configFrom: s3://.../bot-a/config.toml
+    - name: bot-b
+      configFrom: s3://.../bot-b/config.toml
+      resources: { cpu: "1024", memory: "2048" }  # override
+```
+
+**Fleet features:**
+- Template inheritance with per-agent overrides (`image`, `resources`, `bootstrapFrom`, `secrets`, `ingress`)
+- `${name}` interpolation in `configFrom`, `bootstrapFrom`
+- Runtime shared across fleet (not overridable per-agent)
+- Validate-all-before-apply (no partial deploys)
+
+### Design Principles
+
+- **Manifest = infra desired state** — image, CPU, networking
+- **Agent config is external** — `configFrom` points to config.toml (managed via `--sync`)
+- **Secrets resolved by OpenAB** — `[secrets.refs]` in config.toml, not in manifest
+- **Runtime-agnostic spec** — same top-level fields regardless of ECS or K8S
+
+### Per-Service IAM Task Role (`taskRoleArn`)
+
+By default, all services use the bootstrap shared role (`oab-task-role`) created
+by `oabctl bootstrap`. For production multi-agent fleets where services need
+different IAM permissions (e.g., one bot accesses a specific S3 bucket, another
+needs DynamoDB), you can declare a per-service task role in the manifest:
+
+```yaml
+spec:
+  runtime:
+    type: ecs
+    taskRoleArn: arn:aws:iam::123456789012:role/oab-task-role-my-bot
+    capacityProvider: FARGATE_SPOT
+    networking: { subnets: [...], securityGroups: [...] }
+```
+
+**Resolution order:**
+1. `runtime.taskRoleArn` from manifest → use it
+2. Otherwise → fall back to bootstrap shared role (`oab-task-role`)
+
+**Requirements for the custom role:**
+- Must have a trust policy allowing `ecs-tasks.amazonaws.com` to `sts:AssumeRole`
+- Should include at minimum the permissions the agent needs at runtime
+  (S3 config access, Secrets Manager, ECS Exec if used)
+
+**Recommendation:** Use the bootstrap shared role for quick starts and single-bot
+setups. For production multi-agent fleets, create per-service roles with
+least-privilege policies and declare them in each manifest.
+
+> **Note:** `taskRoleArn` is distinct from `executionRoleArn`. The execution
+> role (always from bootstrap) is used by ECS itself to pull images and inject
+> secrets *before* the container starts. The task role is the identity the
+> *running container* assumes — this is what `taskRoleArn` overrides.
+
+## Bootstrap
+
+One-time infrastructure setup — similar to `cdk bootstrap`:
+
+```bash
+oabctl bootstrap                          # create all (with plan + Y/n)
+oabctl bootstrap --status                 # show current state
+oabctl bootstrap --delete                 # teardown (only managed resources)
+oabctl bootstrap --cluster my-cluster     # import existing resources
+```
+
+### Resources Created
+
+| Resource | Name | Purpose |
+|----------|------|---------|
+| ECS Cluster | `oab` | FARGATE + FARGATE_SPOT |
+| IAM Role | `oab-task-execution` | Pull images from ECR |
+| IAM Role | `oab-task-role` | ECS Exec + S3 artifacts + Secrets Manager |
+| S3 Bucket | `oab-control-plane-{account}` | State + artifacts |
+| Security Group | `oab-agents` | Outbound-only |
+| Log Group | `/oab/agents` | CloudWatch logs |
+
+### IAM Task Role Permissions
+
+Attached to `oab-task-role` — the identity the *running container* assumes.
+
+| Policy | Permissions | Resource |
+|--------|------------|----------|
+| `oab-ecs-exec` | ssmmessages:* | * (ECS Exec requirement) |
+| `oab-s3-artifacts` | s3:GetObject, s3:PutObject | `{bucket}/artifacts/*` |
+| `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
+
+### `spec.secrets` value format
+
+`spec.secrets` maps a container env var name to where ECS should fetch its
+value from at task launch (via the execution role below — the container
+itself never sees a raw secret reference, only the resolved value). Two
+formats are accepted **per value** — either works for any key, and both can
+be mixed freely across different keys in the same manifest. The example
+below uses the two Telegram-specific keys from "Auto-register the Telegram
+webhook" above, annotated with what each is for:
+
+```yaml
+spec:
+  secrets:
+    # TELEGRAM_BOT_TOKEN — the bot's API token from BotFather. Required for
+    # openab to authenticate as the bot, and for `apply` to auto-register
+    # the webhook via setWebhook (see above).
+    #
+    # Format 1 — ECS-native valueFrom: a full Secrets Manager ARN. Add a
+    # `:<jsonKey>::` suffix to extract one field of a JSON secret; omit it
+    # for a plain-string secret.
+    TELEGRAM_BOT_TOKEN: "arn:aws:secretsmanager:us-east-1:123456789012:secret:oab/telegram/mybot-AC80TP:TELEGRAM_BOT_TOKEN::"
+    # TELEGRAM_BOT_TOKEN: "aws-sm://oab/telegram/mybot#TELEGRAM_BOT_TOKEN"  # equivalent, Format 2 below
+
+    # TELEGRAM_SECRET_TOKEN — optional. Telegram's own setWebhook
+    # secret_token request-signing hardening (see the security note above),
+    # not an openab-specific convention. `apply` passes it to Telegram
+    # automatically if present.
+    #
+    # Format 2 — aws-sm://<secret-id>#<json-key> shorthand: the same
+    # convention openab itself uses for in-app secret refs in config.toml
+    # (see docs/secrets-management.md). oabctl resolves this to the
+    # ECS-native form automatically; <secret-id> can be a bare secret name
+    # (resolved to its ARN via DescribeSecret) or a full ARN directly.
+    TELEGRAM_SECRET_TOKEN: "aws-sm://oab/telegram/mybot#TELEGRAM_SECRET_TOKEN"
+```
+
+Either format works for **any** key — `TELEGRAM_BOT_TOKEN` above could just
+as well be written `"aws-sm://oab/telegram/mybot#TELEGRAM_BOT_TOKEN"`, and
+`TELEGRAM_SECRET_TOKEN` could just as well use the full ARN form. The choice
+is per-value, not tied to which secret it is.
+
+### IAM Execution Role Permissions
+
+Attached to `oab-task-execution` — the identity **ECS itself** assumes to pull
+the image and resolve `spec.secrets` values *before* the container starts.
+This is a different role from the task role above; a manifest's `spec.secrets`
+values are fetched by this role, not by the running container.
+
+| Policy | Permissions | Resource |
+|--------|------------|----------|
+| `AmazonECSTaskExecutionRolePolicy` (AWS managed) | ECR image pulls, CloudWatch log delivery | * |
+| `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
+
+### Import Existing Resources
+
+```bash
+oabctl bootstrap \
+  --cluster my-existing-cluster \
+  --vpc vpc-12345 \
+  --subnets subnet-a,subnet-b \
+  --security-group sg-existing \
+  --execution-role arn:aws:iam::123:role/my-role \
+  --task-role arn:aws:iam::123:role/my-task-role
+```
+
+Imported resources are tracked but not deleted on `bootstrap --delete`.
+
+## State Store
+
+```
+s3://oab-control-plane-{account}/
+├── bootstrap/state.json              ← infra state (resource ARNs, managed flags)
+├── manifests/{namespace}/{name}.yaml ← desired state (generation tracked)
+└── artifacts/{namespace}/{name}/     ← agent configs, accessible by task role
+    └── config.toml
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `oabctl bootstrap` | One-time infra setup (plan + confirm) |
+| `oabctl bootstrap --delete` | Teardown managed resources |
+| `oabctl bootstrap --status` | Show bootstrap state |
+| `oabctl create <name>` | Interactive wizard → generate config + manifest |
+| `oabctl create <name> --auto-apply` | Generate + deploy immediately |
+| `oabctl apply -f <file\|dir>` | Sync config + deploy (default) |
+| `oabctl apply -f <file> --no-sync` | Deploy without syncing config |
+| `oabctl get oabservice [name]` | List agents and status |
+| `oabctl delete oabservice <name>` | Teardown agent |
+| `oabctl delete -f <file\|dir>` | Teardown every agent defined in a manifest (mirrors `apply -f`) |
+| `oabctl exec <agent> -- <cmd>` | Execute command in container |
+| `oabctl cp <src> <dst>` | Copy files to/from container |
+| `oabctl sync <src> <dst>` | Sync directories (bidirectional) |
+| `oabctl scale <alias> <size>` | Immediately set desired task count (0 or 1) |
+| `oabctl schedule create <alias> <size> --expr '<expression>'` | Create/update recurring schedule |
+| `oabctl schedule create <alias> <size> --expr '<expression>' --timezone 'Asia/Taipei'` | Schedule with IANA timezone |
+| `oabctl schedule list` | List all scaling schedules |
+| `oabctl schedule delete <name>` | Remove a scaling schedule |
+
+## Scale & Schedule
+
+Scale OAB services immediately or on a recurring schedule using EventBridge Scheduler.
+
+### Immediate Scaling
+
+```bash
+# Scale up to 1 task
+oabctl scale my-bot 1
+
+# Scale down to 0 (stop)
+oabctl scale my-bot 0
+```
+
+### Scheduled Scaling
+
+```bash
+# Scale to 0 at 9PM Taipei time, every day
+oabctl schedule create my-bot 0 --expr 'cron(0 21 * * ? *)' --timezone 'Asia/Taipei'
+
+# Scale to 1 at 8AM
+oabctl schedule create my-bot 1 --expr 'cron(0 8 * * ? *)' --timezone 'Asia/Taipei'
+
+# Scale every 6 hours
+oabctl schedule create my-bot 1 --expr 'rate(6 hours)'
+```
+
+**Schedule expressions** — must be one of:
+- `cron(min hour dom month dow year)` — 6-field cron
+- `rate(value unit)` — e.g. `rate(1 hour)`, `rate(5 minutes)`
+- `at(yyyy-mm-ddThh:mm:ss)` — one-time execution
+
+### Restrictions
+
+- **Size: 0 or 1 only.** OAB services are single-instance (one bot token per service). Scaling above 1 would cause duplicate responses.
+- **oabctl-managed services only.** The `<name>` argument resolves as `oab-{namespace}-{name}` in the oab cluster. Use `oabctl get oabservice` to list available services. ecsctl aliases are not supported.
+
+### Managing Schedules
+
+```bash
+# List all schedules
+oabctl schedule list
+
+# Delete a schedule
+oabctl schedule delete oab-scale-my-bot-to-0
+```
+
+### Architecture
+
+Uses **EventBridge Scheduler** with universal target (`arn:aws:scheduler:::aws-sdk:ecs:updateService`). No Lambda required. Auto-creates:
+
+- `oab-schedules` schedule group (idempotent)
+- `oab-scheduler-role` IAM role with `ecs:UpdateService` scoped to `service/*/oab-*`
+
+The scheduler role includes confused-deputy protection (`aws:SourceAccount` + `aws:SourceArn` conditions).
+
+## JSON Schema
+
+[`operator/schema/oabservice-v2.json`](../operator/schema/oabservice-v2.json) — supports both OABService and OABFleet for IDE validation.
+
+## Prerequisites
+
+With `oabctl bootstrap`, most prerequisites are handled automatically. You only need:
+
+1. **AWS credentials** — IAM user/role with permissions to create the above resources
+2. **Docker** — to build custom images (optional if using official images)
+
+### Additional permissions for `spec.ingress`
+
+The resources bootstrap creates cover outbound-only (Discord) deployments. If
+any manifest sets `spec.ingress`, the **caller of `oabctl apply`/`delete`**
+(not the task role) also needs:
+
+| Service | Actions |
+|---------|---------|
+| Cloud Map | `servicediscovery:CreatePrivateDnsNamespace`, `CreateService`, `DeleteService`, `ListNamespaces`, `ListServices`, `GetOperation` |
+| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| EC2 | `ec2:DescribeSubnets`, `AuthorizeSecurityGroupIngress` |
+| ECS | `ecs:UpdateService` with `serviceRegistries` (requires the `AWSServiceRoleForECS` service-linked role, which ECS creates automatically the first time any service in the account uses service discovery) |
+
+`AdministratorAccess`-equivalent or a broad `servicediscovery:*`/`apigateway:*`
+during development is fine; the table above is for scoping a least-privilege
+policy.

@@ -135,6 +135,25 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 ---
 
+## `[line]`
+
+First-class L3 identity trust for the LINE adapter (identity-trust-none ADR, Phase 1). Replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE — relying on those for LINE is deprecated and warns at startup. Channel credentials remain on the `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` env vars.
+
+Each field resolves: config value → `LINE_*` env var → default (deny-all).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `allow_all_users` | bool \| omit | `false` (deny-all) | `true` = any user may interact (bypasses `allowed_users` entirely); `false`/omitted = only `allowed_users`. Env fallback: `LINE_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | LINE user IDs (`U…`, 33 chars) allowed to interact. Only checked when `allow_all_users` resolves to false. Env fallback: `LINE_ALLOWED_USERS` (comma-separated). |
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+---
+
 ## `[agent]`
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
@@ -234,6 +253,17 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
+| `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
+
+**Example** — force Devin to bypass mode and use a specific model:
+
+```toml
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+default_config_options = { mode = "bypass", model = "swe-1-6" }
+```
 
 ---
 
@@ -486,6 +516,86 @@ context_flushes = 3
 channels = []                     # Channel ID allowlist — and their threads (required)
 allow_bot_messages = true
 ```
+
+---
+
+## `[filestore]`
+
+Optional S3/R2-compatible object store for handling file attachments.
+
+When configured, text files exceeding the 512 KB inline limit are uploaded to the
+object store and a presigned GET URL is returned to the agent. This eliminates
+the silent-drop behavior for large files and works with any agent that can perform
+HTTP GET (no platform auth tokens required).
+
+```toml
+[filestore]
+bucket = "my-oab-files"
+region = "us-west-2"
+# endpoint = "https://<account_id>.r2.cloudflarestorage.com"  # Cloudflare R2
+# endpoint = "http://localhost:9000"                           # MinIO
+prefix = "incoming/"       # object key prefix (default: "incoming/")
+presigned_ttl = 3600       # URL expiry in seconds (default: 3600 = 1 hour)
+# max_file_size_mb = 250   # max upload size in MB (default: 250, max: 500)
+# access_key_id = "${secrets.filestore_key}"         # recommended: use secret refs
+# secret_access_key = "${secrets.filestore_secret}"  # recommended: use secret refs
+```
+
+> **Credentials best practice:** For R2 and explicit S3 credentials, always use
+> `[secrets.refs]` to resolve credentials from AWS Secrets Manager or an exec
+> provider. Avoid hardcoding credentials or relying solely on env vars in production.
+> For AWS S3 with IRSA/Pod Identity/instance roles, omit both fields entirely.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `bucket` | ✅ | — | S3 bucket name |
+| `region` | ✅ | — | AWS region (use `"auto"` for Cloudflare R2) |
+| `endpoint` | ❌ | AWS default | Custom S3-compatible endpoint URL (R2, MinIO, etc.) |
+| `prefix` | ❌ | `"incoming/"` | Object key prefix for uploaded files |
+| `presigned_ttl` | ❌ | `3600` | Presigned URL expiry in seconds |
+| `max_file_size_mb` | ❌ | `250` | Maximum file size for upload in MB (hard cap: 500) |
+| `access_key_id` | ❌ | provider chain | Explicit access key (falls back to IRSA/env/config) |
+| `secret_access_key` | ❌ | provider chain | Explicit secret key |
+
+**Behavior when configured:**
+
+- Text files ≤ 512 KB: inlined into the prompt as before (unchanged)
+- Text files > 512 KB: downloaded by OAB, uploaded to S3/R2, presigned URL returned
+- PDF, ZIP, binary, and other unsupported formats (Discord/Slack): uploaded to S3/R2, presigned URL returned
+- The presigned URL requires no authentication — any HTTP GET works
+- File count cap (5 files) still applies
+- Aggregate 1 MB cap only applies to inlined files; filestore uploads bypass it
+
+**Behavior when NOT configured (default):**
+
+- Text files > 512 KB and unsupported formats are silently dropped (existing behavior)
+
+**Supported backends:**
+
+- AWS S3
+- Cloudflare R2 (S3-compatible, zero egress fees)
+- MinIO
+- Any S3-compatible object store
+
+**Build requirement:** The filestore feature is enabled by default in standard builds. When built without it (e.g. `--no-default-features`), the `[filestore]` config section is ignored and all behavior is unchanged.
+
+**Minimum IAM policy:**
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:PutObject",
+    "s3:GetObject",
+    "s3:AbortMultipartUpload",
+    "s3:ListMultipartUploadParts"
+  ],
+  "Resource": "arn:aws:s3:::my-oab-files/incoming/*"
+}
+```
+
+For Cloudflare R2, use the equivalent R2 API token with Object Read & Write
+permissions scoped to the bucket.
 
 ---
 

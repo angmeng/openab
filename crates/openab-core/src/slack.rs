@@ -3,6 +3,7 @@ use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
+use crate::trust::l3_gate_applies;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -1280,7 +1281,7 @@ impl ChatAdapter for SlackAdapter {
         self.streaming && self.trusted_bot_ids.is_empty() && !other_bot_present
     }
 
-    fn renders_native_tables(&self) -> bool {
+    fn renders_native_tables(&self, _platform: &str) -> bool {
         true
     }
 
@@ -1445,10 +1446,96 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 const PING_INTERVAL_SECS: u64 = 30;
 const IDLE_TIMEOUT_SECS: u64 = 75;
 const MAX_BACKOFF_SECS: u64 = 30;
+/// Bounds `connect_async` (the WebSocket handshake) in the reconnect path.
+/// `tokio_tungstenite` carries no timeout of its own, so this is the sole
+/// bound against a stalled TLS/WS handshake parking the reconnect task
+/// forever with no logs (see #1279).
+const RECONNECT_TIMEOUT_SECS: u64 = 30;
+/// Bounds `get_socket_mode_url` (the `apps.connections.open` Web API call) in
+/// the reconnect path. Set strictly above the adapter client's own 30s
+/// timeout (see `SlackAdapter::new`) so that timeout — which carries a
+/// diagnosable cause — fires first in the normal case; this constant is a
+/// backstop for the rare case the client builder failed and fell back to an
+/// unbounded `reqwest::Client::new()` (see #1279).
+const RECONNECT_HTTP_TIMEOUT_SECS: u64 = 35;
+/// Bounds outbound `write.send(...)` calls in the live socket loop. The
+/// inbound half-open case is guarded by `IDLE_TIMEOUT_SECS`, but a stalled
+/// *outbound* send parks the loop inside that `select!` branch forever too —
+/// and since it can never reach `ping_interval.tick()`, the idle watchdog
+/// itself becomes unreachable. Same bug class as #1279, on the write side.
+const WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// The Socket Mode WebSocket write half, as produced by splitting the stream
+/// returned from `connect_with_reconnect_timeout`. Named so the nested
+/// generic doesn't have to be repeated at every `send_with_timeout` call
+/// site.
+type SlackWsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tungstenite::Message,
+>;
+
+/// Result of `connect_with_reconnect_timeout`: the outer `Result` is the
+/// timeout, the inner `Result` is `connect_async`'s own outcome.
+type ConnectResult = std::result::Result<
+    std::result::Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::Error,
+    >,
+    tokio::time::error::Elapsed,
+>;
+
+/// Result of `get_socket_mode_url_with_timeout`: `Err` is the outer timeout;
+/// `Ok` carries `get_socket_mode_url`'s own `anyhow::Result`.
+type SocketModeUrlResult = std::result::Result<Result<String>, tokio::time::error::Elapsed>;
 
 /// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
 fn next_backoff(cur: u64) -> u64 {
     (cur * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// Wraps `connect_async` in the reconnect-path timeout. Extracted so the
+/// regression test exercises the exact same code path `run_slack_adapter`
+/// uses, instead of duplicating the timeout expression (#1279).
+async fn connect_with_reconnect_timeout(ws_url: &str) -> ConnectResult {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
+        tokio_tungstenite::connect_async(ws_url),
+    )
+    .await
+}
+
+/// Send `msg` on `write`, bounded by `WRITE_TIMEOUT_SECS`. Mirrors
+/// `connect_with_reconnect_timeout`: extracted so every write in the live
+/// socket loop shares one bounded-send implementation instead of each call
+/// site duplicating (or omitting) the timeout.
+async fn send_with_timeout(
+    write: &mut SlackWsSink,
+    msg: tungstenite::Message,
+) -> std::result::Result<std::result::Result<(), tungstenite::Error>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+        write.send(msg),
+    )
+    .await
+}
+
+/// Sleep for `backoff_secs`, honoring shutdown. Returns the next backoff
+/// value, or `None` if a shutdown signal arrived during the sleep (caller
+/// should return immediately). Shared by every retry point in the reconnect
+/// loop so backoff/shutdown handling only needs to change in one place.
+async fn wait_backoff_or_shutdown(
+    backoff_secs: u64,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<u64> {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => Some(next_backoff(backoff_secs)),
+        _ = shutdown_rx.changed() => None,
+    }
 }
 
 /// The socket is considered dead (half-open) when no inbound frame has arrived
@@ -1463,6 +1550,7 @@ fn socket_idle(since_last_inbound: std::time::Duration, timeout: std::time::Dura
 #[allow(clippy::too_many_arguments)]
 pub async fn run_slack_adapter(
     adapter: Arc<SlackAdapter>,
+    router: Arc<crate::adapter::AdapterRouter>,
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -1476,6 +1564,7 @@ pub async fn run_slack_adapter(
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -1491,30 +1580,32 @@ pub async fn run_slack_adapter(
             return Ok(());
         }
 
-        let ws_url = match get_socket_mode_url(&app_token).await {
-            Ok(url) => url,
-            Err(e) => {
+        let ws_url = match get_socket_mode_url_with_timeout(&adapter.client, &app_token).await {
+            Ok(Ok(url)) => url,
+            Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    _ = shutdown_rx.changed() => { return Ok(()); }
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
                 }
-                backoff_secs = next_backoff(backoff_secs);
+                continue;
+            }
+            Err(_) => {
+                error!(
+                    backoff = backoff_secs,
+                    timeout = RECONNECT_HTTP_TIMEOUT_SECS,
+                    "get Socket Mode URL timed out, retrying"
+                );
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
+                }
                 continue;
             }
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        // Bound the WebSocket handshake for the same reason as the HTTP call
-        // above — `connect_async` can otherwise hang indefinitely on a half-up
-        // network. On timeout, warn and fall through to the backoff retry below
-        // so the bridge keeps trying until the network returns (ac1fa7b).
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        {
+        match connect_with_reconnect_timeout(&ws_url).await {
             Ok(Ok((ws_stream, _))) => {
                 info!("Slack Socket Mode connected");
                 backoff_secs = 1; // reset on success
@@ -1540,9 +1631,31 @@ pub async fn run_slack_adapter(
                                     // Acknowledge the envelope immediately
                                     if let Some(envelope_id) = envelope["envelope_id"].as_str() {
                                         let ack = serde_json::json!({"envelope_id": envelope_id});
-                                        let _ = write
-                                            .send(tungstenite::Message::Text(ack.to_string()))
-                                            .await;
+                                        // Reconnect before dispatch if the ack cannot be written;
+                                        // Slack redelivers unacked envelopes, avoiding work it
+                                        // still considers pending.
+                                        match send_with_timeout(
+                                            &mut write,
+                                            tungstenite::Message::Text(ack.to_string()),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Err(e)) => {
+                                                warn!(
+                                                    error = %e,
+                                                    "Slack Socket Mode envelope ack failed, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    timeout = WRITE_TIMEOUT_SECS,
+                                                    "Slack Socket Mode envelope ack timed out, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Ok(Ok(())) => {}
+                                        }
                                     }
 
                                     // Slash commands and interactive block_actions aren't
@@ -1923,11 +2036,14 @@ pub async fn run_slack_adapter(
                                                     .to_string();
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
+                                                let router = router.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let dm_allowed_users = dm_allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                #[cfg(feature = "filestore")]
+                                                let filestore = filestore.clone();
                                                 if is_bot {
                                                     info!(
                                                         channel_id,
@@ -1940,6 +2056,7 @@ pub async fn run_slack_adapter(
                                                         &event,
                                                         &team_id,
                                                         &adapter,
+                                                        &router,
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
@@ -1947,6 +2064,8 @@ pub async fn run_slack_adapter(
                                                         &dm_allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        #[cfg(feature = "filestore")]
+                                                        filestore.as_deref(),
                                                     )
                                                     .await;
                                                 });
@@ -1956,7 +2075,28 @@ pub async fn run_slack_adapter(
                                     }
                                 }
                                 Ok(tungstenite::Message::Ping(data)) => {
-                                    let _ = write.send(tungstenite::Message::Pong(data)).await;
+                                    match send_with_timeout(
+                                        &mut write,
+                                        tungstenite::Message::Pong(data),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Err(e)) => {
+                                            warn!(
+                                                error = %e,
+                                                "Slack Socket Mode pong send failed, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                timeout = WRITE_TIMEOUT_SECS,
+                                                "Slack Socket Mode pong send timed out, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Ok(Ok(())) => {}
+                                    }
                                 }
                                 Ok(tungstenite::Message::Close(_)) => {
                                     warn!("Slack Socket Mode connection closed by server");
@@ -1980,14 +2120,24 @@ pub async fn run_slack_adapter(
                                 );
                                 break;
                             }
-                            if let Err(e) = write.send(tungstenite::Message::Ping(Vec::new())).await {
-                                warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
-                                break;
+                            match send_with_timeout(&mut write, tungstenite::Message::Ping(Vec::new())).await {
+                                Ok(Err(e)) => {
+                                    warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout = WRITE_TIMEOUT_SECS,
+                                        "Slack Socket Mode ping timed out, reconnecting"
+                                    );
+                                    break;
+                                }
+                                Ok(Ok(())) => {}
                             }
                         }
                         _ = shutdown_rx.changed() => {
                             info!("Slack adapter received shutdown signal");
-                            let _ = write.send(tungstenite::Message::Close(None)).await;
+                            let _ = send_with_timeout(&mut write, tungstenite::Message::Close(None)).await;
                             return Ok(());
                         }
                     }
@@ -1997,30 +2147,29 @@ pub async fn run_slack_adapter(
                 error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
             }
             Err(_) => {
-                warn!(backoff = backoff_secs, "connect_async timed out after 20s, retrying");
+                error!(
+                    backoff = backoff_secs,
+                    timeout = RECONNECT_TIMEOUT_SECS,
+                    "Slack Socket Mode connect timed out, retrying"
+                );
             }
         }
 
         warn!(backoff = backoff_secs, "reconnecting to Slack Socket Mode");
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-            _ = shutdown_rx.changed() => { return Ok(()); }
+        match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+            Some(next) => backoff_secs = next,
+            None => return Ok(()),
         }
-        backoff_secs = next_backoff(backoff_secs);
     }
 }
 
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
-async fn get_socket_mode_url(app_token: &str) -> Result<String> {
-    // Bound the HTTP call. A bare `reqwest::Client::new()` has no default
-    // timeout, so a hung TCP connect (e.g. waking from laptop sleep onto a
-    // not-yet-ready network) would block the reconnect loop forever — process
-    // alive, last log line "connecting…", no "connected", silent (ac1fa7b).
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+/// Reuses the adapter's `reqwest::Client` instead of building a fresh
+/// unbounded one per call (#386). The reconnect path is bounded by the
+/// caller's explicit `tokio::time::timeout(RECONNECT_HTTP_TIMEOUT_SECS, ...)`
+/// (see #1279); the client's own 30s timeout (see `SlackAdapter::new`) is a
+/// secondary bound that fires first in the normal case, since it's shorter.
+async fn get_socket_mode_url(client: &reqwest::Client, app_token: &str) -> Result<String> {
     let resp = client
         .post(format!("{SLACK_API}/apps.connections.open"))
         .header("Authorization", format!("Bearer {app_token}"))
@@ -2070,11 +2219,36 @@ fn invite_accepted(invite_allowed_users: &HashSet<String>, inviter: Option<&str>
         || inviter.is_some_and(|inv| invite_allowed_users.contains(inv))
 }
 
+/// Wraps `get_socket_mode_url` in the reconnect-path HTTP timeout. Extracted
+/// (mirroring `connect_with_reconnect_timeout`) so the regression test calls
+/// the same production code path `run_slack_adapter` uses, instead of
+/// duplicating the timeout expression.
+async fn get_socket_mode_url_with_timeout(
+    client: &reqwest::Client,
+    app_token: &str,
+) -> SocketModeUrlResult {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_HTTP_TIMEOUT_SECS),
+        get_socket_mode_url(client, app_token),
+    )
+    .await
+}
+
+/// Whether a Slack conversation ID denotes a DM. Slack conversation IDs are
+/// prefix-typed: `C…` public channel, `G…` private channel/group, `D…` DM.
+/// Only informational for the gate today — Slack's registry entry is L2-open
+/// with `allow_dm=true`, so the decision is identical either way — but passing
+/// the real surface keeps the gate's inputs truthful (cf. #1270 review F2).
+fn is_dm_channel(channel_id: &str) -> bool {
+    channel_id.starts_with('D')
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
     team_id: &str,
     adapter: &Arc<SlackAdapter>,
+    router: &Arc<crate::adapter::AdapterRouter>,
     bot_token: &str,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -2082,6 +2256,7 @@ async fn handle_message(
     dm_allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -2139,6 +2314,32 @@ async fn handle_message(
             // surfaces the bot's presence to people it won't talk to, which reads as
             // rude. Log-only denial is quieter; the user simply gets no response.
             tracing::info!(user_id, is_dm, "denied Slack user, ignoring (no reaction)");
+            return;
+        }
+    }
+
+    // Shared ingress trust gate (L3 identity). Redundant-but-matching with
+    // Slack's own user check that already ran above, so it cannot deny anything
+    // already admitted (non-regressive). L2 (channel allowlist) stays in the
+    // adapter for Slack — its registry entry is L2-open.
+    //
+    // Bots are skipped here: the user check above has the same `!is_bot_msg`
+    // bypass (bot admission is handled separately by allow_bot_messages +
+    // trusted_bot_ids), and the shared L3 gate is human-identity only. Running
+    // it on bots would wrongly drop trusted bot-to-bot messages when
+    // allow_all_users=false (multi-agent). Same rationale as Discord (#1270
+    // review F1). Phase 1c makes this authoritative and removes the scattered
+    // check (#1361).
+    if l3_gate_applies(is_bot_msg) {
+        let decision =
+            router.gate_incoming("slack", &channel_id, is_dm_channel(&channel_id), &user_id);
+        if !decision.is_allowed() {
+            tracing::info!(
+                user_id,
+                channel = %channel_id,
+                ?decision,
+                "slack message denied by trust gate"
+            );
             return;
         }
     }
@@ -2270,7 +2471,13 @@ async fn handle_message(
                 // externally-backed files, so this is advisory only — the
                 // authoritative cap check happens after download using
                 // `actual_bytes`.
-                if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
+                // When filestore is configured, skip the cap for files > 512KB (they'll
+                // be uploaded to S3, not inlined).
+                #[cfg(feature = "filestore")]
+                let skip_cap = filestore.is_some() && size > crate::media::TEXT_INLINE_LIMIT;
+                #[cfg(not(feature = "filestore"))]
+                let skip_cap = false;
+                if !skip_cap && size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
                     debug!(
                         filename,
                         total = text_file_bytes,
@@ -2278,9 +2485,22 @@ async fn handle_message(
                     );
                     continue;
                 }
-                if let Some((block, actual_bytes)) =
-                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
-                {
+                #[cfg(feature = "filestore")]
+                let text_file_result = media::download_and_read_text_file(
+                    url,
+                    filename,
+                    size,
+                    Some(bot_token),
+                    filestore,
+                ).await;
+                #[cfg(not(feature = "filestore"))]
+                let text_file_result = media::download_and_read_text_file(
+                    url,
+                    filename,
+                    size,
+                    Some(bot_token),
+                ).await;
+                if let Some((block, actual_bytes)) = text_file_result {
                     if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(
                             filename,
@@ -2310,9 +2530,13 @@ async fn handle_message(
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
-                        // Non-image binary (video, PDF, Office docs, archives,
-                        // generic binary): download to disk so the agent gets a
-                        // local path it can hand to ffmpeg / pdftotext / etc.
+                        // Fork behavior: non-image binary (video, PDF, Office
+                        // docs, archives, generic binary) downloads to disk so
+                        // the agent gets a local path it can hand to ffmpeg /
+                        // pdftotext / etc. Upstream's filestore (S3/R2) upload
+                        // path is intentionally NOT taken here — this deployment
+                        // is single-machine with no filestore, and upstream's
+                        // path silently drops files when none is configured.
                         // If the disk write fails, inject a failure-notice block
                         // so the agent still knows the file existed (fail loudly,
                         // don't silently drop).
@@ -3281,6 +3505,28 @@ mod tests {
         assert!(spec.is_none());
     }
 
+    // --- trust gate tests ---
+
+    /// Pins the L3 bot-bypass: the shared identity gate must not run for bot
+    /// senders (bot admission = allow_bot_messages + trusted_bot_ids), matching
+    /// the inline user check's `!is_bot_msg` bypass. Regression for #1361
+    /// (mirrors the Discord test for PR #1270 review F4).
+    #[test]
+    fn l3_gate_skips_bots_applies_to_humans() {
+        assert!(!l3_gate_applies(true)); // bot → gate skipped
+        assert!(l3_gate_applies(false)); // human → gate applies
+    }
+
+    /// Pins Slack conversation-ID prefix typing for the gate's `is_dm` input:
+    /// `D…` = DM; `C…` (public) and `G…` (private/group) are not DMs.
+    #[test]
+    fn is_dm_channel_by_prefix() {
+        assert!(is_dm_channel("D0123456789"));
+        assert!(!is_dm_channel("C0123456789"));
+        assert!(!is_dm_channel("G0123456789"));
+        assert!(!is_dm_channel(""));
+    }
+
     // --- builder tests ---
 
     #[test]
@@ -3889,13 +4135,16 @@ mod tests {
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true, HashSet::new(), HashSet::new(), None);
-        assert!(adapter.renders_native_tables());
+        assert!(adapter.renders_native_tables("slack"));
     }
 }
 
 #[cfg(test)]
 mod socket_keepalive_tests {
-    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS};
+    use super::{
+        connect_with_reconnect_timeout, get_socket_mode_url_with_timeout, next_backoff,
+        socket_idle, wait_backoff_or_shutdown, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
+    };
     use std::time::Duration;
 
     /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
@@ -3922,5 +4171,91 @@ mod socket_keepalive_tests {
         assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
+    }
+
+    /// Regression test for #1279: a stalled WebSocket handshake during reconnect
+    /// must surface as a timeout instead of parking the reconnect task forever.
+    /// Calls `connect_with_reconnect_timeout` directly (the same helper
+    /// `run_slack_adapter` calls) so this pins the actual production code
+    /// path, not just a copy of the timeout expression. `start_paused` lets
+    /// the 30s timeout resolve instantly under Tokio's virtual clock instead
+    /// of a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn connect_async_timeout_fires_on_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Accept the TCP connection but never send any WS handshake bytes, so
+        // `connect_async` blocks forever waiting for the server's HTTP
+        // upgrade response — the exact stall this timeout is meant to catch.
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let ws_url = format!("ws://{addr}");
+        let result = connect_with_reconnect_timeout(&ws_url).await;
+
+        assert!(
+            result.is_err(),
+            "connect_async on a stalled handshake must time out, not hang"
+        );
+    }
+
+    /// Regression test for #1279 (the HTTP leg): a stalled `apps.connections.open`
+    /// call during reconnect must surface as a timeout instead of parking the
+    /// reconnect task forever. Overrides DNS resolution for `slack.com` to a
+    /// local listener that accepts the TCP connection and never responds, so
+    /// the client's TLS handshake stalls exactly like a silently-dropped peer
+    /// would. Calls `get_socket_mode_url_with_timeout` directly (the same
+    /// helper `run_slack_adapter` calls) so this pins the actual production
+    /// code path, mirroring `connect_async_timeout_fires_on_stalled_handshake`
+    /// above.
+    #[tokio::test(start_paused = true)]
+    async fn get_socket_mode_url_timeout_fires_on_stalled_http_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .resolve("slack.com", addr)
+            .build()
+            .expect("build client");
+
+        let result = get_socket_mode_url_with_timeout(&client, "xapp-test-token").await;
+
+        assert!(
+            result.is_err(),
+            "get_socket_mode_url on a stalled HTTP call must time out, not hang"
+        );
+    }
+
+    /// With no shutdown signal, `wait_backoff_or_shutdown` sleeps out the
+    /// backoff and returns the next (doubled) value. `start_paused` resolves
+    /// the sleep instantly under Tokio's virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_next_backoff_when_no_shutdown() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let result = wait_backoff_or_shutdown(2, &mut rx).await;
+        assert_eq!(result, Some(next_backoff(2)));
+    }
+
+    /// A shutdown signal wins the race against an arbitrarily long backoff,
+    /// returning `None` so the caller returns immediately instead of parking
+    /// until the backoff elapses.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_none_on_shutdown() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("receiver still open");
+        let result = wait_backoff_or_shutdown(3600, &mut rx).await;
+        assert_eq!(result, None);
     }
 }

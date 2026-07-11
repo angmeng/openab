@@ -1,33 +1,72 @@
 name: Build oabctl
 
+# Rides along with every openab release: fires on the same trigger as
+# release.yml (a merge that bumps charts/openab/Chart.yaml on main), builds
+# oabctl for all supported platforms, and uploads them to the same
+# `openab-<version>` GitHub Release that chart-releaser just created — so
+# `oabctl` always ships attached to the openab release it was built against,
+# without needing its own separate version/tag scheme.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/openab/Chart.yaml"
   workflow_dispatch:
     inputs:
       target:
-        description: 'Build target (linux-x86_64, linux-aarch64, macos-arm64)'
+        description: 'Build target (leave empty to build all)'
         required: false
-        default: 'linux-x86_64'
+        default: ''
         type: choice
         options:
+          - ''
           - linux-x86_64
           - linux-aarch64
           - macos-arm64
 
 jobs:
-  build:
-    runs-on: ${{ inputs.target == 'macos-arm64' && 'macos-latest' || 'ubuntu-latest' }}
+  resolve:
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      targets: ${{ steps.version.outputs.targets }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      - name: Resolve version and target matrix
+        id: version
+        run: |
+          VERSION=$(grep '^version:' charts/openab/Chart.yaml | awk '{print $2}')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${{ inputs.target }}" ]; then
+            TARGETS="[\"${{ inputs.target }}\"]"
+          else
+            TARGETS='["linux-x86_64","linux-aarch64","macos-arm64"]'
+          fi
+          echo "targets=${TARGETS}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.resolve.outputs.targets) }}
+    runs-on: ${{ matrix.target == 'macos-arm64' && 'macos-latest' || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ inputs.target == 'linux-aarch64' && 'aarch64-unknown-linux-gnu' || '' }}
+          targets: ${{ matrix.target == 'linux-aarch64' && 'aarch64-unknown-linux-gnu' || '' }}
 
       - name: Install cross-compilation tools
-        if: inputs.target == 'linux-aarch64'
+        if: matrix.target == 'linux-aarch64'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -35,7 +74,7 @@ jobs:
       - name: Build oabctl
         working-directory: operator
         run: |
-          if [ "${{ inputs.target }}" = "linux-aarch64" ]; then
+          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             cargo build --release --target aarch64-unknown-linux-gnu
             cp target/aarch64-unknown-linux-gnu/release/oabctl .
@@ -46,11 +85,30 @@ jobs:
 
       - name: Package
         working-directory: operator
-        run: tar czf oabctl-${{ inputs.target }}.tar.gz oabctl
+        run: tar czf oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz oabctl
+
+      - name: Upload to release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: operator
+        run: |
+          TAG="openab-${{ needs.resolve.outputs.version }}"
+          NAME="oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz"
+          # Release is created by chart-releaser (release.yml) on the same
+          # push — wait for it to exist before uploading.
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+              break
+            fi
+            echo "Release ${TAG} not found yet, waiting..."
+            sleep 15
+          done
+          gh release upload "$TAG" "$NAME" --repo "${{ github.repository }}" --clobber
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: oabctl-${{ inputs.target }}
-          path: operator/oabctl-${{ inputs.target }}.tar.gz
+          name: oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}
+          path: operator/oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz
           retention-days: 7

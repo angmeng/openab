@@ -519,7 +519,10 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// lets the platform render the raw Markdown table itself.
     /// Default: `false` (keep converting). Overridden by Slack (Block Kit
     /// `markdown` blocks / `markdown_text` stream chunks render tables natively).
-    fn renders_native_tables(&self) -> bool {
+    /// The `platform` parameter allows shared adapters (e.g. UnifiedGatewayAdapter)
+    /// to make per-platform decisions.
+    fn renders_native_tables(&self, platform: &str) -> bool {
+        let _ = platform;
         false
     }
 
@@ -557,6 +560,10 @@ pub struct AdapterRouter {
     workspace_aliases: std::collections::HashMap<String, String>,
     /// Bot home directory (security boundary for workspace directives).
     bot_home: std::path::PathBuf,
+    /// Per-platform trust gate (L2 scope + L3 identity). Populated via
+    /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
+    /// (only consulted by paths wired to the gate — currently the gateway path).
+    trust: crate::trust::PlatformTrustConfigs,
 }
 
 /// Silence threshold for the dropped-turn watchdog. If the agent emits content
@@ -605,6 +612,7 @@ impl AdapterRouter {
             relay_ctx,
             workspace_aliases,
             bot_home,
+            trust: crate::trust::PlatformTrustConfigs::default(),
         }
     }
 
@@ -620,6 +628,28 @@ impl AdapterRouter {
     /// bound that sits just above it.
     pub fn prompt_hard_timeout(&self) -> std::time::Duration {
         self.prompt_hard_timeout
+    }
+
+    /// Attach the per-platform trust registry (builder style, before `Arc`-wrapping).
+    /// Keeps `new()`'s signature stable across its many call sites.
+    pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
+        self.trust = trust;
+        self
+    }
+
+    /// The single ingress trust gate: evaluate L2 (scope) + L3 (identity) for an
+    /// inbound message. This is the long-term choke point — dispatch paths should
+    /// only be reachable after an `Allow` here. Returns the [`Decision`] so the
+    /// caller can echo on `DenyIdentity` (request-access UX) vs silently drop on
+    /// `DenyScope`.
+    pub fn gate_incoming(
+        &self,
+        platform: &str,
+        channel_id: &str,
+        is_dm: bool,
+        sender_id: &str,
+    ) -> crate::trust::Decision {
+        self.trust.decide(platform, channel_id, is_dm, sender_id)
     }
 
     /// Access the underlying session pool (e.g. for config option queries).
@@ -817,7 +847,7 @@ impl AdapterRouter {
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
-        let table_mode = if adapter.renders_native_tables() {
+        let table_mode = if adapter.renders_native_tables(&thread_channel.platform) {
             TableMode::Off
         } else {
             self.table_mode
@@ -2418,7 +2448,7 @@ mod tests {
         assert!(!adapter.use_streaming(false));
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
-        assert!(!adapter.renders_native_tables());
+        assert!(!adapter.renders_native_tables("discord"));
     }
 
     #[test]
