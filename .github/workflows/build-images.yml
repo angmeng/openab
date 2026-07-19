@@ -170,10 +170,11 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -228,10 +229,10 @@ jobs:
       - name: Create manifest list
         env:
           BRANCH_INPUT: ${{ inputs.branch }}
+          TAG: ${{ needs.matrix.outputs.tag }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ needs.matrix.outputs.tag }}"
-          VARIANT="${{ matrix.variant }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
 
           # Tag: <version>-<agent>
           docker buildx imagetools create \
@@ -254,10 +255,10 @@ jobs:
       - name: Summary
         env:
           BRANCH_INPUT: ${{ inputs.branch }}
+          TAG: ${{ needs.matrix.outputs.tag }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ needs.matrix.outputs.tag }}"
-          VARIANT="${{ matrix.variant }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
           echo "### 📦 \`${IMAGE}:${TAG}-${VARIANT}\`" >> "$GITHUB_STEP_SUMMARY"
           if [ "${VARIANT}" = "kiro" ]; then
             echo "### 📦 \`${IMAGE}:${TAG}\` (default)" >> "$GITHUB_STEP_SUMMARY"

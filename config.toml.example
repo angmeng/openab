@@ -80,10 +80,76 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # NOTE: relying on GATEWAY_ALLOW_ALL_USERS / GATEWAY_ALLOWED_USERS for LINE is
 # deprecated (warns at startup; becomes an error in Phase 2).
 # [line]
+# channel_secret       = "${LINE_CHANNEL_SECRET}"        # L1 webhook HMAC key; env fallback: LINE_CHANNEL_SECRET
+# channel_access_token = "${LINE_CHANNEL_ACCESS_TOKEN}"  # Reply/Push API; env fallback: LINE_CHANNEL_ACCESS_TOKEN
+# webhook_path = "/webhook/line"        # env fallback: LINE_WEBHOOK_PATH (default /webhook/line)
 # allow_all_users = false               # true = any user; omitted/false = deny-all except allowed_users
 #                                       # env fallback: LINE_ALLOW_ALL_USERS
 # allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
 #                                       # env fallback: LINE_ALLOWED_USERS (comma-separated)
+
+# --- WeCom / Google Chat / MS Teams (first-class trust sections) ---
+# Same shape as [line]: L3 identity trust per platform, replacing the uniform
+# GATEWAY_ALLOW_ALL_USERS / GATEWAY_ALLOWED_USERS env for that platform
+# (deprecated: warns at startup; becomes an error in Phase 2). Platform
+# credentials stay on their gateway env vars (WECOM_CORP_ID/WECOM_SECRET,
+# GOOGLE_CHAT_*, TEAMS_APP_ID/TEAMS_APP_SECRET).
+# [wecom]
+# corp_id          = "${WECOM_CORP_ID}"          # env fallback: WECOM_CORP_ID
+# secret           = "${WECOM_SECRET}"           # env fallback: WECOM_SECRET
+# token            = "${WECOM_TOKEN}"            # callback token (L1); env fallback: WECOM_TOKEN
+# encoding_aes_key = "${WECOM_ENCODING_AES_KEY}" # 43 chars (L1); env fallback: WECOM_ENCODING_AES_KEY
+# agent_id         = "1000002"                   # numeric; env fallback: WECOM_AGENT_ID
+# webhook_path = "/webhook/wecom"       # env fallback: WECOM_WEBHOOK_PATH
+# streaming_enabled = false             # env fallback: WECOM_STREAMING_ENABLED
+# debounce_secs = 3                     # env fallback: WECOM_DEBOUNCE_SECS
+# allow_all_users = false               # env fallback: WECOM_ALLOW_ALL_USERS
+# allowed_users = ["zhangsan", "lisi"]  # WeCom UserIDs (tenant-assigned, freeform strings)
+#                                       # env fallback: WECOM_ALLOWED_USERS (comma-separated)
+# [googlechat]
+# enabled = true                        # env fallback: GOOGLE_CHAT_ENABLED
+# sa_key_json = "${GOOGLE_CHAT_SA_KEY_JSON}"   # inline SA key; wins over sa_key_file
+# sa_key_file = "/etc/openab/sa.json"   # env fallback: GOOGLE_CHAT_SA_KEY_FILE
+# access_token = "${GOOGLE_CHAT_ACCESS_TOKEN}" # static token alternative
+# audience = "projects/<n>/..."         # enables webhook JWT verification (L1)
+# webhook_path = "/webhook/googlechat"  # env fallback: GOOGLE_CHAT_WEBHOOK_PATH
+# allow_all_users = false               # env fallback: GOOGLE_CHAT_ALLOW_ALL_USERS
+# allowed_users = ["users/123456789"]   # Chat user resource names (users/<id>)
+#                                       # env fallback: GOOGLE_CHAT_ALLOWED_USERS (comma-separated)
+# [teams]
+# app_id     = "${TEAMS_APP_ID}"        # env fallback: TEAMS_APP_ID
+# app_secret = "${TEAMS_APP_SECRET}"    # env fallback: TEAMS_APP_SECRET
+# allowed_tenants = ["<tenant-guid>"]   # env fallback: TEAMS_ALLOWED_TENANTS (empty = all)
+# webhook_path = "/webhook/teams"       # env fallback: TEAMS_WEBHOOK_PATH
+# allow_all_users = false               # env fallback: TEAMS_ALLOW_ALL_USERS
+# allowed_users = ["29:1abc..."]        # Bot Framework activity.from.id values (29:…)
+#                                       # env fallback: TEAMS_ALLOWED_USERS (comma-separated)
+
+# --- Feishu/Lark (first-class section; config-first with FEISHU_* env fallback) ---
+# app_id + app_secret are mandatory (after env fallback); incomplete = adapter disabled.
+# [feishu]
+# app_id     = "${FEISHU_APP_ID}"       # env fallback: FEISHU_APP_ID
+# app_secret = "${FEISHU_APP_SECRET}"   # env fallback: FEISHU_APP_SECRET
+# encrypt_key = "${FEISHU_ENCRYPT_KEY}" # webhook signature key (L1); env fallback: FEISHU_ENCRYPT_KEY
+# verification_token = "${FEISHU_VERIFICATION_TOKEN}"
+# domain = "feishu"                     # "feishu" | "lark"
+# connection_mode = "websocket"         # "websocket" (default, no public URL) | "webhook"
+# webhook_path = "/webhook/feishu"
+# allowed_users  = ["ou_xxxx"]          # open_id allowlist (per-app!); env: FEISHU_ALLOWED_USERS
+# allowed_groups = ["oc_xxxx"]          # env: FEISHU_ALLOWED_GROUPS
+# trusted_bot_ids = ["ou_bot1"]         # env: FEISHU_TRUSTED_BOT_IDS
+# require_mention = true                # env: FEISHU_REQUIRE_MENTION
+# allow_bots = "off"                    # off | mentions | all
+# allow_user_messages = "multibot_mentions"  # multibot_mentions | mentions | involved
+# max_bot_turns = 20
+# dedupe_ttl_secs = 300
+# message_limit = 4000
+# session_ttl_hours = 24                # 0 disables participation tracking
+# card_streaming_mode = "auto"          # auto | post | card
+# card_fallback_to_post = true
+# card_promote_bytes = 4000
+# card_idle_finalize_ms = 3000
+# allow_all_users = false               # L3 shared-gate opt-in; env: FEISHU_ALLOW_ALL_USERS
 
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
@@ -119,10 +185,12 @@ working_dir = "/home/agent"
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
 
 # [agent]
-# command = "codex"
-# args = ["--acp"]
+# command = "codex-acp"
 # working_dir = "/home/node"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+# Recommended for containerized deployments (outer container = security boundary):
+# [pool]
+# default_config_options = { mode = "agent-full-access" }
 
 # [agent]
 # command = "gemini"

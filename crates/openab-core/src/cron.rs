@@ -238,7 +238,18 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram"];
+const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat"];
+
+fn should_create_cron_thread(job: &CronJobConfig) -> bool {
+    job.thread_id.is_none() && job.platform != "googlechat"
+}
+
+fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
+    channel
+        .thread_id
+        .clone()
+        .or_else(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone()))
+}
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
 pub fn validate_cronjobs(
@@ -660,9 +671,7 @@ async fn fire_cronjob(
         }
     };
 
-    let reply_channel = if job.thread_id.is_some() {
-        thread_channel.clone()
-    } else {
+    let reply_channel = if should_create_cron_thread(job) {
         let thread_name = format::shorten_thread_name(&job.message);
         match adapter
             .create_thread(&thread_channel, &trigger_msg, &thread_name)
@@ -692,6 +701,8 @@ async fn fire_cronjob(
                 return;
             }
         }
+    } else {
+        thread_channel.clone()
     };
 
     let sender = SenderContext {
@@ -705,10 +716,7 @@ async fn fire_cronjob(
             .as_deref()
             .unwrap_or(&reply_channel.channel_id)
             .to_string(),
-        thread_id: reply_channel
-            .thread_id
-            .clone()
-            .or(Some(reply_channel.channel_id.clone())),
+        thread_id: cron_sender_thread_id(&reply_channel),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
         message_id: None, // cron jobs don't originate from a message
@@ -1546,6 +1554,66 @@ message = "a"
         }
     }
 
+    #[test]
+    fn googlechat_cron_stays_top_level_without_explicit_thread() {
+        let mut job = test_cron_job();
+        job.platform = "googlechat".into();
+
+        assert!(!should_create_cron_thread(&job));
+
+        job.thread_id = Some("spaces/TEST/threads/THREAD".into());
+        assert!(!should_create_cron_thread(&job));
+    }
+
+    #[test]
+    fn thread_capable_cron_platform_creates_thread_when_unspecified() {
+        let job = test_cron_job();
+
+        assert!(should_create_cron_thread(&job));
+    }
+
+    #[test]
+    fn googlechat_top_level_sender_has_no_thread_id() {
+        let channel = ChannelRef {
+            platform: "googlechat".into(),
+            channel_id: "spaces/TEST".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+
+        assert_eq!(cron_sender_thread_id(&channel), None);
+    }
+
+    #[test]
+    fn cron_sender_preserves_explicit_thread_id() {
+        let channel = ChannelRef {
+            platform: "googlechat".into(),
+            channel_id: "spaces/TEST".into(),
+            thread_id: Some("spaces/TEST/threads/THREAD".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+
+        assert_eq!(
+            cron_sender_thread_id(&channel).as_deref(),
+            Some("spaces/TEST/threads/THREAD")
+        );
+    }
+
+    #[test]
+    fn cron_sender_uses_child_channel_id_for_thread_platforms() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "thread-456".into(),
+            thread_id: None,
+            parent_id: Some("channel-123".into()),
+            origin_event_id: None,
+        };
+
+        assert_eq!(cron_sender_thread_id(&channel).as_deref(), Some("thread-456"));
+    }
+
     // --- validate_cronjobs tests ---
 
     #[test]
@@ -1566,6 +1634,17 @@ message = "a"
             disable_on_success_working_dir: None,
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_googlechat_passes_when_configured() {
+        let mut job = test_cron_job();
+        job.platform = "googlechat".into();
+        job.channel = "spaces/TEST".into();
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+
+        assert!(validate_cronjobs(&[job], &["googlechat"]).is_ok());
     }
 
     #[test]

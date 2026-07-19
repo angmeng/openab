@@ -270,6 +270,38 @@ pub struct GoogleChatAdapter {
 }
 
 impl GoogleChatAdapter {
+    /// Build an adapter from resolved parts (#1379): SA key JSON (inline wins
+    /// over file path), optional static access token, optional JWT audience.
+    /// Shared by env-derived construction and `apply_googlechat_config`.
+    pub(crate) fn from_parts(
+        sa_key_json: Option<String>,
+        sa_key_file: Option<String>,
+        access_token: Option<String>,
+        audience: Option<String>,
+    ) -> Self {
+        use tracing::{info, warn};
+        let token_cache = sa_key_json
+            .or_else(|| {
+                sa_key_file.and_then(|path| {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| {
+                            warn!("failed to read Google Chat SA key file '{}': {e}", path);
+                        })
+                        .ok()
+                })
+            })
+            .and_then(|json| {
+                GoogleChatTokenCache::new(&json)
+                    .map_err(|e| warn!("googlechat SA key error: {e}"))
+                    .ok()
+            });
+        let jwt_verifier = audience.map(|aud| {
+            info!("googlechat webhook JWT verification enabled (audience={aud})");
+            GoogleChatJwtVerifier::new(aud)
+        });
+        Self::new(token_cache, access_token, jwt_verifier)
+    }
+
     pub fn new(
         token_cache: Option<GoogleChatTokenCache>,
         access_token: Option<String>,

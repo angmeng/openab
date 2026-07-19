@@ -36,20 +36,23 @@ jobs:
 
       - name: Resolve matrix and tag
         id: resolve
+        env:
+          INPUT_VARIANTS: ${{ inputs.variants }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Resolve variants
-          if [ "${{ inputs.variants }}" = "all" ] || [ -z "${{ inputs.variants }}" ]; then
-            VARIANTS="${{ env.ALL_VARIANTS }}"
+          if [ "$INPUT_VARIANTS" = "all" ] || [ -z "$INPUT_VARIANTS" ]; then
+            VARIANTS="$ALL_VARIANTS"
           else
-            VARIANTS="${{ inputs.variants }}"
+            VARIANTS="$INPUT_VARIANTS"
           fi
           # Convert to JSON array
           JSON=$(echo "$VARIANTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
           echo "variants=${JSON}" >> "$GITHUB_OUTPUT"
 
           # Resolve tag
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           else
             SHA=$(git rev-parse --short HEAD)
             echo "tag=snapshot-${SHA}" >> "$GITHUB_OUTPUT"
@@ -83,13 +86,15 @@ jobs:
 
       - name: Resolve Dockerfile
         id: df
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
-          if [ "${{ matrix.variant }}" = "default" ]; then
+          if [ "$VARIANT" = "default" ]; then
             echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
           else
-            echo "file=Dockerfile.${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
-            echo "suffix=-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+            echo "file=Dockerfile.${VARIANT}" >> "$GITHUB_OUTPUT"
+            echo "suffix=-${VARIANT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push by digest
@@ -104,10 +109,11 @@ jobs:
           cache-to: type=gha,scope=snapshot-${{ matrix.variant }}-${{ matrix.platform.os }},mode=max
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -128,11 +134,13 @@ jobs:
     steps:
       - name: Resolve suffix
         id: df
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
-          if [ "${{ matrix.variant }}" = "default" ]; then
+          if [ "$VARIANT" = "default" ]; then
             echo "suffix=" >> "$GITHUB_OUTPUT"
           else
-            echo "suffix=-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+            echo "suffix=-${VARIANT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download digests
@@ -151,13 +159,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list
+        env:
+          SUFFIX: ${{ steps.df.outputs.suffix }}
+          TAG: ${{ needs.matrix.outputs.tag }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}${SUFFIX}"
           docker buildx imagetools create \
-            -t "${IMAGE}:${{ needs.matrix.outputs.tag }}" \
+            -t "${IMAGE}:${TAG}" \
             $(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
 
       - name: Summary
+        env:
+          SUFFIX: ${{ steps.df.outputs.suffix }}
+          TAG: ${{ needs.matrix.outputs.tag }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }}"
-          echo "### 📦 \`${IMAGE}:${{ needs.matrix.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}${SUFFIX}"
+          echo "### 📦 \`${IMAGE}:${TAG}\`" >> "$GITHUB_STEP_SUMMARY"

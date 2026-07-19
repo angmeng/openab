@@ -53,28 +53,31 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          PR_JSON=$(gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }})
+          PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
           echo "ref=$(echo "$PR_JSON" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
           echo "repo=$(echo "$PR_JSON" | jq -r '.head.repo.full_name')" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Dockerfile
         id: df
+        env:
+          VARIANT: ${{ inputs.variant }}
         run: |
-          if [ "${{ inputs.variant }}" = "default" ]; then
+          if [ "$VARIANT" = "default" ]; then
             echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
             echo "build_args=" >> "$GITHUB_OUTPUT"
             echo "tag_suffix=" >> "$GITHUB_OUTPUT"
             echo "target=" >> "$GITHUB_OUTPUT"
-          elif [ "${{ inputs.variant }}" = "kiro" ]; then
+          elif [ "$VARIANT" = "kiro" ]; then
             # Unified build (all platforms) tagged as :pr<N>-kiro
             echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
             echo "build_args=BUILD_MODE=unified" >> "$GITHUB_OUTPUT"
             echo "tag_suffix=-kiro" >> "$GITHUB_OUTPUT"
             echo "target=" >> "$GITHUB_OUTPUT"
-          elif [ "${{ inputs.variant }}" = "unified" ]; then
+          elif [ "$VARIANT" = "unified" ]; then
             # Same base Dockerfile as "default", but built with BUILD_MODE=unified
             # so the telegram/line/feishu/wecom/googlechat/teams gateway adapters
             # (Cargo feature `unified`) are actually compiled in. The "default"
@@ -93,8 +96,8 @@ jobs:
             echo "file=Dockerfile.unified" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
             echo "build_args=" >> "$GITHUB_OUTPUT"
-            echo "tag_suffix=-${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
-            echo "target=${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
+            echo "tag_suffix=-${VARIANT}" >> "$GITHUB_OUTPUT"
+            echo "target=${VARIANT}" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -136,10 +139,11 @@ jobs:
           cache-to: type=gha,scope=pr-${{ inputs.variant }}-${{ matrix.platform.os }},mode=max
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -171,8 +175,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list
+        env:
+          SUFFIX: ${{ needs.resolve-pr.outputs.suffix }}
+          TAG_SUFFIX: ${{ needs.resolve-pr.outputs.tag_suffix }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ needs.resolve-pr.outputs.suffix }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}${SUFFIX}"
           docker buildx imagetools create \
-            -t "${IMAGE}:pr${{ inputs.pr_number }}${{ needs.resolve-pr.outputs.tag_suffix }}" \
+            -t "${IMAGE}:pr${PR_NUMBER}${TAG_SUFFIX}" \
             $(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))

@@ -18,12 +18,15 @@ jobs:
       issues: write
     steps:
       - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DECISION: ${{ inputs.decision }}
         with:
           script: |
             const MAINTAINER = 'pending-maintainer';
             const CONTRIBUTOR = 'pending-contributor';
-            const prNumber = ${{ inputs.pr_number }};
-            const decision = '${{ inputs.decision }}';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const decision = process.env.DECISION;
 
             const addLabel = decision === 'maintainer' ? MAINTAINER : CONTRIBUTOR;
             const removeLabel = decision === 'maintainer' ? CONTRIBUTOR : MAINTAINER;

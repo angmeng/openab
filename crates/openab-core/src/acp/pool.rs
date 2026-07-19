@@ -679,6 +679,22 @@ impl SessionPool {
         conn.set_config_option(config_id, value).await
     }
 
+    /// Query account-level usage/billing from the backend agent for a session
+    /// (kiro-cli extension). Fails when there is no active session for the
+    /// thread or the backend does not support usage queries.
+    pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
+        let conn = {
+            let state = self.state.read().await;
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+        };
+        let mut conn = conn.lock().await;
+        conn.get_usage().await
+    }
+
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {

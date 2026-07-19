@@ -45,9 +45,11 @@ jobs:
     steps:
       - name: Resolve and validate tag
         id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -159,10 +161,11 @@ jobs:
 
       - name: Export digest
         if: inputs.dry_run != true
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         if: inputs.dry_run != true
@@ -214,12 +217,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list
+        env:
+          VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
+          AGENT: ${{ matrix.agent }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
-          AGENT="${{ matrix.agent }}"
-          SHA="${{ github.sha }}"
-          SHORT_SHA="${SHA:0:7}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
 
           DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
 
@@ -232,10 +235,11 @@ jobs:
             ${DIGESTS}
 
       - name: Summary
+        env:
+          VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
+          AGENT: ${{ matrix.agent }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
-          AGENT="${{ matrix.agent }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
           echo "### 📦 \`${IMAGE}:${VERSION}-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "### 📦 \`${IMAGE}:beta-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -266,8 +270,9 @@ jobs:
 
       - name: Find pre-release image
         id: find-prerelease
+        env:
+          CHART_VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
         run: |
-          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
           PRERELEASE_TAG=$(git tag -l "v${CHART_VERSION}-*" --sort=-v:refname | head -1)
           if [ -z "$PRERELEASE_TAG" ]; then
             echo "::error::No pre-release tag found for v${CHART_VERSION}-*. Run a pre-release build first."
@@ -278,10 +283,11 @@ jobs:
           echo "prerelease_version=${PRERELEASE_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Verify and promote to stable tags
+        env:
+          PRERELEASE_VERSION: ${{ steps.find-prerelease.outputs.prerelease_version }}
+          CHART_VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          PRERELEASE_VERSION="${{ steps.find-prerelease.outputs.prerelease_version }}"
-          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
           MAJOR_MINOR="${CHART_VERSION%.*}"
           AGENT="${{ matrix.agent }}"
 
@@ -298,10 +304,11 @@ jobs:
             "${IMAGE}:${PRERELEASE_VERSION}-${AGENT}"
 
       - name: Summary
+        env:
+          CHART_VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
+          AGENT: ${{ matrix.agent }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
-          AGENT="${{ matrix.agent }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
           echo "### 📦 Promoted \`${IMAGE}:${CHART_VERSION}-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "### 📦 Promoted \`${IMAGE}:stable-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -321,7 +328,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
 
       - uses: docker/login-action@v4
         with:
@@ -330,7 +337,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push chart to OCI
+        env:
+          CHART_VERSION: ${{ needs.resolve-tag.outputs.chart_version }}
         run: |
-          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
           helm package charts/openab
           helm push openab-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

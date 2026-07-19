@@ -34,10 +34,12 @@ jobs:
         id: versions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_AWS_CLI_VERSION: ${{ inputs.aws_cli_version }}
+          INPUT_GHPOOL_VERSION: ${{ inputs.ghpool_version }}
         run: |
           # AWS CLI version
-          if [ -n "${{ inputs.aws_cli_version }}" ]; then
-            AWS_VER="${{ inputs.aws_cli_version }}"
+          if [ -n "$INPUT_AWS_CLI_VERSION" ]; then
+            AWS_VER="$INPUT_AWS_CLI_VERSION"
           else
             AWS_VER=$(curl -fsSL https://raw.githubusercontent.com/aws/aws-cli/v2/CHANGELOG.rst | grep -m1 '^[0-9]' | cut -d' ' -f1)
             echo "Resolved latest AWS CLI: $AWS_VER"
@@ -45,8 +47,8 @@ jobs:
           echo "aws_cli_version=${AWS_VER}" >> "$GITHUB_OUTPUT"
 
           # ghpool version
-          if [ -n "${{ inputs.ghpool_version }}" ]; then
-            GHP_VER="${{ inputs.ghpool_version }}"
+          if [ -n "$INPUT_GHPOOL_VERSION" ]; then
+            GHP_VER="$INPUT_GHPOOL_VERSION"
           else
             GHP_VER=$(gh release view --repo openabdev/ghpool --json tagName -q '.tagName' | sed 's/^v//')
             echo "Resolved latest ghpool: $GHP_VER"
@@ -54,10 +56,13 @@ jobs:
           echo "ghpool_version=${GHP_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Summary
+        env:
+          AWS_CLI_VERSION: ${{ steps.versions.outputs.aws_cli_version }}
+          GHPOOL_VERSION: ${{ steps.versions.outputs.ghpool_version }}
         run: |
           echo "### Resolved Versions" >> "$GITHUB_STEP_SUMMARY"
-          echo "- AWS CLI: ${{ steps.versions.outputs.aws_cli_version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ghpool: ${{ steps.versions.outputs.ghpool_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- AWS CLI: ${AWS_CLI_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghpool: ${GHPOOL_VERSION}" >> "$GITHUB_STEP_SUMMARY"
 
   bundle:
     needs: resolve
@@ -69,8 +74,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Install AWS CLI v2
+        env:
+          AWS_CLI_VERSION: ${{ needs.resolve.outputs.aws_cli_version }}
         run: |
-          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${{ matrix.awscli_arch }}-${{ needs.resolve.outputs.aws_cli_version }}.zip" -o /tmp/awscli.zip
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${{ matrix.awscli_arch }}-${AWS_CLI_VERSION}.zip" -o /tmp/awscli.zip
           unzip -q /tmp/awscli.zip -d /tmp
           /tmp/aws/install --install-dir ./aws-cli --bin-dir ./bin
           rm -rf /tmp/aws /tmp/awscli.zip
@@ -78,8 +85,8 @@ jobs:
       - name: Download ghp from ghpool release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHP_VER: ${{ needs.resolve.outputs.ghpool_version }}
         run: |
-          GHP_VER="${{ needs.resolve.outputs.ghpool_version }}"
           gh release download "v${GHP_VER}" \
             --repo openabdev/ghpool \
             --pattern "ghpool-${GHP_VER}-${{ matrix.ghpool_arch }}.tar.gz" \
@@ -150,16 +157,18 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_CLI_VERSION: ${{ needs.resolve.outputs.aws_cli_version }}
+          GHPOOL_VERSION: ${{ needs.resolve.outputs.ghpool_version }}
         run: |
-          TAG="pre-seed-utils-v${{ needs.resolve.outputs.aws_cli_version }}-ghp${{ needs.resolve.outputs.ghpool_version }}"
+          TAG="pre-seed-utils-v${AWS_CLI_VERSION}-ghp${GHPOOL_VERSION}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "pre_seed utils (AWS CLI ${{ needs.resolve.outputs.aws_cli_version }} + ghp ${{ needs.resolve.outputs.ghpool_version }})" \
+            --title "pre_seed utils (AWS CLI ${AWS_CLI_VERSION} + ghp ${GHPOOL_VERSION})" \
             --notes "Bundled pre_seed utilities for OAB fleet.
 
           **Contents:**
-          - AWS CLI v${{ needs.resolve.outputs.aws_cli_version }}
-          - ghp v${{ needs.resolve.outputs.ghpool_version }} (ghpool shim)
+          - AWS CLI v${AWS_CLI_VERSION}
+          - ghp v${GHPOOL_VERSION} (ghpool shim)
           - gh → ghp symlink
 
           **Usage:** Add to \`[hooks.pre_seed].sources\` as S3 URI after uploading." \
@@ -175,7 +184,7 @@ jobs:
       contents: read
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1

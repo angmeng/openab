@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::feishu_card;
 
@@ -173,32 +173,48 @@ impl FeishuConfig {
     /// Build config from environment variables. Returns None if FEISHU_APP_ID
     /// is not set (adapter disabled).
     pub fn from_env() -> Option<Self> {
-        let app_id = std::env::var("FEISHU_APP_ID").ok()?;
-        let app_secret = std::env::var("FEISHU_APP_SECRET").ok().unwrap_or_default();
+        Self::from_reader(|k| std::env::var(k).ok())
+    }
+
+    /// Build config from an arbitrary string reader (#1377) — shared by
+    /// env-derived construction and `apply_feishu_config`, so parsing rules
+    /// and defaults live in exactly one place.
+    pub(crate) fn from_reader<F: Fn(&str) -> Option<String>>(read: F) -> Option<Self> {
+        let app_id = read("FEISHU_APP_ID")?;
+        let app_secret = read("FEISHU_APP_SECRET").unwrap_or_default();
         if app_secret.is_empty() {
             warn!("FEISHU_APP_ID set but FEISHU_APP_SECRET is empty");
             return None;
         }
-        let domain = std::env::var("FEISHU_DOMAIN").unwrap_or_else(|_| "feishu".into());
-        let connection_mode = match std::env::var("FEISHU_CONNECTION_MODE")
-            .unwrap_or_else(|_| "websocket".into())
+        let domain = read("FEISHU_DOMAIN").unwrap_or_else(|| "feishu".into());
+        let connection_mode = match read("FEISHU_CONNECTION_MODE")
+            .unwrap_or_else(|| "websocket".into())
             .to_lowercase()
             .as_str()
         {
             "webhook" => ConnectionMode::Webhook,
             _ => ConnectionMode::Websocket,
         };
-        let webhook_path = std::env::var("FEISHU_WEBHOOK_PATH")
-            .unwrap_or_else(|_| "/webhook/feishu".into());
-        let verification_token = std::env::var("FEISHU_VERIFICATION_TOKEN").ok();
-        let encrypt_key = std::env::var("FEISHU_ENCRYPT_KEY").ok();
-        let allowed_groups = parse_csv("FEISHU_ALLOWED_GROUPS");
-        let allowed_users = parse_csv("FEISHU_ALLOWED_USERS");
-        let require_mention = std::env::var("FEISHU_REQUIRE_MENTION")
+        let webhook_path = read("FEISHU_WEBHOOK_PATH").unwrap_or_else(|| "/webhook/feishu".into());
+        let verification_token = read("FEISHU_VERIFICATION_TOKEN");
+        let encrypt_key = read("FEISHU_ENCRYPT_KEY");
+        let allowed_groups = read("FEISHU_ALLOWED_GROUPS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allowed_users = read("FEISHU_ALLOWED_USERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let require_mention = read("FEISHU_REQUIRE_MENTION")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let allow_bots = match std::env::var("FEISHU_ALLOW_BOTS")
-            .unwrap_or_else(|_| "off".into())
+        let allow_bots = match read("FEISHU_ALLOW_BOTS")
+            .unwrap_or_else(|| "off".into())
             .to_lowercase()
             .as_str()
         {
@@ -206,9 +222,14 @@ impl FeishuConfig {
             "all" => AllowBots::All,
             _ => AllowBots::Off,
         };
-        let trusted_bot_ids = parse_csv("FEISHU_TRUSTED_BOT_IDS");
-        let allow_user_messages = match std::env::var("FEISHU_ALLOW_USER_MESSAGES")
-            .unwrap_or_else(|_| "multibot_mentions".into())
+        let trusted_bot_ids = read("FEISHU_TRUSTED_BOT_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allow_user_messages = match read("FEISHU_ALLOW_USER_MESSAGES")
+            .unwrap_or_else(|| "multibot_mentions".into())
             .to_lowercase()
             .replace('-', "_")
             .as_str()
@@ -217,20 +238,16 @@ impl FeishuConfig {
             "mentions" => AllowUsers::Mentions,
             _ => AllowUsers::MultibotMentions,
         };
-        let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
-            .ok()
+        let max_bot_turns = read("FEISHU_MAX_BOT_TURNS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
-        let dedupe_ttl_secs = std::env::var("FEISHU_DEDUPE_TTL_SECS")
-            .ok()
+        let dedupe_ttl_secs = read("FEISHU_DEDUPE_TTL_SECS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
-        let message_limit = std::env::var("FEISHU_MESSAGE_LIMIT")
-            .ok()
+        let message_limit = read("FEISHU_MESSAGE_LIMIT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(4000);
-        let session_ttl_secs = std::env::var("FEISHU_SESSION_TTL_HOURS")
-            .ok()
+        let session_ttl_secs = read("FEISHU_SESSION_TTL_HOURS")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(24)
             * 3600;
@@ -239,20 +256,17 @@ impl FeishuConfig {
         // is unset or empty, card streaming is on in auto mode (short → post,
         // long / code / table → card). FEISHU_CARD_STREAMING_MODE=post is the
         // no-recompile kill-switch back to today's post-only behavior. ---
-        let streaming_mode = std::env::var("FEISHU_CARD_STREAMING_MODE")
-            .ok()
+        let streaming_mode = read("FEISHU_CARD_STREAMING_MODE")
             .filter(|v| !v.trim().is_empty())
             .map(|v| StreamingMode::parse(&v))
             .unwrap_or_default();
-        let card_fallback_to_post = std::env::var("FEISHU_CARD_FALLBACK_TO_POST")
+        let card_fallback_to_post = read("FEISHU_CARD_FALLBACK_TO_POST")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let card_promote_bytes = std::env::var("FEISHU_CARD_PROMOTE_BYTES")
-            .ok()
+        let card_promote_bytes = read("FEISHU_CARD_PROMOTE_BYTES")
             .and_then(|v| v.parse().ok())
             .unwrap_or(4000);
-        let card_idle_finalize_ms = std::env::var("FEISHU_CARD_IDLE_FINALIZE_MS")
-            .ok()
+        let card_idle_finalize_ms = read("FEISHU_CARD_IDLE_FINALIZE_MS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
 
@@ -293,15 +307,6 @@ impl FeishuConfig {
             "https://open.feishu.cn".into()
         }
     }
-}
-
-fn parse_csv(var: &str) -> Vec<String> {
-    std::env::var(var)
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3332,7 +3337,9 @@ pub async fn webhook(
             }
         }
     } else {
-        warn!("FEISHU_ENCRYPT_KEY not configured — webhook signature verification is SKIPPED (insecure)");
+        // L1 unenforceable is surfaced once at startup by
+        // AppState::warn_unenforceable_l1 (#1356); avoid a per-request warn flood.
+        debug!("FEISHU_ENCRYPT_KEY not configured — webhook signature verification is SKIPPED");
     }
 
     // Parse body — may be encrypted

@@ -129,6 +129,36 @@ max_sessions = 10
 | `allow_all_channels` | No | Allow messages from all channels (default: `false`) |
 | `allow_all_users` | No | Allow messages from all users (default: `false`) |
 
+### `[wecom]` Section (credentials + trust)
+
+Since #1378 the `[wecom]` section carries the full adapter configuration — credentials, connection, and trust — config-first with `WECOM_*` env fallback:
+
+```toml
+[wecom]
+corp_id          = "${WECOM_CORP_ID}"
+secret           = "${WECOM_SECRET}"
+token            = "${WECOM_TOKEN}"
+encoding_aes_key = "${WECOM_ENCODING_AES_KEY}"
+agent_id         = "1000002"
+allowed_users    = ["zhangsan", "lisi"]
+```
+
+### User Trust (`[wecom]` section)
+
+> **Trust resolution:** the `[wecom]` section's trust settings apply in **both** deployment modes. Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[wecom]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[wecom]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[wecom]` section:
+
+```toml
+[wecom]
+allowed_users = ["zhangsan", "lisi"]  # WeCom UserIDs (tenant-assigned, freeform strings)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `WECOM_ALLOW_ALL_USERS` / `WECOM_ALLOWED_USERS` env var when unset.
+
+> ⚠️ **Deprecated:** driving WeCom trust through the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[wecom]` (or `WECOM_*` env vars).
+
 ## 6. Expose the Gateway (HTTPS)
 
 WeCom requires a publicly accessible HTTPS URL for callbacks.

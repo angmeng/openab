@@ -125,18 +125,25 @@ pub struct TeamsConfig {
 
 impl TeamsConfig {
     pub fn from_env() -> Option<Self> {
-        let app_id = std::env::var("TEAMS_APP_ID").ok()?;
-        let app_secret = std::env::var("TEAMS_APP_SECRET").ok()?;
+        Self::from_reader(|k| std::env::var(k).ok())
+    }
+
+    /// Build config from an arbitrary string reader (#1380) — shared by
+    /// env-derived construction and `apply_teams_config`, so the same
+    /// mandatory-credential semantics apply to both paths.
+    pub(crate) fn from_reader<F: Fn(&str) -> Option<String>>(read: F) -> Option<Self> {
+        let app_id = read("TEAMS_APP_ID")?;
+        let app_secret = read("TEAMS_APP_SECRET")?;
         Some(Self {
             app_id,
             app_secret,
-            oauth_endpoint: std::env::var("TEAMS_OAUTH_ENDPOINT").unwrap_or_else(|_| {
+            oauth_endpoint: read("TEAMS_OAUTH_ENDPOINT").unwrap_or_else(|| {
                 "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token".into()
             }),
-            openid_metadata: std::env::var("TEAMS_OPENID_METADATA").unwrap_or_else(|_| {
+            openid_metadata: read("TEAMS_OPENID_METADATA").unwrap_or_else(|| {
                 "https://login.botframework.com/v1/.well-known/openidconfiguration".into()
             }),
-            allowed_tenants: std::env::var("TEAMS_ALLOWED_TENANTS")
+            allowed_tenants: read("TEAMS_ALLOWED_TENANTS")
                 .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim().to_string())

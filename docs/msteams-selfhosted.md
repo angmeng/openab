@@ -31,6 +31,34 @@ tables = "off"
 
 Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
 
+### `[teams]` Section (credentials + trust)
+
+Since #1380 the `[teams]` section carries the full adapter configuration — config-first with `TEAMS_*` env fallback:
+
+```toml
+[teams]
+app_id     = "${TEAMS_APP_ID}"
+app_secret = "${TEAMS_APP_SECRET}"
+allowed_tenants = ["<tenant-guid>"]
+allowed_users   = ["29:1abc..."]
+```
+
+### User Trust (`[teams]` section)
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[teams]` section:
+
+```toml
+[teams]
+allowed_users = ["29:1abc..."]  # Bot Framework activity.from.id values
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `TEAMS_ALLOW_ALL_USERS` / `TEAMS_ALLOWED_USERS` env var when unset. To find a user's `29:…` ID, check the OAB logs — the sender ID is logged for each incoming message.
+
+> **Trust resolution:** the `[teams]` section's trust settings apply in **both** deployment modes. Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[teams]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[teams]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+> ⚠️ **Deprecated:** driving Teams trust through the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[teams]` (or `TEAMS_*` env vars).
+
 ---
 
 ## Standalone Gateway Mode (Legacy)

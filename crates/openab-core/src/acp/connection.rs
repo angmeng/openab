@@ -1,5 +1,6 @@
 use crate::acp::protocol::{
-    parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -179,6 +180,9 @@ pub struct AcpConnection {
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
+    /// Used to gate agent-specific extension methods.
+    pub agent_name: String,
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
@@ -474,6 +478,7 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            agent_name: String::new(),
             config_options: Vec::new(),
             last_active: Instant::now(),
             activity,
@@ -552,6 +557,7 @@ impl AcpConnection {
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
+        self.agent_name = agent_name.to_string();
         self.supports_load_session = result
             .and_then(|r| r.get("agentCapabilities"))
             .and_then(|c| c.get("loadSession"))
@@ -658,6 +664,50 @@ impl AcpConnection {
         }
 
         Ok(self.config_options.clone())
+    }
+
+    /// Query account-level usage/billing via kiro-cli's
+    /// `_kiro.dev/commands/execute` extension (the `/usage` slash command).
+    ///
+    /// This is a Kiro-specific extension, not part of the ACP spec, and the
+    /// request shape is strict: a malformed `command` value is a
+    /// deserialization error that kills the whole ACP connection (no JSON-RPC
+    /// error is returned). We therefore gate on the agent name advertised in
+    /// `initialize` and never retry on failure.
+    pub async fn get_usage(&mut self) -> Result<UsageReport> {
+        if !self.agent_name.to_ascii_lowercase().contains("kiro") {
+            return Err(anyhow!(
+                "usage query is not supported by this backend ({})",
+                if self.agent_name.is_empty() {
+                    "unknown agent"
+                } else {
+                    &self.agent_name
+                }
+            ));
+        }
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+
+        let resp = self
+            .send_request(
+                "_kiro.dev/commands/execute",
+                Some(json!({
+                    "sessionId": session_id,
+                    // Adjacently-tagged TuiCommand enum: tag = "command", content = "args".
+                    "command": {"command": "usage", "args": {}},
+                })),
+            )
+            .await?;
+
+        let result = resp
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow!("empty usage response"))?;
+        parse_usage_report(result)
+            .ok_or_else(|| anyhow!("could not parse usage response from agent"))
     }
 
     /// Send a prompt with content blocks (text and/or images) and return a receiver

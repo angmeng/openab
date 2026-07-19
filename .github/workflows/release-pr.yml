@@ -38,9 +38,12 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             CURRENT=$(grep '^version:' charts/openab/Chart.yaml | awk '{print $2}')
             BASE="${CURRENT%%-*}"
@@ -49,7 +52,7 @@ jobs:
               VERSION="${BASE}-beta.$((BETA_NUM + 1))"
             else
               IFS='.' read -r major minor patch <<< "$BASE"
-              case "${{ inputs.bump }}" in
+              case "$INPUT_BUMP" in
                 major) major=$((major + 1)); minor=0; patch=0 ;;
                 minor) minor=$((minor + 1)); patch=0 ;;
                 patch) patch=$((patch + 1)) ;;
@@ -65,9 +68,10 @@ jobs:
           echo "stable=${STABLE}" >> "$GITHUB_OUTPUT"
 
       - name: Update version files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          STABLE: ${{ steps.version.outputs.stable }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          STABLE="${{ steps.version.outputs.stable }}"
           # Chart.yaml always gets the full version (beta or stable)
           sed -i "s/^version: .*/version: ${VERSION}/" charts/openab/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/openab/Chart.yaml
@@ -77,8 +81,8 @@ jobs:
       - name: Create release PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           BRANCH="release/v${VERSION}"
           git config user.name "openab-app[bot]"
           git config user.email "274185012+openab-app[bot]@users.noreply.github.com"

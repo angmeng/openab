@@ -12,6 +12,14 @@ A curated list of projects, tools, and resources built on or for the OpenAB ecos
 
 ---
 
+## Monitoring & Observability
+
+| Project | Description | Author |
+|---------|-------------|--------|
+| [openab-dashboard](https://github.com/masami-agent/openab-dashboard) | A lightweight, single-binary monitoring dashboard for OpenAB agent pods. Track token usage, response times, and pod health across all AI coding agents. Built with Rust + axum + SQLite. | [@masami-agent](https://github.com/masami-agent) |
+
+---
+
 ## Articles
 
 | Title | Description | Author |

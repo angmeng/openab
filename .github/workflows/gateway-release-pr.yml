@@ -27,16 +27,17 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Update gateway version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
           sed -i "s/^version = .*/version = \"${VERSION}\"/" crates/openab-gateway/Cargo.toml
           echo "::notice::Gateway release version: ${VERSION}"
 
       - name: Create release PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
           BRANCH="release/gateway-v${VERSION}"
           git config user.name "openab-app[bot]"
           git config user.email "274185012+openab-app[bot]@users.noreply.github.com"

@@ -745,15 +745,15 @@ impl ChatAdapter for GatewayAdapter {
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
 
 /// Resolved gateway configuration passed to the adapter at startup.
+/// Channel/user allowlists are NOT carried here anymore: L2/L3 enforcement for
+/// the WebSocket path moved to the shared per-platform trust registry
+/// (`AdapterRouter::gate_incoming`), seeded in main.rs with precedence
+/// `GATEWAY_*` env < `[gateway]` section < `[<platform>]` section (#1356).
 pub struct GatewayParams {
     pub url: String,
     pub platform: String,
     pub token: Option<String>,
     pub bot_username: Option<String>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: Vec<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: Vec<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: Vec<String>,
     pub streaming: bool,
@@ -774,10 +774,6 @@ pub async fn run_gateway_adapter(
     // Append auth token as query param if configured
     let gateway_url = params.url;
     let bot_username = params.bot_username;
-    let allow_all_channels = params.allow_all_channels;
-    let allowed_channels: HashSet<String> = params.allowed_channels.into_iter().collect();
-    let allow_all_users = params.allow_all_users;
-    let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
     // Cosmetic streaming edits a placeholder in place. On platforms without an
@@ -850,12 +846,17 @@ pub async fn run_gateway_adapter(
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-        // Hoist filter params outside loop — all fields are loop-invariant
+        // Hoist filter params outside loop — all fields are loop-invariant.
+        // Structural gating (bot filter + @mention) stays in should_skip_event.
+        // L2 (channel) + L3 (identity) are enforced by the shared ingress gate
+        // (`gate_gateway_event`) below — same registry as the unified path —
+        // so channel/user checks are neutered here by passing allow-all.
+        let no_ids: HashSet<String> = HashSet::new();
         let filter = EventFilterParams {
-            allow_all_channels,
-            allowed_channels: &allowed_channels,
-            allow_all_users,
-            allowed_users: &allowed_users,
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
             allow_bot_messages,
             trusted_bot_ids: &trusted_bot_ids,
             bot_username: bot_username.as_deref(),
@@ -882,6 +883,31 @@ pub async fn run_gateway_adapter(
                                 Ok(event) => {
                                     if should_skip_event(&event, &filter) {
                                         continue;
+                                    }
+
+                                    // Shared ingress trust gate (L2 scope + L3
+                                    // identity) — same per-platform registry as
+                                    // the unified path. Placed before slash
+                                    // handling so untrusted senders cannot
+                                    // execute /reset|/cancel|/config. The echo
+                                    // is SPAWNED, never awaited here: streaming
+                                    // send_message waits for a GatewayResponse
+                                    // that only this loop can dispatch, so an
+                                    // inline await would stall all event
+                                    // processing for the reply timeout.
+                                    match gate_gateway_event(&router, &event) {
+                                        GateOutcome::Allow => {}
+                                        GateOutcome::Deny { echo } => {
+                                            if let Some((echo_channel, msg)) = echo {
+                                                let echo_adapter = adapter.clone();
+                                                tasks.spawn(async move {
+                                                    let _ = echo_adapter
+                                                        .send_message(&echo_channel, &msg)
+                                                        .await;
+                                                });
+                                            }
+                                            continue;
+                                        }
                                     }
 
                                     info!(
@@ -1205,7 +1231,6 @@ pub async fn run_gateway_adapter(
     } // outer reconnect loop
 }
 
-
 // --- Public API for unified mode (Phase 2) ---
 
 /// Context required to process a gateway event without a WebSocket connection.
@@ -1214,10 +1239,6 @@ pub struct GatewayEventContext {
     pub adapter: Arc<dyn ChatAdapter>,
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     pub router: Arc<crate::adapter::AdapterRouter>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: HashSet<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: HashSet<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
@@ -1254,6 +1275,83 @@ fn echo_allowed(key: &str) -> bool {
     }
 }
 
+/// Outcome of the shared ingress trust gate. `Deny { echo }` carries the
+/// throttled request-access echo payload (channel + message) when the deny is
+/// an identity deny and the per-sender throttle admits it; the CALLER decides
+/// how to deliver it. Delivery must NOT be awaited inline inside the WS event
+/// loop: `GatewayAdapter::send_message` (streaming mode) waits for a
+/// `GatewayResponse` that is dispatched by that same loop — awaiting there
+/// would stall all event processing for the reply timeout. The WS path spawns
+/// the echo; the unified path (axum/bridge task) awaits it directly.
+enum GateOutcome {
+    Allow,
+    Deny { echo: Option<(ChannelRef, String)> },
+}
+
+/// Shared ingress trust gate for gateway events — used by BOTH the standalone
+/// WebSocket path (`run_gateway_adapter`) and the unified path
+/// (`process_gateway_event`), so L2 (channel scope) and L3 (identity) are
+/// enforced by the same per-platform registry regardless of deployment mode
+/// (#1356 Phase 1c prerequisite).
+///
+/// On `DenyIdentity`, returns the throttled request-access echo payload; on
+/// `DenyScope` (and any future variant), denies silently — scope is not a
+/// security boundary, so no echo.
+///
+/// Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+/// evaluated against the channel allowlist like any other channel (the
+/// `allow_dm` surface semantics arrive with the per-platform trust flip).
+/// TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+/// `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEvent) -> GateOutcome {
+    let decision =
+        router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    match decision {
+        crate::trust::Decision::Allow => GateOutcome::Allow,
+        crate::trust::Decision::DenyIdentity => {
+            // L3 identity deny → echo the sender their ID so they can request
+            // access (throttled to avoid amplification). Bots never reach here
+            // (should_skip_event handles bot admission; L3 is human-only).
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                "gateway event denied (identity); echoing request-access"
+            );
+            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
+            let echo = if echo_allowed(&throttle_key) {
+                let echo_channel = ChannelRef {
+                    platform: event.platform.clone(),
+                    channel_id: event.channel.id.clone(),
+                    thread_id: event.channel.thread_id.clone(),
+                    parent_id: None,
+                    origin_event_id: Some(event.event_id.clone()),
+                };
+                let msg = format!(
+                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
+                    event.sender.id
+                );
+                Some((echo_channel, msg))
+            } else {
+                None
+            };
+            GateOutcome::Deny { echo }
+        }
+        // DenyScope (and any future variant) → silent drop (scope is not a
+        // security boundary; no request-access echo).
+        _ => {
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                ?decision,
+                "gateway event denied (scope); silent"
+            );
+            GateOutcome::Deny { echo: None }
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1280,53 +1378,14 @@ pub async fn process_gateway_event(
     }
 
     // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
-    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
-    // evaluated against the channel allowlist like any other channel (the
-    // `allow_dm` surface semantics arrive with the per-platform trust flip).
-    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
-    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
-    let decision =
-        ctx.router
-            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
-    match decision {
-        crate::trust::Decision::Allow => {}
-        crate::trust::Decision::DenyIdentity => {
-            // L3 identity deny → echo the sender their ID so they can request
-            // access (throttled to avoid amplification). Bots never reach here
-            // (should_skip_event handles bot admission; L3 is human-only).
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                "gateway event denied (identity); echoing request-access"
-            );
-            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
-            if echo_allowed(&throttle_key) {
-                let echo_channel = ChannelRef {
-                    platform: event.platform.clone(),
-                    channel_id: event.channel.id.clone(),
-                    thread_id: event.channel.thread_id.clone(),
-                    parent_id: None,
-                    origin_event_id: Some(event.event_id.clone()),
-                };
-                let echo = format!(
-                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
-                    event.sender.id
-                );
-                let _ = ctx.adapter.send_message(&echo_channel, &echo).await;
+    // Awaiting echo delivery here is safe: this runs on the axum/bridge task,
+    // not inside the WS event loop.
+    match gate_gateway_event(&ctx.router, &event) {
+        GateOutcome::Allow => {}
+        GateOutcome::Deny { echo } => {
+            if let Some((echo_channel, msg)) = echo {
+                let _ = ctx.adapter.send_message(&echo_channel, &msg).await;
             }
-            return Ok(false);
-        }
-        // DenyScope (and any future variant) → silent drop (scope is not a
-        // security boundary; no request-access echo).
-        _ => {
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                ?decision,
-                "gateway event denied (scope); silent"
-            );
             return Ok(false);
         }
     }
@@ -1626,6 +1685,63 @@ mod tests {
                 "{platform} should still support streaming",
             );
         }
+    }
+
+    #[test]
+    fn ws_path_filter_is_structural_only() {
+        // The WS path's hoisted filter neuters channel/user checks (allow-all)
+        // because L2/L3 moved to the shared trust registry (#1356 Phase 1c
+        // prerequisite). This pins the two properties that combination relies
+        // on: unknown channels/users PASS the structural filter (the gate
+        // decides), while bot admission and @mention gating still apply.
+        let no_ids: HashSet<String> = HashSet::new();
+        let trusted: HashSet<String> = ["good-bot".to_string()].into_iter().collect();
+        let filter = EventFilterParams {
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
+            allow_bot_messages: false,
+            trusted_bot_ids: &trusted,
+            bot_username: Some("mybot"),
+        };
+
+        // Unknown human in unknown channel: structural filter passes it through.
+        let ev = make_event(
+            false,
+            "stranger",
+            "unlisted-channel",
+            "private",
+            None,
+            vec!["mybot"],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Untrusted bot still skipped (structural, stays on this path).
+        let ev = make_event(
+            true,
+            "evil-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(should_skip_event(&ev, &filter));
+
+        // Trusted bot admitted.
+        let ev = make_event(
+            true,
+            "good-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Group without @mention still skipped (structural, stays on this path).
+        let ev = make_event(false, "stranger", "group-1", "group", None, vec![]);
+        assert!(should_skip_event(&ev, &filter));
     }
 
     #[test]

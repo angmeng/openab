@@ -35,9 +35,11 @@ jobs:
 
       - name: Resolve tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -66,10 +68,11 @@ jobs:
 
       - name: Export digest
         if: inputs.dry_run != true
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         if: inputs.dry_run != true
@@ -89,9 +92,11 @@ jobs:
     steps:
       - name: Resolve tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -111,13 +116,15 @@ jobs:
           merge-multiple: true
 
       - name: Create multi-arch manifest
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
           cd /tmp/digests
           docker buildx imagetools create \
-            -t ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }} \
-            -t ${{ env.IMAGE_NAME }}:v${{ steps.tag.outputs.version }} \
-            -t ${{ env.IMAGE_NAME }}:latest \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:v${VERSION}" \
+            -t "${IMAGE_NAME}:latest" \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
 
   release:
     needs: [build, merge]
@@ -130,9 +137,11 @@ jobs:
 
       - name: Resolve version
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -142,9 +151,9 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${{ steps.tag.outputs.version }}"
           cat > /tmp/release-notes.md << EOF
           ## OpenAB Gateway v${VERSION}
 

@@ -34,6 +34,21 @@ Set `FEISHU_APP_ID` (and related platform env vars) on the container. No `[gatew
 
 Connect OpenAB to Feishu (China) or Lark (international) so users can chat with an AI agent in DMs or group chats.
 
+## `[feishu]` Section (config-first)
+
+Since #1377 all Feishu settings can live in a first-class `[feishu]` section — config-first with `FEISHU_*` env fallback:
+
+```toml
+[feishu]
+app_id     = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+encrypt_key = "${FEISHU_ENCRYPT_KEY}"   # enables webhook signature verification (L1)
+connection_mode = "websocket"           # default; "webhook" for HTTP callback mode
+allowed_users = ["ou_xxxx"]             # open_id allowlist (note: open_id is per-app)
+```
+
+See [config-reference.md](config-reference.md#feishu) for the full field table.
+
 ## Prerequisites
 
 1. Create a Feishu/Lark app at [open.feishu.cn](https://open.feishu.cn/) or [open.larksuite.com](https://open.larksuite.com/).

@@ -26,10 +26,10 @@ jobs:
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
 
       - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.6.0
+        uses: helm/chart-releaser-action@a917fd15b20e8b64b94d9158ad54cd6345335584 # v1.6.0
         with:
           skip_existing: true
         env:
@@ -40,7 +40,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OWNER="${{ github.repository_owner }}"
-          REPO="${{ github.event.repository.name }}"
+          REPO="${GITHUB_REPOSITORY##*/}"
           CHART=charts/openab
           NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
           VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')

@@ -1,187 +1,295 @@
 use anyhow::{Context, Result};
+use aws_sdk_ecs::error::ProvideErrorMetadata;
 use std::path::Path;
 
-/// Delete every OABService defined in a manifest file or directory (mirrors
-/// `apply -f`). Each manifest's `metadata.name`/`metadata.namespace` are used
-/// directly — cluster is resolved from bootstrap state (supports imported
-/// clusters with custom names), falling back to "oab" if unavailable.
-/// An `OABFleet` manifest expands to multiple services, all deleted in turn.
-///
-/// Continues past a failed delete instead of stopping at the first one, so
-/// one broken/already-gone service in a fleet doesn't block cleanup of the
-/// rest — but still returns an error at the end if anything failed.
-pub async fn run_from_file(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EcsDeletePhase {
+    Delete,
+    Drain,
+    Cleanup,
+}
+
+fn ecs_delete_phase(status: Option<&str>) -> Result<EcsDeletePhase> {
+    match status {
+        Some("ACTIVE") => Ok(EcsDeletePhase::Delete),
+        Some("DRAINING") => Ok(EcsDeletePhase::Drain),
+        Some("INACTIVE") | None => Ok(EcsDeletePhase::Cleanup),
+        Some(other) => anyhow::bail!("unexpected ECS service status during delete: {other}"),
+    }
+}
+
+/// Delete every OABService defined in a manifest file or directory.
+pub(crate) async fn run_from_file(
+    aws_config: &aws_config::SdkConfig,
+    file_path: &str,
+) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = crate::apply::load_manifests(path)
         .with_context(|| format!("failed to load manifest(s) from {file_path}"))?;
-
     if manifests.is_empty() {
-        anyhow::bail!("no manifests found at {}", file_path);
+        anyhow::bail!("no manifests found at {file_path}");
     }
 
-    // Resolve cluster from config (same source as `get` and CLI `delete` commands).
-    // ~/.oabctl/config.toml defaults.cluster; falls back to "oab".
-    // Propagate config load errors — silently defaulting could target the wrong cluster.
     let oab_cfg = crate::config::OabConfig::load()
         .context("failed to load ~/.oabctl/config.toml (run `oabctl bootstrap` first)")?;
     let cluster = &oab_cfg.defaults.cluster;
+    let bucket =
+        crate::control_plane::resolve_bucket(aws_config, oab_cfg.bootstrap.bucket.as_deref())
+            .await?;
 
     let mut failures = Vec::new();
-    for m in &manifests {
-        println!("Deleting {} (from {})...", m.metadata.name, file_path);
-        if let Err(e) = run(aws_config, "oabservice", &m.metadata.name, cluster, &m.metadata.namespace).await {
-            eprintln!("  ⚠ failed to delete {}: {e}", m.metadata.name);
-            failures.push(m.metadata.name.clone());
+    for manifest in &manifests {
+        println!(
+            "Deleting {} (from {})...",
+            manifest.metadata.name, file_path
+        );
+        if let Err(error) = run_with_bucket(
+            aws_config,
+            "oabservice",
+            &manifest.metadata.name,
+            cluster,
+            &manifest.metadata.namespace,
+            &bucket,
+        )
+        .await
+        {
+            eprintln!("  ⚠ failed to delete {}: {error}", manifest.metadata.name);
+            failures.push(manifest.metadata.name.clone());
         }
     }
 
     if !failures.is_empty() {
-        anyhow::bail!("failed to delete {} of {} service(s): {}", failures.len(), manifests.len(), failures.join(", "));
+        anyhow::bail!(
+            "failed to delete {} of {} service(s): {}",
+            failures.len(),
+            manifests.len(),
+            failures.join(", ")
+        );
     }
     Ok(())
 }
 
-
-pub async fn run(
+pub(crate) async fn run(
     aws_config: &aws_config::SdkConfig,
     resource: &str,
     name: &str,
     cluster: &str,
     namespace: &str,
 ) -> Result<()> {
+    let oab_cfg =
+        crate::config::OabConfig::load().context("failed to load ~/.oabctl/config.toml")?;
+    let bucket =
+        crate::control_plane::resolve_bucket(aws_config, oab_cfg.bootstrap.bucket.as_deref())
+            .await?;
+    run_with_bucket(aws_config, resource, name, cluster, namespace, &bucket).await
+}
+
+async fn run_with_bucket(
+    aws_config: &aws_config::SdkConfig,
+    resource: &str,
+    name: &str,
+    cluster: &str,
+    namespace: &str,
+    bucket: &str,
+) -> Result<()> {
     if resource != "oabservice" {
-        anyhow::bail!("unknown resource type: {}. Use 'oabservice'", resource);
+        anyhow::bail!("unknown resource type: {resource}. Use 'oabservice'");
     }
 
-    let service_name = format!("oab-{}-{}", namespace, name);
+    let service_name = format!("oab-{namespace}-{name}");
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
-    let bucket = "oab-control-plane";
 
-    println!("Deleting {}...", name);
+    println!("Deleting {name}...");
 
-    // Capture the service's Cloud Map registry ARN (if any) BEFORE deleting it,
-    // so teardown can resolve the exact Cloud Map service by ARN instead of a
-    // name-only account-wide scan (which could otherwise match a
-    // same-named bot in a different VPC/environment).
-    let registry_arn: Option<String> = ecs
+    let describe_response = ecs
         .describe_services()
         .cluster(cluster)
         .services(&service_name)
         .send()
         .await
-        .ok()
-        .and_then(|r| r.services().first().cloned())
-        .and_then(|s| s.service_registries().first().and_then(|r| r.registry_arn()).map(|a| a.to_string()));
+        .context("failed to describe ECS service before delete")?;
+    let service = describe_response.services().first();
+    let registry_arn: Option<String> = service.and_then(|service| {
+        service
+            .service_registries()
+            .first()
+            .and_then(|registry| registry.registry_arn())
+            .map(str::to_owned)
+    });
+    let service_status = service.and_then(|service| service.status());
+    let delete_phase = ecs_delete_phase(service_status)?;
+    let service_needs_delete = delete_phase == EcsDeletePhase::Delete;
+    let service_is_draining = delete_phase == EcsDeletePhase::Drain;
 
-    // 1. Scale to 0
-    let _ = ecs
-        .update_service()
-        .cluster(cluster)
-        .service(&service_name)
-        .desired_count(0)
-        .send()
-        .await;
-    println!("  ✓ Scaled to 0");
-
-    // 2. Delete ECS service
-    ecs.delete_service()
-        .cluster(cluster)
-        .service(&service_name)
-        .force(true)
-        .send()
-        .await
-        .context("failed to delete ECS service")?;
-    println!("  ✓ ECS service deleted");
-
-    // 2a. Wait for the service to fully drain (INACTIVE status) so that
-    // a subsequent `apply` doesn't hit "Unable to Start a service that
-    // is still Draining".
-    const DRAIN_POLL_ATTEMPTS: u32 = 12;
-    const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-    eprint!("  ⏳ Waiting for drain to complete...");
-    for i in 0..DRAIN_POLL_ATTEMPTS {
-        // Check status first, then sleep — avoids an unnecessary initial delay
-        // when the service transitions quickly.
-        let resp = ecs
-            .describe_services()
+    if service_needs_delete {
+        let _ = ecs
+            .update_service()
             .cluster(cluster)
-            .services(&service_name)
+            .service(&service_name)
+            .desired_count(0)
             .send()
             .await;
-        let is_gone = match resp {
-            Ok(r) => r
-                .services()
-                .first()
-                .map(|s| s.status() == Some("INACTIVE"))
-                .unwrap_or(true),
-            Err(e) => {
-                eprintln!("\n  ⚠ describe_services error (retrying): {e}");
-                false
+        println!("  ✓ Scaled to 0");
+
+        match ecs
+            .delete_service()
+            .cluster(cluster)
+            .service(&service_name)
+            .force(true)
+            .send()
+            .await
+        {
+            Ok(_) => println!("  ✓ ECS service deleted"),
+            Err(error) if error.code() == Some("ServiceNotFoundException") => {
+                println!("  ✓ ECS service already absent")
             }
-        };
-        if is_gone {
-            if i == 0 {
-                eprintln!(" done (immediate)");
-            } else {
-                let elapsed = u64::from(i) * DRAIN_POLL_INTERVAL.as_secs();
-                eprintln!(" done ({elapsed}s)");
-            }
-            break;
+            Err(error) => return Err(error).context("failed to delete ECS service"),
         }
-        if i == DRAIN_POLL_ATTEMPTS - 1 {
-            eprintln!(" timed out (service may still be draining)");
-        } else {
-            eprint!(".");
-            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    } else if service_is_draining {
+        println!("  ✓ ECS service is already draining; resuming delete cleanup");
+    } else {
+        println!("  ✓ ECS service already absent; resuming dependent cleanup");
+    }
+
+    if service_needs_delete || service_is_draining {
+        const DRAIN_POLL_ATTEMPTS: u32 = 12;
+        const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        eprint!("  ⏳ Waiting for drain to complete...");
+        for attempt in 0..DRAIN_POLL_ATTEMPTS {
+            let response = ecs
+                .describe_services()
+                .cluster(cluster)
+                .services(&service_name)
+                .send()
+                .await;
+            let is_gone = match response {
+                Ok(response) => response
+                    .services()
+                    .first()
+                    .map(|service| service.status() == Some("INACTIVE"))
+                    .unwrap_or(true),
+                Err(error) => {
+                    eprintln!("\n  ⚠ describe_services error (retrying): {error}");
+                    false
+                }
+            };
+            if is_gone {
+                if attempt == 0 {
+                    eprintln!(" done (immediate)");
+                } else {
+                    let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
+                    eprintln!(" done ({elapsed}s)");
+                }
+                break;
+            }
+            if attempt == DRAIN_POLL_ATTEMPTS - 1 {
+                eprintln!(" timed out (service may still be draining)");
+            } else {
+                eprint!(".");
+                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            }
         }
     }
 
-    // 2b. Best-effort ingress teardown: Cloud Map service + this API's
-    // routes/integration/stage. No-op for bots that never had ingress. Never
-    // blocks deletion — failures are logged only.
-    if let Err(e) =
+    if let Err(error) =
         crate::ingress::teardown(aws_config, namespace, name, registry_arn.as_deref()).await
     {
-        eprintln!("  ⚠ ingress teardown skipped: {e}");
+        eprintln!("  ⚠ ingress teardown skipped: {error}");
+    }
+    if let Err(error) = crate::ingress::delete_api(aws_config, namespace, name).await {
+        eprintln!("  ⚠ HTTP API cleanup skipped: {error}");
     }
 
-    // 2c. The bot is being permanently removed here (unlike `apply`'s
-    // ingress-removed recreate path), so it's safe to delete the per-bot HTTP
-    // API resource itself too — there's no webhook URL to keep stable for a
-    // bot that no longer exists.
-    if let Err(e) = crate::ingress::delete_api(aws_config, namespace, name).await {
-        eprintln!("  ⚠ HTTP API cleanup skipped: {e}");
-    }
-
-    // 3. Clean up S3 manifest
-    let manifest_key = format!("manifests/{}/{}.yaml", namespace, name);
-    let _ = s3
+    let mut cleanup_failures = Vec::new();
+    let manifest_key = format!("manifests/{namespace}/{name}.yaml");
+    match s3
         .delete_object()
         .bucket(bucket)
         .key(&manifest_key)
         .send()
-        .await;
-    println!("  ✓ Manifest removed from S3");
+        .await
+    {
+        Ok(_) => println!("  ✓ Manifest removed from S3"),
+        Err(error) => cleanup_failures.push(format!(
+            "failed to delete s3://{bucket}/{manifest_key}: {error}"
+        )),
+    }
 
-    // 4. Clean up S3 config (list and delete all generations)
-    let config_prefix = format!("config/{}/{}/", namespace, name);
-    let list = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&config_prefix)
-        .send()
-        .await;
-    if let Ok(resp) = list {
-        for obj in resp.contents() {
-            if let Some(key) = obj.key() {
-                let _ = s3.delete_object().bucket(bucket).key(key).send().await;
+    let artifact_prefix = format!("artifacts/{namespace}/{name}/");
+    let mut continuation_token = None;
+    loop {
+        let response = match s3
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&artifact_prefix)
+            .set_continuation_token(continuation_token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                cleanup_failures.push(format!(
+                    "failed to list config artifacts under s3://{bucket}/{artifact_prefix}: {error}"
+                ));
+                break;
+            }
+        };
+        for object in response.contents() {
+            if let Some(key) = object.key() {
+                if let Err(error) = s3
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                {
+                    cleanup_failures
+                        .push(format!("failed to delete s3://{bucket}/{key}: {error}"));
+                }
             }
         }
+        continuation_token = response.next_continuation_token().map(str::to_owned);
+        if continuation_token.is_none() {
+            break;
+        }
     }
-    println!("  ✓ Config artifacts removed from S3");
+    if cleanup_failures.is_empty() {
+        println!("  ✓ Config artifacts removed from S3");
+    } else {
+        anyhow::bail!(
+            "post-delete cleanup incomplete (safe to retry): {}",
+            cleanup_failures.join("; ")
+        );
+    }
 
-    println!("\n✓ {} deleted", name);
+    println!("\n✓ {name} deleted");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_phase_requests_delete_only_for_active_service() {
+        assert_eq!(
+            ecs_delete_phase(Some("ACTIVE")).unwrap(),
+            EcsDeletePhase::Delete
+        );
+        assert_eq!(
+            ecs_delete_phase(Some("DRAINING")).unwrap(),
+            EcsDeletePhase::Drain
+        );
+        assert_eq!(
+            ecs_delete_phase(Some("INACTIVE")).unwrap(),
+            EcsDeletePhase::Cleanup
+        );
+        assert_eq!(ecs_delete_phase(None).unwrap(), EcsDeletePhase::Cleanup);
+    }
+
+    #[test]
+    fn delete_phase_rejects_unknown_status() {
+        assert!(ecs_delete_phase(Some("UNKNOWN")).is_err());
+    }
 }

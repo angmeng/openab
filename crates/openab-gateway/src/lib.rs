@@ -24,6 +24,13 @@ pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
 // --- App state (shared across all adapters) ---
 
+/// Whether a webhook platform's L1 (transport authentication) is unenforceable:
+/// the platform is active (configured to receive traffic) but its verification
+/// secret is not configured, so it accepts unauthenticated POSTs. See #1356.
+fn l1_unenforceable(active: bool, l1_configured: bool) -> bool {
+    active && !l1_configured
+}
+
 pub struct AppState {
     pub telegram_bot_token: Option<String>,
     pub telegram_secret_token: Option<String>,
@@ -33,13 +40,22 @@ pub struct AppState {
     pub telegram_streaming: Option<bool>,
     pub line_channel_secret: Option<String>,
     pub line_access_token: Option<String>,
+    /// Webhook mount path for LINE (env: `LINE_WEBHOOK_PATH`; config-first via
+    /// `apply_line_config`, default `/webhook/line`).
+    pub line_webhook_path: String,
     #[cfg(feature = "teams")]
     pub teams: Option<adapters::teams::TeamsAdapter>,
+    /// Webhook mount path for Teams (env: `TEAMS_WEBHOOK_PATH`; config-first
+    /// via `apply_teams_config`, default `/webhook/teams`).
+    pub teams_webhook_path: String,
     pub teams_service_urls: Mutex<HashMap<String, (String, Instant)>>,
     #[cfg(feature = "feishu")]
     pub feishu: Option<adapters::feishu::FeishuAdapter>,
     #[cfg(feature = "googlechat")]
     pub google_chat: Option<adapters::googlechat::GoogleChatAdapter>,
+    /// Webhook mount path for Google Chat (env: `GOOGLE_CHAT_WEBHOOK_PATH`;
+    /// config-first via `apply_googlechat_config`, default `/webhook/googlechat`).
+    pub googlechat_webhook_path: String,
     #[cfg(feature = "wecom")]
     pub wecom: Option<adapters::wecom::WecomAdapter>,
     pub ws_token: Option<String>,
@@ -69,13 +85,16 @@ impl AppState {
             telegram_streaming: None,
             line_channel_secret: None,
             line_access_token: None,
+            line_webhook_path: "/webhook/line".into(),
             #[cfg(feature = "teams")]
             teams: None,
+            teams_webhook_path: "/webhook/teams".into(),
             teams_service_urls: Mutex::new(HashMap::new()),
             #[cfg(feature = "feishu")]
             feishu: None,
             #[cfg(feature = "googlechat")]
             google_chat: None,
+            googlechat_webhook_path: "/webhook/googlechat".into(),
             #[cfg(feature = "wecom")]
             wecom: None,
             ws_token: None,
@@ -90,7 +109,7 @@ impl AppState {
     /// Initializes all platform adapters based on available env vars.
     /// `ws_token` is passed separately (only needed for standalone gateway mode).
     pub fn from_env(event_tx: broadcast::Sender<String>, ws_token: Option<String>) -> Self {
-        use tracing::{info, warn};
+        use tracing::info;
 
         // Telegram
         let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
@@ -108,6 +127,8 @@ impl AppState {
         // LINE
         let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
         let line_access_token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
+        let line_webhook_path =
+            std::env::var("LINE_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/line".into());
 
         // Teams
         #[cfg(feature = "teams")]
@@ -115,6 +136,8 @@ impl AppState {
             info!("teams adapter configured");
             adapters::teams::TeamsAdapter::new(config)
         });
+        let teams_webhook_path =
+            std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
 
         // Feishu
         #[cfg(feature = "feishu")]
@@ -128,34 +151,18 @@ impl AppState {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
             if enabled {
-                let token_cache = std::env::var("GOOGLE_CHAT_SA_KEY_JSON")
-                    .ok()
-                    .or_else(|| {
-                        std::env::var("GOOGLE_CHAT_SA_KEY_FILE")
-                            .ok()
-                            .and_then(|path| {
-                                std::fs::read_to_string(&path).map_err(|e| {
-                                    warn!("failed to read GOOGLE_CHAT_SA_KEY_FILE '{}': {e}", path);
-                                }).ok()
-                            })
-                    })
-                    .and_then(|json| {
-                        adapters::googlechat::GoogleChatTokenCache::new(&json)
-                            .map_err(|e| warn!("googlechat SA key error: {e}"))
-                            .ok()
-                    });
-                let access_token = std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok();
-                let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE").ok().map(|aud| {
-                    info!("googlechat JWT verification enabled (audience={aud})");
-                    adapters::googlechat::GoogleChatJwtVerifier::new(aud)
-                });
-                Some(adapters::googlechat::GoogleChatAdapter::new(
-                    token_cache, access_token, jwt_verifier,
+                Some(adapters::googlechat::GoogleChatAdapter::from_parts(
+                    std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
+                    std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
+                    std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
+                    std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
                 ))
             } else {
                 None
             }
         };
+        let googlechat_webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
+            .unwrap_or_else(|_| "/webhook/googlechat".into());
 
         // WeCom
         #[cfg(feature = "wecom")]
@@ -175,13 +182,16 @@ impl AppState {
             telegram_streaming,
             line_channel_secret,
             line_access_token,
+            line_webhook_path,
             #[cfg(feature = "teams")]
             teams,
+            teams_webhook_path,
             teams_service_urls: Mutex::new(HashMap::new()),
             #[cfg(feature = "feishu")]
             feishu,
             #[cfg(feature = "googlechat")]
             google_chat,
+            googlechat_webhook_path,
             #[cfg(feature = "wecom")]
             wecom,
             ws_token,
@@ -190,6 +200,107 @@ impl AppState {
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
             client,
         }
+    }
+
+    /// Phase 1 L1 audit (#1356): warn loudly for each **active** webhook
+    /// platform whose transport authentication (L1) secret is unconfigured.
+    ///
+    /// When L1 is skipped, the webhook accepts unauthenticated POSTs, so the
+    /// per-platform `allowed_users` (L3) allowlist is forgeable — an attacker
+    /// can POST an envelope with an allowlisted sender id and pass the trust
+    /// gate. Phase 1 only warns (backward-compatible: existing no-secret
+    /// deployments keep running); a later phase may escalate to a hard error.
+    ///
+    /// `feishu_webhook_route_mounted`: whether the caller actually mounted the
+    /// Feishu webhook route. The two binaries differ — the standalone gateway
+    /// mounts it only in Webhook connection mode, while the unified binary
+    /// mounts it unconditionally — so exposure is the caller's knowledge, not
+    /// derivable from `AppState` alone.
+    ///
+    /// Call this once at startup **after** all config overrides are applied
+    /// (e.g. after `apply_telegram_config`), so a config-supplied secret is not
+    /// falsely reported as missing. WeCom and MS Teams are intentionally
+    /// omitted: their adapters treat the L1 secret as a construction
+    /// precondition (`from_env` returns `None` without it) and verify every
+    /// request, so they cannot be active-but-unconfigured.
+    #[cfg_attr(not(feature = "feishu"), allow(unused_variables))]
+    pub fn warn_unenforceable_l1(&self, feishu_webhook_route_mounted: bool) {
+        use tracing::warn;
+        for (platform, hint) in self.unenforceable_l1(feishu_webhook_route_mounted) {
+            warn!(
+                platform,
+                hint,
+                "L1 webhook authentication is NOT configured — this webhook accepts \
+                 unauthenticated requests, so the per-platform allowed_users (L3) allowlist \
+                 is forgeable: an attacker can POST a spoofed allowlisted sender id and pass \
+                 the trust gate. Configure the platform's webhook secret/signature to make \
+                 identity trust enforceable. \
+                 See https://github.com/openabdev/openab/issues/1356."
+            );
+        }
+    }
+
+    /// The platforms whose L1 is unenforceable right now, with a remediation
+    /// hint each. Separated from the warn wrapper so the per-platform
+    /// active/configured wiring is unit-testable.
+    #[cfg_attr(not(feature = "feishu"), allow(unused_variables))]
+    fn unenforceable_l1(
+        &self,
+        feishu_webhook_route_mounted: bool,
+    ) -> Vec<(&'static str, &'static str)> {
+        // (platform, active, l1_configured, remediation hint)
+        #[allow(unused_mut)]
+        let mut checks: Vec<(&str, bool, bool, &str)> = vec![
+            (
+                "telegram",
+                self.telegram_bot_token.is_some(),
+                // secret_token is the primary L1; the trusted_source_only IP
+                // allowlist is a weaker-but-real alternate L1 (ADR Layer 1).
+                self.telegram_secret_token.is_some() || self.telegram_trusted_source_only,
+                "set TELEGRAM_SECRET_TOKEN (or [telegram].secret_token), or enable \
+                 TELEGRAM_TRUSTED_SOURCE_ONLY",
+            ),
+            (
+                "line",
+                // Any LINE env present = an operator intends to run LINE. With
+                // no LINE env at all the route still mounts, but spoofed events
+                // then face the core trust gate's deny-all default, so we avoid
+                // a false-positive warn on gateways that don't use LINE.
+                self.line_channel_secret.is_some() || self.line_access_token.is_some(),
+                self.line_channel_secret.is_some(),
+                "set LINE_CHANNEL_SECRET",
+            ),
+        ];
+        #[cfg(feature = "feishu")]
+        checks.push((
+            "feishu",
+            // Active = the webhook route is actually exposed (caller-supplied:
+            // the standalone gateway mounts it only in Webhook connection
+            // mode; the unified binary mounts it unconditionally). Websocket
+            // delivery itself needs no L1 secret — events arrive over an
+            // outbound long-connection.
+            self.feishu.is_some() && feishu_webhook_route_mounted,
+            self.feishu
+                .as_ref()
+                .map(|f| f.config.encrypt_key.is_some())
+                .unwrap_or(false),
+            "set FEISHU_ENCRYPT_KEY",
+        ));
+        #[cfg(feature = "googlechat")]
+        checks.push((
+            "googlechat",
+            self.google_chat.is_some(),
+            self.google_chat
+                .as_ref()
+                .map(|a| a.jwt_verifier.is_some())
+                .unwrap_or(false),
+            "set GOOGLE_CHAT_AUDIENCE",
+        ));
+        checks
+            .into_iter()
+            .filter(|(_, active, l1_configured, _)| l1_unenforceable(*active, *l1_configured))
+            .map(|(platform, _, _, hint)| (platform, hint))
+            .collect()
     }
 
     /// Apply resolved `[telegram]` config values, overriding the env-derived
@@ -202,6 +313,89 @@ impl AppState {
         self.telegram_trusted_source_only = cfg.trusted_source_only;
         self.telegram_streaming = cfg.streaming;
     }
+
+    /// Apply resolved `[line]` config values, overriding the env-derived
+    /// fields (#1376). Same crate-boundary pattern as
+    /// [`AppState::apply_telegram_config`]. Call before
+    /// [`AppState::warn_unenforceable_l1`] so a config-supplied
+    /// `channel_secret` is not falsely flagged as missing L1.
+    pub fn apply_line_config(&mut self, cfg: GatewayLineConfig) {
+        self.line_channel_secret = cfg.channel_secret;
+        self.line_access_token = cfg.channel_access_token;
+        self.line_webhook_path = cfg.webhook_path;
+    }
+
+    /// Apply resolved `[wecom]` config values (#1378), rebuilding the WeCom
+    /// adapter from them. Reuses the adapter's `from_reader` construction so
+    /// the exact same validation applies (all five credentials mandatory,
+    /// numeric agent_id, 43-char AES key) — an incomplete section resolves to
+    /// no adapter, matching env-only semantics.
+    #[cfg(feature = "wecom")]
+    pub fn apply_wecom_config(&mut self, cfg: GatewayWecomConfig) {
+        let streaming = if cfg.streaming_enabled { "true" } else { "false" }.to_string();
+        let debounce = cfg.debounce_secs.to_string();
+        self.wecom = adapters::wecom::WecomConfig::from_reader(|k| match k {
+            "WECOM_CORP_ID" => cfg.corp_id.clone(),
+            "WECOM_SECRET" => cfg.secret.clone(),
+            "WECOM_TOKEN" => cfg.token.clone(),
+            "WECOM_ENCODING_AES_KEY" => cfg.encoding_aes_key.clone(),
+            "WECOM_AGENT_ID" => cfg.agent_id.clone(),
+            "WECOM_WEBHOOK_PATH" => Some(cfg.webhook_path.clone()),
+            "WECOM_STREAMING_ENABLED" => Some(streaming.clone()),
+            "WECOM_DEBOUNCE_SECS" => Some(debounce.clone()),
+            _ => None,
+        })
+        .map(adapters::wecom::WecomAdapter::new);
+    }
+
+    /// Apply resolved `[googlechat]` config values (#1379), rebuilding the
+    /// adapter from them via the same `from_parts` construction as env-only
+    /// startup. Call before [`AppState::warn_unenforceable_l1`] so a
+    /// config-supplied `audience` (JWT verifier) is not falsely flagged.
+    #[cfg(feature = "googlechat")]
+    pub fn apply_googlechat_config(&mut self, cfg: GatewayGoogleChatConfig) {
+        self.googlechat_webhook_path = cfg.webhook_path;
+        self.google_chat = if cfg.enabled {
+            Some(adapters::googlechat::GoogleChatAdapter::from_parts(
+                cfg.sa_key_json,
+                cfg.sa_key_file,
+                cfg.access_token,
+                cfg.audience,
+            ))
+        } else {
+            None
+        };
+    }
+
+    /// Apply resolved `[teams]` config values (#1380), rebuilding the adapter
+    /// through the same `from_reader` construction as env-only startup
+    /// (app_id + app_secret mandatory; incomplete section disables the
+    /// adapter, matching env-only semantics).
+    #[cfg(feature = "teams")]
+    pub fn apply_teams_config(&mut self, cfg: GatewayTeamsConfig) {
+        self.teams_webhook_path = cfg.webhook_path;
+        let tenants = cfg.allowed_tenants.join(",");
+        self.teams = adapters::teams::TeamsConfig::from_reader(|k| match k {
+            "TEAMS_APP_ID" => cfg.app_id.clone(),
+            "TEAMS_APP_SECRET" => cfg.app_secret.clone(),
+            "TEAMS_OAUTH_ENDPOINT" => Some(cfg.oauth_endpoint.clone()),
+            "TEAMS_OPENID_METADATA" => Some(cfg.openid_metadata.clone()),
+            "TEAMS_ALLOWED_TENANTS" => Some(tenants.clone()),
+            _ => None,
+        })
+        .map(adapters::teams::TeamsAdapter::new);
+    }
+
+    /// Apply resolved `[feishu]` config values (#1377), rebuilding the
+    /// adapter through the same `from_reader` construction as env-only
+    /// startup (app_id + app_secret mandatory; incomplete section disables
+    /// the adapter). Call before [`AppState::warn_unenforceable_l1`] so a
+    /// config-supplied `encrypt_key` is not falsely flagged.
+    #[cfg(feature = "feishu")]
+    pub fn apply_feishu_config(&mut self, cfg: GatewayFeishuConfig) {
+        self.feishu = adapters::feishu::FeishuConfig::from_reader(|k| cfg.pairs.get(k).cloned())
+            .map(adapters::feishu::FeishuAdapter::new);
+    }
 }
 
 /// Parameter object for passing resolved Telegram config across the crate
@@ -213,6 +407,63 @@ pub struct GatewayTelegramConfig {
     pub rich_messages: bool,
     pub trusted_source_only: bool,
     pub streaming: Option<bool>,
+}
+
+/// Parameter object for passing resolved LINE config across the crate
+/// boundary without introducing a dependency on `openab-core` (#1376).
+#[derive(Debug, Clone)]
+pub struct GatewayLineConfig {
+    pub channel_secret: Option<String>,
+    pub channel_access_token: Option<String>,
+    pub webhook_path: String,
+}
+
+/// Parameter object for passing resolved WeCom config across the crate
+/// boundary without introducing a dependency on `openab-core` (#1378).
+/// Fields are the fully resolved (config → env → default) values.
+#[derive(Debug, Clone)]
+pub struct GatewayWecomConfig {
+    pub corp_id: Option<String>,
+    pub secret: Option<String>,
+    pub token: Option<String>,
+    pub encoding_aes_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub webhook_path: String,
+    pub streaming_enabled: bool,
+    pub debounce_secs: u64,
+}
+
+/// Parameter object for passing resolved Google Chat config across the crate
+/// boundary without introducing a dependency on `openab-core` (#1379).
+#[derive(Debug, Clone)]
+pub struct GatewayGoogleChatConfig {
+    pub enabled: bool,
+    pub sa_key_json: Option<String>,
+    pub sa_key_file: Option<String>,
+    pub access_token: Option<String>,
+    pub audience: Option<String>,
+    pub webhook_path: String,
+}
+
+/// Parameter object for passing resolved Teams config across the crate
+/// boundary without introducing a dependency on `openab-core` (#1380).
+#[derive(Debug, Clone)]
+pub struct GatewayTeamsConfig {
+    pub app_id: Option<String>,
+    pub app_secret: Option<String>,
+    pub allowed_tenants: Vec<String>,
+    pub oauth_endpoint: String,
+    pub openid_metadata: String,
+    pub webhook_path: String,
+}
+
+/// Parameter object for passing resolved Feishu config across the crate
+/// boundary without introducing a dependency on `openab-core` (#1377).
+/// Carries the config-first key/value pairs in env-var string form; the
+/// adapter's `from_reader` performs all parsing and default resolution.
+#[derive(Debug, Clone)]
+pub struct GatewayFeishuConfig {
+    pub pairs: std::collections::HashMap<String, String>,
 }
 
 // --- Public serve() entry point ---
@@ -264,9 +515,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     if telegram_bot_token.is_some() {
         let webhook_path =
             std::env::var("TELEGRAM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/telegram".into());
-        if telegram_secret_token.is_none() {
-            warn!("TELEGRAM_SECRET_TOKEN not set — webhook requests are NOT validated (insecure)");
-        }
+        // Missing-secret warning is emitted by warn_unenforceable_l1 below,
+        // which also accounts for the trusted_source_only IP-allowlist L1.
         info!(path = %webhook_path, "telegram adapter enabled");
         app = app.route(&webhook_path, post(adapters::telegram::webhook));
     }
@@ -283,14 +533,19 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     #[cfg(feature = "line")]
     let line_access_token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
     #[cfg(feature = "line")]
+    let line_webhook_path =
+        std::env::var("LINE_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/line".into());
+    #[cfg(feature = "line")]
     {
-        info!("line adapter enabled");
-        app = app.route("/webhook/line", post(adapters::line::webhook));
+        info!(path = %line_webhook_path, "line adapter enabled");
+        app = app.route(&line_webhook_path, post(adapters::line::webhook));
     }
     #[cfg(not(feature = "line"))]
     let line_channel_secret: Option<String> = None;
     #[cfg(not(feature = "line"))]
     let line_access_token: Option<String> = None;
+    #[cfg(not(feature = "line"))]
+    let line_webhook_path = "/webhook/line".to_string();
 
     // Teams adapter
     #[cfg(feature = "teams")]
@@ -301,12 +556,12 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     #[cfg(not(feature = "teams"))]
     let teams: Option<()> = None;
 
+    let teams_webhook_path =
+        std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
     #[cfg(feature = "teams")]
     if teams.is_some() {
-        let webhook_path =
-            std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
-        info!(path = %webhook_path, "teams webhook registered");
-        app = app.route(&webhook_path, post(adapters::teams::webhook));
+        info!(path = %teams_webhook_path, "teams webhook registered");
+        app = app.route(&teams_webhook_path, post(adapters::teams::webhook));
     }
 
     // Feishu adapter
@@ -356,42 +611,21 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     // Google Chat adapter
     #[cfg(feature = "googlechat")]
+    let googlechat_webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
+        .unwrap_or_else(|_| "/webhook/googlechat".into());
+    #[cfg(feature = "googlechat")]
     let google_chat = {
         let enabled = std::env::var("GOOGLE_CHAT_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
         if enabled {
-            let token_cache = std::env::var("GOOGLE_CHAT_SA_KEY_JSON")
-                .ok()
-                .or_else(|| {
-                    std::env::var("GOOGLE_CHAT_SA_KEY_FILE")
-                        .ok()
-                        .and_then(|path| {
-                            std::fs::read_to_string(&path).map_err(|e| {
-                                warn!("failed to read GOOGLE_CHAT_SA_KEY_FILE '{}': {e}", path);
-                            }).ok()
-                        })
-                })
-                .and_then(|json| {
-                    adapters::googlechat::GoogleChatTokenCache::new(&json)
-                        .map_err(|e| warn!("googlechat SA key error: {e}"))
-                        .ok()
-                });
-            let access_token = std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok();
-            let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE").ok().map(|aud| {
-                info!("googlechat webhook JWT verification enabled (audience={aud})");
-                adapters::googlechat::GoogleChatJwtVerifier::new(aud)
-            });
-
-            let webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
-                .unwrap_or_else(|_| "/webhook/googlechat".into());
-            info!(path = %webhook_path, "googlechat adapter enabled");
-            app = app.route(&webhook_path, post(adapters::googlechat::webhook));
-
-            Some(adapters::googlechat::GoogleChatAdapter::new(
-                token_cache,
-                access_token,
-                jwt_verifier,
+            info!(path = %googlechat_webhook_path, "googlechat adapter enabled");
+            app = app.route(&googlechat_webhook_path, post(adapters::googlechat::webhook));
+            Some(adapters::googlechat::GoogleChatAdapter::from_parts(
+                std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
+                std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
+                std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
+                std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
             ))
         } else {
             None
@@ -399,6 +633,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "googlechat"))]
     let google_chat: Option<()> = None;
+    #[cfg(not(feature = "googlechat"))]
+    let googlechat_webhook_path = "/webhook/googlechat".to_string();
 
     // WeCom adapter
     #[cfg(feature = "wecom")]
@@ -436,13 +672,16 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
         line_channel_secret,
         line_access_token,
+        line_webhook_path,
         #[cfg(feature = "teams")]
         teams,
+        teams_webhook_path,
         teams_service_urls: Mutex::new(HashMap::new()),
         #[cfg(feature = "feishu")]
         feishu,
         #[cfg(feature = "googlechat")]
         google_chat,
+        googlechat_webhook_path,
         #[cfg(feature = "wecom")]
         wecom,
         ws_token,
@@ -451,6 +690,20 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         client,
     });
+
+    // Phase 1 L1 audit (#1356): warn if any active webhook platform has no
+    // transport authentication configured (identity trust unenforceable).
+    // The standalone gateway mounts the feishu webhook route only in Webhook
+    // connection mode (see the route setup above).
+    #[cfg(feature = "feishu")]
+    let feishu_webhook_route_mounted = state
+        .feishu
+        .as_ref()
+        .map(|f| f.config.connection_mode == adapters::feishu::ConnectionMode::Webhook)
+        .unwrap_or(false);
+    #[cfg(not(feature = "feishu"))]
+    let feishu_webhook_route_mounted = false;
+    state.warn_unenforceable_l1(feishu_webhook_route_mounted);
 
     // Background: sweep expired reply tokens
     {
@@ -670,4 +923,193 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[cfg(test)]
+mod l1_audit_tests {
+    use super::{l1_unenforceable, AppState};
+    use tokio::sync::broadcast;
+
+    #[test]
+    fn warns_only_when_active_and_secret_missing() {
+        // active platform, no L1 secret → unenforceable (warn)
+        assert!(l1_unenforceable(true, false));
+        // active with L1 configured → fine
+        assert!(!l1_unenforceable(true, true));
+        // inactive platform → never warn, regardless of L1
+        assert!(!l1_unenforceable(false, false));
+        assert!(!l1_unenforceable(false, true));
+    }
+
+    fn state() -> AppState {
+        let (tx, _rx) = broadcast::channel(4);
+        AppState::test_default(tx)
+    }
+
+    fn flagged(s: &AppState) -> Vec<&'static str> {
+        s.unenforceable_l1(false)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn inactive_platforms_are_never_flagged() {
+        // test_default is all-None → nothing configured, nothing active.
+        assert!(flagged(&state()).is_empty());
+        // …even when a feishu webhook route is reported as mounted (no adapter).
+        assert!(state().unenforceable_l1(true).is_empty());
+    }
+
+    #[test]
+    fn telegram_active_without_l1_is_flagged() {
+        let mut s = state();
+        s.telegram_bot_token = Some("bot".into());
+        assert_eq!(flagged(&s), vec!["telegram"]);
+
+        // secret_token satisfies L1
+        s.telegram_secret_token = Some("sec".into());
+        assert!(flagged(&s).is_empty());
+
+        // trusted_source_only is an accepted alternate L1
+        s.telegram_secret_token = None;
+        s.telegram_trusted_source_only = true;
+        assert!(flagged(&s).is_empty());
+    }
+
+    #[test]
+    fn line_flagged_only_when_active_without_secret() {
+        let mut s = state();
+        // access token present but no channel secret → active, L1 missing
+        s.line_access_token = Some("tok".into());
+        assert_eq!(flagged(&s), vec!["line"]);
+
+        // channel secret present → L1 enforced
+        s.line_channel_secret = Some("csecret".into());
+        assert!(flagged(&s).is_empty());
+    }
+
+    #[cfg(feature = "feishu")]
+    #[test]
+    fn apply_feishu_config_requires_credentials() {
+        use super::GatewayFeishuConfig;
+        use std::collections::HashMap;
+        let mut s = state();
+        // Complete credentials → adapter built via the shared from_reader.
+        let mut pairs = HashMap::new();
+        pairs.insert("FEISHU_APP_ID".to_string(), "cli_x".to_string());
+        pairs.insert("FEISHU_APP_SECRET".to_string(), "sec".to_string());
+        pairs.insert("FEISHU_CONNECTION_MODE".to_string(), "webhook".to_string());
+        pairs.insert("FEISHU_ENCRYPT_KEY".to_string(), "ek".to_string());
+        s.apply_feishu_config(GatewayFeishuConfig {
+            pairs: pairs.clone(),
+        });
+        assert!(s.feishu.is_some());
+        let cfg = &s.feishu.as_ref().unwrap().config;
+        assert_eq!(cfg.app_id, "cli_x");
+        assert!(matches!(
+            cfg.connection_mode,
+            super::adapters::feishu::ConnectionMode::Webhook
+        ));
+        assert_eq!(cfg.encrypt_key.as_deref(), Some("ek"));
+        // Config-supplied encrypt_key satisfies the L1 startup check
+        // when the webhook route is exposed.
+        assert!(s.unenforceable_l1(true).is_empty());
+
+        // Missing secret → adapter disabled.
+        pairs.remove("FEISHU_APP_SECRET");
+        s.apply_feishu_config(GatewayFeishuConfig { pairs });
+        assert!(s.feishu.is_none());
+    }
+
+    #[cfg(feature = "teams")]
+    #[test]
+    fn apply_teams_config_requires_credentials() {
+        use super::GatewayTeamsConfig;
+        let mut s = state();
+        // Complete credentials → adapter built, path set.
+        s.apply_teams_config(GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("sec".into()),
+            allowed_tenants: vec!["t1".into()],
+            oauth_endpoint: "https://x/token".into(),
+            openid_metadata: "https://x/oidc".into(),
+            webhook_path: "/hook/teams".into(),
+        });
+        assert!(s.teams.is_some());
+        assert_eq!(s.teams_webhook_path, "/hook/teams");
+
+        // Missing secret → adapter disabled (same as env-only semantics).
+        s.apply_teams_config(GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: None,
+            allowed_tenants: vec![],
+            oauth_endpoint: "https://x/token".into(),
+            openid_metadata: "https://x/oidc".into(),
+            webhook_path: "/hook/teams".into(),
+        });
+        assert!(s.teams.is_none());
+    }
+
+    #[cfg(feature = "googlechat")]
+    #[test]
+    fn apply_googlechat_config_builds_adapter_and_feeds_l1_warning() {
+        use super::GatewayGoogleChatConfig;
+        let mut s = state();
+        // Enabled without audience → adapter active, no JWT verifier → flagged.
+        s.apply_googlechat_config(GatewayGoogleChatConfig {
+            enabled: true,
+            sa_key_json: None,
+            sa_key_file: None,
+            access_token: Some("tok".into()),
+            audience: None,
+            webhook_path: "/hook/gc".into(),
+        });
+        assert!(s.google_chat.is_some());
+        assert_eq!(s.googlechat_webhook_path, "/hook/gc");
+        assert_eq!(flagged(&s), vec!["googlechat"]);
+
+        // Config-supplied audience builds the verifier → L1 satisfied.
+        s.apply_googlechat_config(GatewayGoogleChatConfig {
+            enabled: true,
+            sa_key_json: None,
+            sa_key_file: None,
+            access_token: Some("tok".into()),
+            audience: Some("aud".into()),
+            webhook_path: "/hook/gc".into(),
+        });
+        assert!(flagged(&s).is_empty());
+
+        // Disabled → adapter removed.
+        s.apply_googlechat_config(GatewayGoogleChatConfig {
+            enabled: false,
+            sa_key_json: None,
+            sa_key_file: None,
+            access_token: None,
+            audience: None,
+            webhook_path: "/hook/gc".into(),
+        });
+        assert!(s.google_chat.is_none());
+    }
+
+    #[test]
+    fn apply_line_config_overrides_env_state_and_feeds_l1_warning() {
+        use super::GatewayLineConfig;
+        let mut s = state();
+        // Simulate env-derived state: token from env, no secret → flagged.
+        s.line_access_token = Some("env-tok".into());
+        assert_eq!(flagged(&s), vec!["line"]);
+
+        // Config-first override (#1376): [line] supplies the secret + path.
+        s.apply_line_config(GatewayLineConfig {
+            channel_secret: Some("cfg-secret".into()),
+            channel_access_token: Some("cfg-tok".into()),
+            webhook_path: "/hook/line".into(),
+        });
+        assert_eq!(s.line_channel_secret.as_deref(), Some("cfg-secret"));
+        assert_eq!(s.line_access_token.as_deref(), Some("cfg-tok"));
+        assert_eq!(s.line_webhook_path, "/hook/line");
+        // Config-supplied secret satisfies the L1 startup check.
+        assert!(flagged(&s).is_empty());
+    }
 }

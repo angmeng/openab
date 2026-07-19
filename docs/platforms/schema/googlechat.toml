@@ -229,9 +229,9 @@ pr      = ""
 
 [[openab_features]]
 feature = "cron_dispatch"
-status  = "not_implemented"
-note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
-source  = []
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"googlechat\"` fire through the unified adapter when the `googlechat` feature is compiled and the platform is enabled (`[googlechat] enabled = true` or `GOOGLE_CHAT_ENABLED` env — config-first, per the first-class-platform-config ADR). Jobs without an explicit `thread_id` remain at the top level of the configured space because Google Chat does not implement the gateway `create_topic` command."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
 pr      = ""
 
 

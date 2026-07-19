@@ -152,6 +152,34 @@ allow_all_users = true
 [agent]
 ```
 
+### `[googlechat]` Section (credentials + trust)
+
+Since #1379 the `[googlechat]` section carries the full adapter configuration — config-first with `GOOGLE_CHAT_*` env fallback:
+
+```toml
+[googlechat]
+enabled     = true
+sa_key_json = "${GOOGLE_CHAT_SA_KEY_JSON}"
+audience    = "projects/<project-number>/..."   # enables webhook JWT verification (L1)
+allowed_users = ["users/123456789"]
+```
+
+### User Trust (`[googlechat]` section)
+
+> **Trust resolution:** the `[googlechat]` section's trust settings apply in **both** deployment modes (enable the embedded adapter with `[googlechat] enabled = true`; `GOOGLE_CHAT_ENABLED=true` remains the env-only fallback). Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[googlechat]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[googlechat]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[googlechat]` section:
+
+```toml
+[googlechat]
+allowed_users = ["users/123456789"]  # Chat user resource names (users/<id>)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWED_USERS` env var when unset.
+
+> ⚠️ **Deprecated:** driving Google Chat trust through the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[googlechat]` (or `GOOGLE_CHAT_*` env vars).
+
 ## Features
 
 ### Supported

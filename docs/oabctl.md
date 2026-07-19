@@ -479,6 +479,20 @@ oabctl bootstrap --cluster my-cluster     # import existing resources
 | Security Group | `oab-agents` | Outbound-only |
 | Log Group | `/oab/agents` | CloudWatch logs |
 
+### Apply Caller Permissions
+
+The IAM identity running either `oabctl apply` or the library's
+`apply_manifests` API needs this preflight permission:
+
+| Action | Resource | Purpose |
+|--------|----------|---------|
+| `ecs:DescribeClusters` | `*` | Verify the configured target exists and is `ACTIVE` before mutation |
+
+`DescribeClusters` does not support resource-level IAM permissions, so the
+policy statement must use `Resource: "*"` even though oabctl sends only the
+configured cluster name or ARN. This caller permission is separate from the
+task and task-execution roles described below.
+
 ### IAM Task Role Permissions
 
 Attached to `oab-task-role` — the identity the *running container* assumes.
@@ -529,6 +543,12 @@ Either format works for **any** key — `TELEGRAM_BOT_TOKEN` above could just
 as well be written `"aws-sm://oab/telegram/mybot#TELEGRAM_BOT_TOKEN"`, and
 `TELEGRAM_SECRET_TOKEN` could just as well use the full ARN form. The choice
 is per-value, not tied to which secret it is.
+
+> **Permission required for shorthand names:** when `<secret-id>` in an
+> `aws-sm://<secret-id>#<json-key>` value is not already a full ARN, the apply
+> caller must have `secretsmanager:DescribeSecret`. oabctl uses that API to
+> resolve the name to the full ARN required by ECS. ARN-form shorthand skips
+> this lookup.
 
 ### IAM Execution Role Permissions
 

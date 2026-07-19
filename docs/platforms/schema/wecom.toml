@@ -239,6 +239,27 @@ pr      = ""
 # ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
 
 [[quirks]]
+date   = "2026-07-13"
+title  = "Callback mode is DM-only — L2 channel scoping is meaningless"
+note   = "The callback-mode Receiver always emits channel_type=\"direct\" with a per-user channel id (wecom:{corp_id}:{from_user}); there is no group-chat delivery path in this mode. Consequence for the trust pyramid: WeCom L2 scope is effectively allow_dm only — allowed_channels can never match anything meaningful. Group delivery would require the separate WS-bot ('智能机器人') model, not self-built-app callbacks. Surfaced by external review (canyugs/openab#18)."
+kind   = "intrinsic"
+source = "crates/openab-gateway/src/adapters/wecom.rs#channel_type"
+
+[[quirks]]
+date   = "2026-07-13"
+title  = "allowed_users format differs for external contacts / ISV apps"
+note   = "The plain tenant-assigned UserID form (e.g. \"zhangsan\") applies to self-built apps receiving messages from internal members only. External contacts and third-party (ISV) app callbacks carry external_userid values with wm/wo prefixes (e.g. wmqfasd1e19278…, woAJ2GCAA…) or an encrypted OpenUserID — operators copying a plain UserID under those modes will misconfigure allowed_users. Surfaced by external review (canyugs/openab#18)."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/92113"
+
+[[quirks]]
+date   = "2026-07-13"
+title  = "is_bot is hardcoded false — L3 bot-bypass is a no-op for WeCom"
+note   = "The Receiver sets SenderInfo.is_bot = false unconditionally, so every WeCom event runs the full L3 identity check and the shared gate's bot-bypass (l3_gate_applies) never triggers for this platform. Harmless today (callback mode has no bot senders), but any future bot detection should populate is_bot from the event — GatewayEvent.SenderInfo already carries the field. Surfaced by external review (canyugs/openab#18)."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/wecom.rs#is_bot"
+
+[[quirks]]
 date   = "2026-07-04"
 title  = "Send / push model (no reply window)"
 note   = "WeCom self-built apps are pure push: given a valid access_token + agentid, the app can message any member via touser at any time — there is no LINE-style reply token or reply window. access_token (7200s TTL) is cached with a 300s refresh margin (TOKEN_REFRESH_MARGIN_SECS) and force-refreshed on errcode 42001 across both message/send and media/get."

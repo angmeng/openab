@@ -24,7 +24,7 @@ impl WecomConfig {
     /// Build config from an arbitrary string reader. Tests use this with a
     /// HashMap so they don't mutate process-wide environment variables —
     /// `env::set_var` races other tests under cargo's parallel runner.
-    fn from_reader<F: Fn(&str) -> Option<String>>(read: F) -> Option<Self> {
+    pub(crate) fn from_reader<F: Fn(&str) -> Option<String>>(read: F) -> Option<Self> {
         let corp_id = read("WECOM_CORP_ID")?;
         let secret = read("WECOM_SECRET")?;
         let token = read("WECOM_TOKEN")?;
