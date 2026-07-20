@@ -75,6 +75,14 @@ pub trait LlmProvider: Send + Sync {
     fn is_oauth(&self) -> bool {
         false
     }
+
+    /// Canonical provider family name (`anthropic` / `openai` / `xai`).
+    /// Combined with [`is_oauth`](Self::is_oauth) so a model switch preserves
+    /// auth mode *per provider*: an xAI OAuth session must not make a switch
+    /// to Anthropic bypass a configured `ANTHROPIC_API_KEY` (review F2).
+    fn provider_name(&self) -> &str {
+        ""
+    }
 }
 
 /// Shared, cloneable handle to an `LlmProvider`. A newtype over
@@ -102,7 +110,15 @@ impl std::ops::Deref for SharedLlmProvider {
 /// the whole string is the model id — so a HuggingFace-style `org/model` id
 /// (e.g. `meta-llama/Llama-3-8B`) for a custom/OpenAI-compatible endpoint stays
 /// intact instead of mis-parsing `org` as a provider. Extend as vendors land.
-const KNOWN_PROVIDERS: &[&str] = &["anthropic", "anthropic-oauth", "claude", "openai", "codex"];
+const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "anthropic-oauth",
+    "claude",
+    "openai",
+    "codex",
+    "xai",
+    "grok",
+];
 
 /// A model reference, optionally provider-qualified. Accepts the canonical
 /// `provider/model_id` form (e.g. `anthropic/claude-sonnet-4-6`) as well as a
@@ -163,6 +179,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
         "anthropic" => Ok(Box::new(AnthropicProvider::auto()?)),
         "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_auto()?)),
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
+        "xai" | "grok" => Ok(Box::new(XaiProvider::from_auth_store()?)),
         _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
             // F3 — don't let a *present-but-misconfigured* Anthropic credential
@@ -179,7 +196,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
                     OpenAiProvider::from_auth_store()
                         .map(|p| Box::new(p) as Box<dyn LlmProvider>)
                         .map_err(|codex_err| format!(
-                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. ({codex_err})"
+                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth` / `openab-agent auth xai`. ({codex_err})"
                         ))
                 }
             }
@@ -501,6 +518,10 @@ impl LlmProvider for AnthropicProvider {
         matches!(self.auth, AnthropicAuth::OAuth | AnthropicAuth::OAuthEnv(_))
     }
 
+    fn provider_name(&self) -> &str {
+        "anthropic"
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -677,6 +698,10 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -825,6 +850,281 @@ impl LlmProvider for OpenAiProvider {
                 return parse_openai_response(&response);
             }
             Err(anyhow!("OpenAI API: max retries exceeded"))
+        })
+    }
+}
+
+// === xAI Provider (SuperGrok / X Premium subscription via device OAuth) ===
+//
+// xAI's API is OpenAI Chat Completions-compatible at `api.x.ai/v1`; the OAuth
+// access token from the `xai-oauth` tenant acts as a plain Bearer API key
+// (scope `api:access`), so no bespoke wire format is needed — requests go to
+// `/chat/completions` and responses reuse `parse_openai_response`'s
+// Chat Completions path.
+
+pub struct XaiProvider {
+    base_url: String,
+    model: String,
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+
+/// Resolve the xAI model. Precedence (env-over-config, ADR §5.5):
+/// `OPENAB_AGENT_XAI_MODEL` → `OPENAB_AGENT_MODEL` → `model` in `config.json`
+/// → built-in `grok-4.5`. Each source may be `provider/`-qualified
+/// (`xai/grok-4.3`); the prefix is stripped via [`ModelRef`].
+fn xai_model() -> String {
+    if let Ok(m) = std::env::var("OPENAB_AGENT_XAI_MODEL") {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    if let Ok(m) = std::env::var("OPENAB_AGENT_MODEL") {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    if let Some(m) = crate::config::AgentConfig::load_or_default().model {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    "grok-4.5".to_string()
+}
+
+/// Validate `OPENAB_AGENT_XAI_BASE_URL` before the OAuth bearer is attached
+/// (review round-3 F1): the stored subscription token is a refreshable
+/// credential, so it may only ever be sent over https to an xAI-owned host
+/// (`api.x.ai` or another `*.x.ai` subdomain). A typo'd, plaintext, or
+/// non-xAI proxy value fails loud instead of silently leaking the token.
+fn validate_xai_base_url(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("invalid OPENAB_AGENT_XAI_BASE_URL `{raw}`: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "refusing OPENAB_AGENT_XAI_BASE_URL `{raw}`: the xAI OAuth bearer may only be sent over https"
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if host != "x.ai" && !host.ends_with(".x.ai") {
+        return Err(format!(
+            "refusing OPENAB_AGENT_XAI_BASE_URL `{raw}`: the xAI OAuth bearer may only be sent to an x.ai host (got `{host}`)"
+        ));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+impl XaiProvider {
+    /// Create provider using the stored xAI OAuth token from
+    /// `~/.openab/agent/auth.json` (run `openab-agent auth xai` first).
+    pub fn from_auth_store() -> Result<Self, String> {
+        // Just verify tokens exist; the live token is fetched (and refreshed)
+        // per call, mirroring `OpenAiProvider`.
+        crate::auth::load_tokens_for(crate::auth::XAI_NAMESPACE).map_err(|e| e.to_string())?;
+        let base_url = match std::env::var("OPENAB_AGENT_XAI_BASE_URL") {
+            Ok(raw) if !raw.is_empty() => validate_xai_base_url(&raw)?,
+            _ => "https://api.x.ai/v1".to_string(),
+        };
+        Ok(Self {
+            base_url,
+            model: xai_model(),
+            // Same documented env-over-config resolution as Anthropic:
+            // OPENAB_AGENT_MAX_TOKENS → config.json max_tokens → 8192.
+            max_tokens: anthropic_max_tokens(),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    /// Create provider with a specific model override.
+    pub fn from_auth_store_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::from_auth_store()?;
+        p.model = ModelRef::parse(model).model;
+        Ok(p)
+    }
+}
+
+/// Convert the internal transcript to Chat Completions `messages`. Pure so the
+/// mapping (tool_use → assistant `tool_calls`, tool_result → `role: tool`) is
+/// unit-testable. Tool results are emitted *before* any user text from the same
+/// message: Chat Completions requires `tool` messages to directly follow the
+/// assistant message carrying the corresponding `tool_calls`.
+fn xai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = vec![json!({"role": "system", "content": system})];
+    for m in messages {
+        if m.role == "user" {
+            for b in &m.content {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = b
+                {
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    }));
+                }
+            }
+            let texts: Vec<&str> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                out.push(json!({"role": "user", "content": texts.join("")}));
+            }
+        } else if m.role == "assistant" {
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for b in &m.content {
+                match b {
+                    ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": input.to_string()},
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            if text_parts.is_empty() && tool_calls.is_empty() {
+                continue;
+            }
+            let mut msg = json!({"role": "assistant"});
+            msg["content"] = if text_parts.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text_parts.join(""))
+            };
+            if !tool_calls.is_empty() {
+                msg["tool_calls"] = json!(tool_calls);
+            }
+            out.push(msg);
+        }
+    }
+    out
+}
+
+/// Build the Chat Completions request body. Pure so the wire shape — including
+/// the documented `OPENAB_AGENT_MAX_TOKENS` output limit (review round-3 F3) —
+/// is unit-testable.
+fn xai_request_body(
+    model: &str,
+    max_tokens: u32,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": xai_chat_messages(system, messages),
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if !tools.is_empty() {
+        let cc_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": &t.name,
+                        "description": &t.description,
+                        "parameters": &t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = json!(cc_tools);
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+impl LlmProvider for XaiProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn is_oauth(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &str {
+        "xai"
+    }
+
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let body = xai_request_body(&self.model, self.max_tokens, system, messages, tools);
+
+            // Retry budgets are independent (round-4 F2): rate-limit retries
+            // are capped, while the one-time 401 refresh always gets its own
+            // follow-up request — a successful refresh must never be consumed
+            // by an exhausted budget. Every other outcome returns, so the
+            // loop is bounded at (rate-limit cap + refresh + terminal).
+            const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+            let mut rate_limit_retries = 0u32;
+            let mut refreshed_after_401 = false;
+            loop {
+                let token = crate::auth::get_valid_token_for(crate::auth::XAI_NAMESPACE).await?;
+                let resp = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+
+                let status = resp.status();
+                if (status.as_u16() == 429 || status.as_u16() == 529)
+                    && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+                {
+                    let delay =
+                        std::time::Duration::from_millis(1000 * 2u64.pow(rate_limit_retries));
+                    rate_limit_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // 401: the token may have expired mid-request. Reactive refresh
+                // at most once, and only continue on a *successful* refresh — a
+                // failed refresh (invalid_grant, storage error) must surface its
+                // actionable re-login message, not decay into a generic 401
+                // after re-sending the same stale token (review F3).
+                if status.as_u16() == 401 && !refreshed_after_401 {
+                    refreshed_after_401 = true;
+                    crate::auth::force_refresh_for(crate::auth::XAI_NAMESPACE)
+                        .await
+                        .map_err(|e| anyhow!("xAI token refresh after HTTP 401 failed: {e}"))?;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("xAI API error {status}: {text}"));
+                }
+
+                let payload: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse xAI response: {e}"))?;
+                // Chat Completions shape → parse_openai_response's fallback path.
+                return parse_openai_response(&payload);
+            }
         })
     }
 }
@@ -1235,5 +1535,392 @@ mod tests {
     fn test_parse_openai_empty_choices() {
         let resp = json!({"choices": []});
         assert!(parse_openai_response(&resp).is_err());
+    }
+
+    #[test]
+    fn test_model_ref_parses_xai_and_grok_prefixes() {
+        let r = ModelRef::parse("xai/grok-4.5");
+        assert_eq!(r.provider.as_deref(), Some("xai"));
+        assert_eq!(r.model, "grok-4.5");
+        let r = ModelRef::parse("grok/grok-4.3");
+        assert_eq!(r.provider.as_deref(), Some("grok"));
+        assert_eq!(r.model, "grok-4.3");
+        // Bare grok model id: no provider split.
+        let r = ModelRef::parse("grok-4.5");
+        assert_eq!(r.provider, None);
+        assert_eq!(r.model, "grok-4.5");
+    }
+
+    #[test]
+    fn test_xai_chat_messages_maps_transcript_to_chat_completions() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "list files".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "Listing.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![
+                    // Text alongside a tool result: the tool message must still
+                    // directly follow the assistant tool_calls message.
+                    ContentBlock::Text {
+                        text: "thanks".to_string(),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "a.txt".to_string(),
+                        is_error: None,
+                    },
+                ],
+            },
+        ];
+        let out = xai_chat_messages("sys", &messages);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "sys");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "list files");
+        // Assistant text + tool_calls in one message, arguments stringified.
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[2]["content"], "Listing.");
+        assert_eq!(out[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(out[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(
+            out[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
+        // Tool result emitted before the trailing user text (adjacency rule).
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], "call_1");
+        assert_eq!(out[3]["content"], "a.txt");
+        assert_eq!(out[4]["role"], "user");
+        assert_eq!(out[4]["content"], "thanks");
+    }
+
+    #[test]
+    fn test_xai_chat_messages_tool_only_assistant_has_null_content() {
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "x"}),
+            }],
+        }];
+        let out = xai_chat_messages("s", &messages);
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(out[1]["content"].is_null());
+        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn xai_model_resolves_env_over_config_over_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.json");
+        std::fs::write(&cfg, r#"{"model":"xai/grok-4.3"}"#).unwrap();
+        let cfg_path = cfg.to_str().unwrap();
+
+        // Config-only (review F1): the configured model must reach the
+        // provider, not be silently replaced by the built-in default.
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_XAI_MODEL", None),
+                ("OPENAB_AGENT_MODEL", None),
+                ("OPENAB_AGENT_PROVIDER", None),
+            ],
+            || {
+                assert_eq!(xai_model(), "grok-4.3");
+                // Same config also selects the provider — the pair that F1 broke.
+                assert_eq!(resolve_provider_choice(), "xai");
+            },
+        );
+
+        // Env still wins over config.
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_XAI_MODEL", Some("xai/grok-4.5")),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            || assert_eq!(xai_model(), "grok-4.5"),
+        );
+
+        // Nothing anywhere → built-in default.
+        let missing = dir.path().join("missing.json");
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(missing.to_str().unwrap())),
+                ("OPENAB_AGENT_XAI_MODEL", None),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            || assert_eq!(xai_model(), "grok-4.5"),
+        );
+    }
+
+    #[test]
+    fn validate_xai_base_url_allows_only_https_x_ai_hosts() {
+        // Review round-3 F1: the OAuth bearer must never leave the x.ai trust
+        // boundary or travel over plaintext.
+        assert_eq!(
+            validate_xai_base_url("https://api.x.ai/v1").unwrap(),
+            "https://api.x.ai/v1"
+        );
+        // Trailing slash normalised; other x.ai subdomains allowed.
+        assert_eq!(
+            validate_xai_base_url("https://staging.x.ai/v1/").unwrap(),
+            "https://staging.x.ai/v1"
+        );
+        // Plaintext, non-xAI hosts, lookalike suffixes, and garbage all fail.
+        assert!(validate_xai_base_url("http://api.x.ai/v1").is_err());
+        assert!(validate_xai_base_url("https://api.evil.example/v1").is_err());
+        assert!(validate_xai_base_url("https://notx.ai/v1").is_err());
+        assert!(validate_xai_base_url("https://apix.ai/v1").is_err());
+        assert!(validate_xai_base_url("not a url").is_err());
+    }
+
+    #[test]
+    fn xai_request_body_carries_max_tokens_and_tools() {
+        // Review round-3 F3: the documented OPENAB_AGENT_MAX_TOKENS contract
+        // must reach the wire.
+        let tools = vec![ToolDef {
+            name: "bash".to_string(),
+            description: "run".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &tools);
+        assert_eq!(body["model"], "grok-4.5");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tool_choice"], "auto");
+        // No tools → the tool fields are absent entirely.
+        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &[]);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    // ── XaiProvider 401 reactive-refresh loop (review F3) ─────────────────
+    // Deterministic coverage via canned local HTTP servers: no live xAI, no
+    // real credentials. HOME is redirected to a tempdir so auth.json reads and
+    // the refresh POST stay inside the test sandbox (temp_env serialises
+    // env-mutating tests).
+
+    fn http_resp(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Serve `responses` to sequential connections; returns the raw requests seen.
+    fn spawn_canned_http(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for resp in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let headers = String::from_utf8_lossy(&buf[..pos]);
+                            content_len = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        if buf.len() >= he + content_len {
+                            break;
+                        }
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&buf).to_string());
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Write a temp-HOME auth.json holding one unexpired xai-oauth tenant whose
+    /// refresh endpoint points at `refresh_url`.
+    fn write_xai_auth(home: &std::path::Path, refresh_url: &str) {
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let auth_dir = home.join(".openab").join("agent");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(
+            auth_dir.join("auth.json"),
+            json!({
+                "xai-oauth": {
+                    "access_token": "stale-token",
+                    "refresh_token": "rt1",
+                    "expires_at": far_future,
+                    "token_endpoint": refresh_url,
+                    "provider": "xai-oauth",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xai_chat_401_refresh_success_retries_with_fresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        // Chat endpoint: 401 first, then a successful completion.
+        let (chat_url, chat_handle) = spawn_canned_http(vec![
+            http_resp("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+            http_resp(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        // Refresh endpoint: rotates the token successfully.
+        let (refresh_url, refresh_handle) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"access_token":"fresh-token","refresh_token":"rt2","expires_in":3600}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                max_tokens: 8192,
+                client: reqwest::Client::new(),
+            };
+            let events = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap();
+            assert!(matches!(&events[0], LlmEvent::Text(t) if t == "ok"));
+        });
+
+        let chat_reqs = chat_handle.join().unwrap();
+        assert!(chat_reqs[0].contains("Bearer stale-token"));
+        // The retry after a successful refresh must carry the rotated token.
+        assert!(chat_reqs[1].contains("Bearer fresh-token"));
+        let refresh_reqs = refresh_handle.join().unwrap();
+        assert!(refresh_reqs[0].contains("grant_type=refresh_token"));
+        assert!(refresh_reqs[0].contains("rt1"));
+    }
+
+    #[test]
+    fn xai_chat_rate_limits_then_401_still_gets_refreshed_request() {
+        // Review round-4 F2: three 429s exhaust the rate-limit budget, then a
+        // 401 triggers the one-time refresh — the refreshed token must still
+        // get its follow-up request instead of dying on "max retries exceeded".
+        let home = tempfile::tempdir().unwrap();
+        let (chat_url, chat_handle) = spawn_canned_http(vec![
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+            http_resp(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        let (refresh_url, _refresh_handle) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"access_token":"fresh-token","refresh_token":"rt2","expires_in":3600}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                max_tokens: 8192,
+                client: reqwest::Client::new(),
+            };
+            let events = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap();
+            assert!(matches!(&events[0], LlmEvent::Text(t) if t == "ok"));
+        });
+
+        let chat_reqs = chat_handle.join().unwrap();
+        assert_eq!(chat_reqs.len(), 5);
+        // The post-refresh request carries the rotated token.
+        assert!(chat_reqs[4].contains("Bearer fresh-token"));
+    }
+
+    #[test]
+    fn xai_chat_401_refresh_failure_propagates_relogin_error() {
+        let home = tempfile::tempdir().unwrap();
+        // Chat endpoint answers 401 once; a second request must never happen.
+        let (chat_url, _chat_handle) = spawn_canned_http(vec![http_resp(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized"}"#,
+        )]);
+        // Refresh endpoint rejects the grant.
+        let (refresh_url, _refresh_handle) = spawn_canned_http(vec![http_resp(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant"}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                max_tokens: 8192,
+                client: reqwest::Client::new(),
+            };
+            let err = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap_err()
+                .to_string();
+            // The actionable refresh failure surfaces (with the re-login hint
+            // from the shared refresh driver), not a generic xAI 401.
+            assert!(
+                err.contains("xAI token refresh after HTTP 401 failed"),
+                "got: {err}"
+            );
+            assert!(err.contains("openab-agent auth xai"), "got: {err}");
+        });
     }
 }
