@@ -1023,9 +1023,33 @@ async fn ws_connect_loop(
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     info!("feishu websocket connected");
 
+    // Half-open detection: Feishu can silently stop sending frames (TCP half-open —
+    // no Close, no error) which would block ws_rx.next() forever, leaving the bot
+    // "connected" but deaf (observed 2026-07-23: 6.5h stranded, process alive, no
+    // events). Proactively ping on an interval and reconnect if no frame arrives
+    // within the idle limit. A healthy peer replies with Pong (resetting
+    // last_activity); a dead one never does, so the idle limit fires. Both intervals
+    // are env-tunable so the timeout can be adjusted without a rebuild.
+    let ping_secs = std::env::var("FEISHU_WS_PING_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60);
+    let idle_limit = std::time::Duration::from_secs(
+        std::env::var("FEISHU_WS_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(180),
+    );
+    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(ping_secs));
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_activity = Instant::now();
+
     loop {
         tokio::select! {
             msg = ws_rx.next() => {
+                last_activity = Instant::now();
                 match msg {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                         handle_ws_message(
@@ -1075,6 +1099,24 @@ async fn ws_connect_loop(
             _ = shutdown_rx.changed() => {
                 let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
                 return Ok(());
+            }
+            _ = ping_tick.tick() => {
+                let idle = last_activity.elapsed();
+                if idle > idle_limit {
+                    return Err(anyhow::anyhow!(
+                        "no ws frames for {}s (idle limit {}s) — suspected half-open, reconnecting",
+                        idle.as_secs(),
+                        idle_limit.as_secs()
+                    ));
+                }
+                // Proactively ping to elicit traffic; a healthy peer replies with Pong
+                // (resetting last_activity via the ws_rx arm), a dead one never does.
+                if let Err(e) = ws_tx
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new()))
+                    .await
+                {
+                    return Err(anyhow::anyhow!("ws ping send failed: {e} — reconnecting"));
+                }
             }
         }
     }
