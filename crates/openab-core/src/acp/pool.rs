@@ -810,6 +810,51 @@ impl SessionPool {
         let mut stale = Vec::new();
         let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>)> = Vec::new();
         for (key, conn) in snapshot {
+            // Busy-noop-streak hung detection (independent of the connection
+            // mutex — the wedge leaves it FREE between no-ops). A wedged ACP
+            // answers new prompts with instant empty `end_turn`s; each one's
+            // `touch()` keeps `last_active` fresh and `in_flight` false, so the
+            // session escapes BOTH the 24h idle path and the mutex-held hung
+            // path below. The adapter-fed streak clock is the only signal.
+            // Reuse the same session/cancel + process-group kill.
+            if let Some(activity) = activity_map.get(&key) {
+                if activity.busy_streak_age() > hung_threshold {
+                    let session_id = cancel_map.get(&key).map(|(_, sid)| sid.clone());
+                    warn!(
+                        thread_id = %key,
+                        session_id = session_id.as_deref().unwrap_or(""),
+                        streak_secs = activity.busy_streak_age().as_secs(),
+                        threshold_secs = self.hung_threshold_secs,
+                        "force-evicting session stuck in busy-noop loop"
+                    );
+                    let stdin_handle = cancel_map.get(&key).map(|(stdin, _)| Arc::clone(stdin));
+                    let pgid = pgid_map.get(&key).copied();
+                    tokio::spawn(async move {
+                        if let (Some(stdin), Some(session_id)) = (stdin_handle, session_id) {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                async move {
+                                    if let Ok(data) = serde_json::to_string(&serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "session/cancel",
+                                        "params": {"sessionId": session_id}
+                                    })) {
+                                        use tokio::io::AsyncWriteExt;
+                                        let mut w = stdin.lock().await;
+                                        let _ = w.write_all(data.as_bytes()).await;
+                                        let _ = w.write_all(b"\n").await;
+                                        let _ = w.flush().await;
+                                    }
+                                },
+                            )
+                            .await;
+                        }
+                        kill_pgid_after_grace(pgid).await;
+                    });
+                    hung.push((key.clone(), Arc::clone(&conn)));
+                    continue;
+                }
+            }
             // Skip active sessions for this cleanup round instead of waiting on
             // their per-connection mutex. A busy session is not idle unless hung.
             let conn_handle = Arc::clone(&conn);

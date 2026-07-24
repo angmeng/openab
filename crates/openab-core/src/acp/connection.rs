@@ -114,6 +114,13 @@ pub struct SessionActivity {
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
     prompt_in_flight: AtomicBool,
+    /// Monotonic-ms start of an unbroken run of busy no-ops — new prompts that
+    /// an ACP wedged on an earlier turn answers with an instant empty
+    /// `end_turn`. 0 = no streak. This is the ONLY signal of that wedge: each
+    /// no-op's `touch()` keeps `last_active` fresh and leaves `prompt_in_flight`
+    /// false, so the session escapes both the idle path and the mutex-held hung
+    /// path. Fed from the adapter (same Arc the pool reads lock-free).
+    busy_streak_start_ms: AtomicU64,
 }
 
 impl Default for SessionActivity {
@@ -127,6 +134,7 @@ impl SessionActivity {
         Self {
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
+            busy_streak_start_ms: AtomicU64::new(0),
         }
     }
 
@@ -162,6 +170,34 @@ impl SessionActivity {
 
     pub fn in_flight(&self) -> bool {
         self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Mark the last turn as a busy no-op. Idempotent: starts the streak clock
+    /// on the first no-op and leaves it running for subsequent ones, so
+    /// `busy_streak_age` measures the whole stuck run, not just the last message.
+    pub fn note_busy_noop(&self) {
+        let now = Self::now_ms().max(1); // 0 is the "no streak" sentinel
+        let _ = self.busy_streak_start_ms.compare_exchange(
+            0,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Clear the busy-noop streak — called after any real turn (model invoked
+    /// or text emitted), i.e. proof the ACP became responsive again.
+    pub fn clear_busy_streak(&self) {
+        self.busy_streak_start_ms.store(0, Ordering::Release);
+    }
+
+    /// Elapsed time in the current unbroken busy-noop streak (ZERO if none).
+    pub fn busy_streak_age(&self) -> std::time::Duration {
+        let start = self.busy_streak_start_ms.load(Ordering::Acquire);
+        if start == 0 {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::from_millis(Self::now_ms().saturating_sub(start))
     }
 
     #[cfg(test)]
@@ -1108,6 +1144,26 @@ mod reader_loop_tests {
         // A future timestamp must not underflow: age saturates at zero.
         activity.set_last_active_ms(u64::MAX);
         assert_eq!(activity.age(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn session_activity_busy_streak_starts_holds_and_clears() {
+        let a = SessionActivity::new();
+        // No streak yet.
+        assert_eq!(a.busy_streak_age(), std::time::Duration::ZERO);
+        // First no-op starts the clock; let real (monotonic) time advance.
+        a.note_busy_noop();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let after_first = a.busy_streak_age();
+        assert!(after_first >= std::time::Duration::from_millis(10));
+        // A second no-op must NOT reset the start (idempotent) — the streak
+        // measures the whole stuck run, so age keeps growing from the FIRST
+        // no-op. A reset would drop age back near zero and fail this.
+        a.note_busy_noop();
+        assert!(a.busy_streak_age() >= after_first);
+        // A real turn clears the streak.
+        a.clear_busy_streak();
+        assert_eq!(a.busy_streak_age(), std::time::Duration::ZERO);
     }
 
     #[test]

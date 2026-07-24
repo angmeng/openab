@@ -1396,6 +1396,16 @@ impl AdapterRouter {
                         && response_error.is_none()
                         && !agent_emitted_text
                         && turn_result.input_tokens == Some(0);
+                    // Feed the busy-noop-streak hung detector. `conn.activity` is
+                    // the same Arc the pool reads lock-free in `cleanup_idle`, so
+                    // no plumbing: an ACP wedged on an earlier turn only ever
+                    // busy-no-ops, crosses the hung threshold, and is force-evicted;
+                    // any real turn here clears the streak.
+                    if busy_noop {
+                        conn.activity.note_busy_noop();
+                    } else {
+                        conn.activity.clear_busy_streak();
+                    }
                     // A dispatched bot that emits empty output would otherwise post
                     // "_(no response)_". That placeholder is pure noise whenever the
                     // turn legitimately added nothing AND the user still gets an ack:
