@@ -23,6 +23,20 @@ pub struct OutputDirectives {
     pub reply_to: Option<String>,
 }
 
+/// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
+/// no small per-message limit, and its reply route is closed after the first delivered
+/// message — so splitting a long reply into multiple messages truncates it over ACP
+/// (review F2). ACP therefore delivers whole (`usize::MAX` → a single chunk); every
+/// other platform keeps the adapter's chunk limit. Overflow-safe: the only arithmetic on
+/// the result is `saturating_sub` (mention-footer reserve).
+fn reply_message_limit(platform: &str, adapter_limit: usize) -> usize {
+    if platform == "acp" {
+        usize::MAX
+    } else {
+        adapter_limit
+    }
+}
+
 /// Parse `[[key:value]]` directives from the beginning of agent output.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
@@ -833,8 +847,16 @@ impl AdapterRouter {
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let message_limit = adapter.message_limit();
-        let streaming = adapter.use_streaming(other_bot_present);
+        let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
+        // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
+        // coupling): it streams append-only `agent_message_chunk` deltas built from the
+        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
+        // explicitly by platform rather than by whatever Telegram happens to be set to.
+        let streaming = if thread_channel.platform == "acp" {
+            false
+        } else {
+            adapter.use_streaming(other_bot_present)
+        };
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.
@@ -853,6 +875,10 @@ impl AdapterRouter {
             self.table_mode
         };
         let tool_display = self.reactions_config.tool_display;
+        // ACP streams over an append-only `agent_message_chunk`; a re-rendered tool-status
+        // prefix from `compose_display` would corrupt the deltas, so ACP streams the raw
+        // append-only answer text and surfaces tools separately (review F2 / roadmap).
+        let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         // Hoist relay state into the closure: bool for the hot streaming path,
@@ -1146,6 +1172,7 @@ impl AdapterRouter {
                                         }
                                     } else if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_streaming_display(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             relay_enabled,
@@ -1195,6 +1222,7 @@ impl AdapterRouter {
                                     // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_streaming_display(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             relay_enabled,
@@ -1240,6 +1268,7 @@ impl AdapterRouter {
                                     }
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_streaming_display(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             relay_enabled,
@@ -1386,7 +1415,7 @@ impl AdapterRouter {
 
                     // Build final content
                     let final_content =
-                        compose_display(&tool_lines, &text_buf, false, tool_display);
+                        display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
                     // A busy no-op: a prompt arrived while the session was mid-turn,
                     // so ACP returned an instant empty `end_turn` with the model never
                     // invoked (`inputTokens == 0`). This is NOT "nothing to say" — the
@@ -1793,12 +1822,21 @@ const TOOL_COLLAPSE_THRESHOLD: usize = 3;
 ///
 /// Centralized so all 3 streaming call sites (`Text`, `ToolStart`, `ToolDone`
 /// arms) route through it — otherwise a relay block can leak via tool events.
+///
+/// ACP-platform short-circuit mirrors `display_for`: an ACP client's
+/// `agent_message_chunk` stream is append-only, so a re-rendered tool-status
+/// prefix would corrupt the deltas. Relay masking is a Slack/Discord-side
+/// concern and does not apply there.
 fn compose_streaming_display(
+    platform_is_acp: bool,
     tool_lines: &[ToolEntry],
     text_buf: &str,
     relay_enabled: bool,
     tool_display: ToolDisplay,
 ) -> String {
+    if platform_is_acp {
+        return text_buf.to_string();
+    }
     let masked: Cow<'_, str> = if relay_enabled {
         relay::mask_streaming_relay_blocks(text_buf)
     } else {
@@ -1865,6 +1903,25 @@ pub(crate) fn classify_empty_turn(
         SILENT_FAILURE_MSG.to_string()
     } else {
         "_(no response)_".to_string()
+    }
+}
+
+/// Content to stream/deliver for a reply. ACP gets the raw append-only answer `text`
+/// (its `agent_message_chunk` stream is append-only, so a re-rendered `compose_display`
+/// tool-status prefix would corrupt the deltas — review F2); tool activity is surfaced
+/// separately as structured `tool_call` updates (roadmap). Every other platform gets the
+/// tool-merged display.
+fn display_for(
+    platform_is_acp: bool,
+    tool_lines: &[ToolEntry],
+    text: &str,
+    streaming: bool,
+    tool_display: ToolDisplay,
+) -> String {
+    if platform_is_acp {
+        text.to_string()
+    } else {
+        compose_display(tool_lines, text, streaming, tool_display)
     }
 }
 
@@ -2235,6 +2292,18 @@ async fn dispatch_relay_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {
+        // ACP delivers whole (no chunking → no truncation, review F2); other platforms
+        // keep the adapter's limit.
+        assert_eq!(reply_message_limit("acp", 4096), usize::MAX);
+        assert_eq!(reply_message_limit("discord", 2000), 2000);
+        assert_eq!(reply_message_limit("slack", 4096), 4096);
+        // and a long reply under the ACP limit is a single chunk (delivered whole)
+        let long = "x".repeat(50_000);
+        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+    }
 
     #[test]
     fn select_delivery_text_send_once_keeps_only_final_block() {

@@ -45,11 +45,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Target: kiro (default)
 # =============================================================================
 FROM base-debian AS kiro
-ARG KIRO_CLI_VERSION=2.8.1
+ARG KIRO_CLI_VERSION=2.13.0
+ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94
+ARG KIRO_SHA256_ARM64=95972602568c2065b7d8cc28924730304d40e612c0984ee0144d8ba452000be3
 RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
-    else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \
+    if [ "$ARCH" = "arm64" ]; then \
+      URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
+      SHA256="$KIRO_SHA256_ARM64"; \
+    else \
+      URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; \
+      SHA256="$KIRO_SHA256_AMD64"; \
+    fi && \
     curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
+    echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c - && \
     unzip /tmp/kirocli.zip -d /tmp && \
     cp /tmp/kirocli/bin/* /usr/local/bin/ && \
     chmod +x /usr/local/bin/kiro-cli* && \
@@ -91,7 +99,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: codex
 # =============================================================================
 FROM base-node AS codex
-ARG CODEX_ACP_VERSION=1.1.2
+ARG CODEX_ACP_VERSION=1.1.4
 ARG CODEX_VERSION=0.144.1
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
 ENV HOME=/home/node
@@ -107,10 +115,37 @@ ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
 # =============================================================================
+# Target: kimi
+# =============================================================================
+FROM node:24-trixie-slim AS kimi
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+ARG KIMI_CODE_VERSION=0.28.1
+RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.kimi-code && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="kimi acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="kimi"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
 # Target: copilot
 # =============================================================================
 FROM base-node AS copilot
-ARG COPILOT_VERSION=1.0.63
+ARG COPILOT_VERSION=1.0.71
 RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -273,9 +308,9 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: devin
 # =============================================================================
 FROM base-debian AS devin
-ARG DEVIN_VERSION=2026.8.18
-ARG DEVIN_SHA256_AMD64=dd4bba20593086bf708474792c11ab0c9428be5b2419ff5c182ec5f1099a0661
-ARG DEVIN_SHA256_ARM64=127e7a8baf2e09cb0fd23871af989dc9e32e3bfa7f497b1f6560cc52f5bf19c6
+ARG DEVIN_VERSION=3000.2.17
+ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2
+ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
@@ -305,15 +340,20 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: antigravity
 # =============================================================================
 FROM base-debian AS antigravity
-ENV AGY_VERSION=1.1.1
+ENV AGY_VERSION=1.1.4
+ARG AGY_SHA256_AMD64=aaab42e395cb4e3bfe5ae88994a340865d949f7a9e7f0604ffa2a3f1e8aadbfa
+ARG AGY_SHA256_ARM64=333199327cc29e21cb8fcc4e19f7c02c462bf41dd876f1328d64e9922c631700
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
-      amd64) ASSET="agy_cli_linux_x64.tar.gz" ;; \
-      arm64) ASSET="agy_cli_linux_arm64.tar.gz" ;; \
+      amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
+      arm64) ASSET="agy_cli_linux_arm64.tar.gz"; sha="${AGY_SHA256_ARM64}" ;; \
       *) echo "unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
     curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
-      | tar -xz -C /usr/local/bin && \
+      -o /tmp/agy.tar.gz && \
+    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/agy.tar.gz -C /usr/local/bin && \
+    rm /tmp/agy.tar.gz && \
     mv /usr/local/bin/antigravity /usr/local/bin/agy && \
     chmod +x /usr/local/bin/agy
 ENV HOME=/home/agent
