@@ -711,8 +711,19 @@ impl EventHandler for Handler {
                 (false, false, None, false, false, None)
             }
             Err(e) => {
-                tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false, None, false, false, None)
+                // to_channel() is a REST call, so a transient network blip lands
+                // here. Defaulting is_dm=false would silently downgrade a DM to
+                // "not a DM", and the !is_dm gate below then drops it without a
+                // trace. The gateway payload already answers this without a
+                // second HTTP round-trip: DM channels carry no guild_id.
+                let is_dm = msg.guild_id.is_none();
+                tracing::warn!(
+                    channel_id = %msg.channel_id,
+                    error = %e,
+                    is_dm,
+                    "to_channel failed — falling back to guild_id for DM detection"
+                );
+                (false, false, None, is_dm, false, None)
             }
         };
 
@@ -874,6 +885,17 @@ impl EventHandler for Handler {
         }
 
         if !is_dm && !in_allowed_channel && !in_thread && !in_ambient_context {
+            // Logged because this is the only place an inbound message can
+            // disappear with no other trace — without it, diagnosing a dropped
+            // message means guessing which of the four conditions was false.
+            tracing::debug!(
+                channel_id = %msg.channel_id,
+                author = %msg.author.id,
+                in_allowed_channel,
+                in_thread,
+                in_ambient_context,
+                "message dropped: not a DM, allowed channel, thread, or ambient context"
+            );
             return;
         }
 
