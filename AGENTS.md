@@ -1,5 +1,28 @@
 # OpenAB — Agent Guidelines
 
+> 🔴 **FORK-LOCAL — not upstream. Keep this block through merges.**
+>
+> This checkout is the **live binary** for four production bridges on this
+> machine (Tifa/Slack, Frieren/Discord, Aerith/Slack, Shoyo/**Feishu**). They
+> all exec the same `target/release/openab`.
+>
+> **Before you build or deploy anything here, read `~/.openab/BUILD.md`.**
+> Two things it will stop you doing, both of which have already broken
+> production once:
+>
+> - A plain `cargo build --release` uses **default features, which exclude
+>   `feishu`** — the resulting binary starts fine for three bridges and
+>   crash-loops Shoyo with `no adapter configured`. Always
+>   `--features unified`.
+> - Overwriting the live binary **in place** (`cp new old`) breaks its code
+>   signature and every later exec is SIGKILLed (exit 137, empty logs).
+>   `rm` it first so the new file lands on a fresh inode.
+>
+> `cargo` is not on the PATH in a non-login shell — use `~/.cargo/bin/cargo`.
+>
+> Incident that produced this block: vault
+> `AI-Memory/shared/2026-08-06-discord-dm-dropped-on-to-channel-error.md`.
+
 You are contributing to OpenAB, a lightweight Rust-based ACP harness bridging Discord, Slack, and webhook platforms to coding CLIs over stdio JSON-RPC.
 
 ## Architecture
