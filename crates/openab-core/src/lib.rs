@@ -9,6 +9,7 @@ pub mod cron;
 pub mod directives;
 pub mod dispatch;
 pub mod error_display;
+pub mod file_send;
 pub mod format;
 pub mod gateway;
 pub mod hooks;

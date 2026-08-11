@@ -415,6 +415,11 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
+    // File-send confinement root: `<<openab-send-file>>` markers may only name
+    // paths inside the agent working_dir (see openab_core::file_send). Set
+    // before any adapter is built; the check fails closed if this is missing.
+    openab_core::file_send::set_file_send_root(&cfg.agent.working_dir);
+
     if cfg.discord.is_none()
         && cfg.slack.is_none()
         && cfg.gateway.is_none()

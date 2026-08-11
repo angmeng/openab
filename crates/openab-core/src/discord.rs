@@ -191,7 +191,10 @@ impl DiscordAdapter {
         reply_to: Option<u64>,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let path_buf = std::path::PathBuf::from(path);
+        // Confinement first (canonicalizes; fails on paths outside working_dir),
+        // then read ONLY via the canonical path it returns — checking one path
+        // and reading another would reopen the symlink hole (crate::file_send).
+        let path_buf = crate::file_send::confine_file_send_path(path)?;
         if !path_buf.is_file() {
             return Err(anyhow::anyhow!("not a regular file: {path}"));
         }

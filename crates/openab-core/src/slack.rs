@@ -452,7 +452,11 @@ impl SlackAdapter {
         use tokio::io::AsyncReadExt;
 
         // --- Validate the path ---
-        let path_buf = std::path::PathBuf::from(path);
+        // Confinement first (canonicalizes; fails on paths outside working_dir
+        // or unresolvable paths), then read ONLY via the canonical path it
+        // returns — checking one path and reading another would reopen the
+        // symlink hole (crate::file_send).
+        let path_buf = crate::file_send::confine_file_send_path(path)?;
         if !path_buf.is_file() {
             return Err(anyhow!("not a regular file: {path}"));
         }
