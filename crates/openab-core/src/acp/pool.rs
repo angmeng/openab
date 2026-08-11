@@ -1258,6 +1258,8 @@ mod tests {
             persisted: HashMap::new(),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
+            // fork-local field (TTL resume gate) — upstream's helper doesn't know it
+            last_seen: HashMap::new(),
         }
     }
 
