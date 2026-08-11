@@ -7,8 +7,13 @@ mod ctl;
     feature = "wecom",
     feature = "teams",
     feature = "acp",
+    feature = "lineworks",
 ))]
 mod unified_adapter;
+#[cfg(feature = "acp")]
+mod acp_tunnel;
+#[cfg(feature = "acp")]
+mod acp_tunnel_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -117,6 +122,46 @@ enum Commands {
         #[arg(long)]
         thread: Option<String>,
     },
+    /// MCP add-on operations (OAB MCP Adapter ADR): interactive and
+    /// operational actions for MCP components. Long-running serving is
+    /// config-driven (`[mcp]` in config.toml + `openab run`); these
+    /// subcommands cover interactive logins and standalone/dev serving.
+    Mcp {
+        #[command(subcommand)]
+        addon: McpAddon,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAddon {
+    /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
+    /// read+drafts Gmail profile served from Gmail's GA REST API as a
+    /// loopback Streamable HTTP MCP server. Register it in mcp.json as a
+    /// `"type": "http"` entry pointing at http://<listen>/mcp.
+    GmailNative {
+        #[command(subcommand)]
+        action: GmailNativeAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum GmailNativeAction {
+    /// Serve the adapter over loopback Streamable HTTP (non-loopback
+    /// addresses are refused — same trust model as the OAB MCP Facade).
+    /// Requires GMAIL_OAUTH_CLIENT_ID (+ optional GMAIL_OAUTH_CLIENT_SECRET)
+    /// in the environment for token refresh.
+    Serve {
+        /// Loopback address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8850")]
+        listen: String,
+    },
+    /// Google OAuth paste-back login requesting offline access, so a refresh
+    /// token is stored and headless deployments survive token expiry.
+    Login {
+        /// Redirect URI pre-registered on the OAuth client.
+        #[arg(long, default_value = openab_mcp::native::gmail::DEFAULT_REDIRECT_URI)]
+        redirect_uri: String,
+    },
 }
 
 /// Returns true if any unified platform is enabled and its corresponding
@@ -147,6 +192,37 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
             && std::env::var("OPENAB_ACP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false))
+        || (cfg!(feature = "lineworks") && lineworks_activated(cfg.lineworks.as_ref()))
+}
+
+/// Single LINE WORKS activation validator: the resolved (config → env →
+/// default) credentials must be complete and non-empty — the same rule the
+/// adapter constructor applies. Used by startup preflight AND cron platform
+/// registration so a partial/empty environment can never register a
+/// platform whose adapter will not construct.
+/// Feature-off stub: `has_unified_platform` calls this through a runtime
+/// `cfg!` check, so the symbol must exist (and answer "not activated") even
+/// when the lineworks feature is compiled out.
+#[cfg(not(feature = "lineworks"))]
+fn lineworks_activated(_lineworks: Option<&config::LineWorksConfig>) -> bool {
+    false
+}
+
+#[cfg(feature = "lineworks")]
+fn lineworks_activated(lineworks: Option<&config::LineWorksConfig>) -> bool {
+    let r = lineworks.cloned().unwrap_or_default().resolve();
+    if !r.is_complete() {
+        return false;
+    }
+    // Same key-material rule as adapter construction: the PEM must parse,
+    // not merely exist — an invalid key must not report a healthy startup.
+    let pem = r.private_key.or_else(|| {
+        r.private_key_file
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+    });
+    pem.as_deref()
+        .is_some_and(openab_gateway::adapters::lineworks::valid_private_key)
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
@@ -190,8 +266,9 @@ fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::Trus
 /// Apply a platform's first-class trust section to the registry, or — when the
 /// platform is active but still trust-driven by the deprecated uniform
 /// `GATEWAY_ALLOW_ALL_USERS`/`GATEWAY_ALLOWED_USERS` env — log the Phase 1
-/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`
-/// overrides; same override shape as the bespoke `[telegram]`/`[line]` blocks.
+/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`/
+/// `[feishu]`/`[lineworks]` overrides; same override shape as the bespoke
+/// `[telegram]`/`[line]` blocks.
 ///
 /// L2 (channels) stays on the shared gateway values passed in; L3 mirrors the
 /// resolved section (config → `{env_prefix}_*` env → deny-all).
@@ -301,6 +378,24 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Commands::Mcp { addon } => {
+            let McpAddon::GmailNative { action } = addon;
+            match action {
+                GmailNativeAction::Serve { listen } => {
+                    if let Err(e) = openab_mcp::native::gmail::serve_http(&listen).await {
+                        eprintln!("gmail-native: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                GmailNativeAction::Login { redirect_uri } => {
+                    if let Err(e) = openab_mcp::native::gmail::login(&redirect_uri).await {
+                        eprintln!("gmail-native login: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            return Ok(());
+        }
         Commands::Run { config } => config,
     };
 
@@ -326,8 +421,25 @@ async fn main() -> anyhow::Result<()> {
         && cfg.telegram.is_none()
         && !has_unified_platform(&cfg)
     {
+        // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
+        // present is a valid deployment — the broker serves just the OAB MCP
+        // Facade listener. One entrypoint, config-driven: hosts that only
+        // need the capability surface (coding-CLI-only users, dev loops, CI
+        // runners, agent hosts with no chat platform) run the same
+        // `openab run` with a two-line config instead of a chat token.
+        if let Some(mcp_cfg) = cfg.mcp.clone() {
+            tracing::info!(
+                listen = %mcp_cfg.listen,
+                "no chat adapter configured — running in facade-only mode ([mcp] present)"
+            );
+            // Foreground, not spawned: the facade IS the workload. A bind
+            // failure or server exit terminates the process (fail fast).
+            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                .await
+                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+        }
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -372,12 +484,82 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    let pool = Arc::new(acp::SessionPool::new(
+    // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
+    // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
+    #[cfg(feature = "acp")]
+    let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
+    #[cfg(feature = "acp")]
+    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
+        acp_tunnel::RootAcpTunnel::new(
+            acp_tunnel_registry.clone(),
+            // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
+            // fall back through the SAME function serde uses rather than repeating the literal.
+            {
+                let t = cfg
+                    .mcp
+                    .as_ref()
+                    .map(|m| m.tunnel_timeout_seconds)
+                    .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds);
+                // The comparison and the ceiling both live beside the constant in the gateway; this
+                // only hands over the configured value.
+                openab_gateway::adapters::acp_server::warn_if_tunnel_timeout_is_ineffective(t);
+                t
+            },
+        ),
+    );
+
+    // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
+    // serve the loopback Streamable HTTP MCP server in-process so any coding
+    // CLI on this host can reach authorized external capabilities via
+    // http://<listen>/mcp. Absent section = no listener (backward compat).
+    // A bind failure is fatal at startup (fail fast, like a bad platform
+    // token) rather than a silently missing capability surface.
+    //
+    // Browser capabilities (Facade mode, default): registered as a
+    // session-aware in-process source — one listener, per-session identity
+    // via broker-minted tokens; no per-session proxy servers.
+    let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
+    // Only read under the acp feature (pool facade wiring below).
+    #[cfg(feature = "acp")]
+    let facade_serving = cfg.mcp.is_some();
+    // Startup, not per-session: report whether the facade is serving, so an operator learns it
+    // here rather than by inferring it from tools that never appear. This is NOT the
+    // `OPENAB_BROWSER_MODE` migration notice — that was removed (see `acp_mcp`), and nothing
+    // reports the variable now.
+    // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
+    // that is a core feature and naming it here is an unknown-cfg error.
+    #[cfg(feature = "acp")]
+    openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    if let Some(mcp_cfg) = cfg.mcp.clone() {
+        let listen = mcp_cfg.listen.clone();
+        let tokens = facade_sessions.clone();
+        // The ACP tunnel source is registered unconditionally under the `acp` feature. It used to
+        // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
+        // runs without it.
+        #[cfg(feature = "acp")]
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
+            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
+                acp_tunnel.clone(),
+            ))];
+        #[cfg(not(feature = "acp"))]
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        tokio::spawn(async move {
+            if let Err(e) =
+                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            {
+                tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
+                std::process::exit(1);
+            }
+        });
+    }
+
+    let pool_inner = acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
         cfg.pool
@@ -385,7 +567,24 @@ async fn main() -> anyhow::Result<()> {
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.session_ttl_hours,
         cfg.pool.default_config_options,
-    ));
+    );
+    // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
+    // no registrar and no facade url, and the pool simply starts sessions without browser
+    // capabilities — there is no longer a proxy path for it to fall back to.
+    #[cfg(feature = "acp")]
+    let pool_inner = pool_inner.with_facade_sessions(
+        facade_serving.then(|| {
+            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+                as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
+        }),
+        facade_serving.then(|| {
+            format!(
+                "http://{}/mcp",
+                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
+            )
+        }),
+    );
+    let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
@@ -467,7 +666,16 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
-        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams", "acp"] {
+        for platform in [
+            "telegram",
+            "line",
+            "feishu",
+            "wecom",
+            "googlechat",
+            "teams",
+            "acp",
+            "lineworks",
+        ] {
             reg.insert(
                 platform,
                 TrustConfig::new(
@@ -683,6 +891,15 @@ async fn main() -> anyhow::Result<()> {
             allow_all_channels,
             &allowed_channels,
         );
+        platform_trust_override(
+            &mut reg,
+            "lineworks",
+            &cfg.lineworks.as_ref().map(|lw| lw.trust_config()),
+            "LINEWORKS",
+            lineworks_activated(cfg.lineworks.as_ref()),
+            allow_all_channels,
+            &allowed_channels,
+        );
         reg
     };
 
@@ -861,6 +1078,10 @@ async fn main() -> anyhow::Result<()> {
     {
         configured_platforms.push("googlechat");
     }
+    #[cfg(feature = "lineworks")]
+    if lineworks_activated(cfg.lineworks.as_ref()) {
+        configured_platforms.push("lineworks");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
@@ -1008,6 +1229,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
@@ -1040,6 +1262,26 @@ async fn main() -> anyhow::Result<()> {
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
+            // Share the tunnel registry the facade's capability source reads (D6-a'), so the gateway
+            // populates the same map the RootAcpTunnel bridge looks up.
+            #[cfg(feature = "acp")]
+            {
+                gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
+            }
+
+            // Pre-download identity probe: lets adapters consult the shared
+            // L3 identity gate BEFORE spending resources on attachment
+            // download. Mirrors gate_gateway_event (is_dm = false, Phase 1).
+            {
+                let probe_router = router.clone();
+                gw_state_inner.trust_probe = Some(std::sync::Arc::new(
+                    move |platform: &str, channel_id: &str, sender_id: &str| {
+                        probe_router
+                            .gate_incoming(platform, channel_id, false, sender_id)
+                            .is_allowed()
+                    },
+                ));
+            }
 
 
             // First-class `[telegram]` config overrides env-derived values
@@ -1070,6 +1312,29 @@ async fn main() -> anyhow::Result<()> {
                     channel_secret: r.channel_secret,
                     channel_access_token: r.channel_access_token,
                     webhook_path: r.webhook_path,
+                });
+            }
+
+            // First-class `[lineworks]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + LINEWORKS_* env
+            // fallback). The apply rebuilds the adapter through the same
+            // validation as env-only construction.
+            #[cfg(feature = "lineworks")]
+            if let Some(ref lw) = cfg.lineworks {
+                let r = lw.resolve();
+                gw_state_inner.apply_lineworks_config(openab_gateway::GatewayLineWorksConfig {
+                    bot_id: r.bot_id,
+                    bot_secret: r.bot_secret,
+                    client_id: r.client_id,
+                    client_secret: r.client_secret,
+                    service_account: r.service_account,
+                    private_key: r.private_key,
+                    private_key_file: r.private_key_file,
+                    webhook_path: r.webhook_path,
+                    require_mention: r.require_mention,
+                    bot_name: r.bot_name,
+                    rich_messages: r.rich_messages,
+                    ack_message: r.ack_message,
                 });
             }
 
@@ -1288,6 +1553,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            #[cfg(feature = "lineworks")]
+            if let Some(ref lw) = gw_state.lineworks {
+                info!(path = %lw.config.webhook_path, "unified: lineworks adapter enabled");
+                app = app.route(
+                    &lw.config.webhook_path,
+                    axum::routing::post(openab_gateway::adapters::lineworks::webhook),
+                );
+            }
+
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
@@ -1404,6 +1678,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "googlechat")]
         if let Some(ref a) = shared_unified_adapter {
             cron_adapters.insert("googlechat".into(), a.clone());
+        }
+        #[cfg(feature = "lineworks")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("lineworks".into(), a.clone());
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
@@ -1645,8 +1923,42 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::Parser;
+
+    /// The shipped tunnel-timeout default must stay strictly beneath the ceiling that overtakes it.
+    ///
+    /// This pairing can only be asserted here. The gateway owns the ceiling and cannot see the
+    /// default; the core crate owns the default and cannot see the ceiling, since the gateway does
+    /// not depend on it. The binary is the only place both are visible — which is also why the
+    /// warning that reports a violation is wired up here.
+    ///
+    /// Raising the default to or above the ceiling would silently restore the condition several
+    /// commits were spent removing: two clocks starting together, with the wrong one able to fire
+    /// first, and no cancellation reaching the peer when it does.
+    ///
+    /// Feature-gated because it names `openab_gateway`, which is an OPTIONAL dependency: the crate
+    /// is absent under default features, so without this gate the whole `openab` test binary fails
+    /// to compile for anyone building without `acp` — including CI, whose `check` job runs a plain
+    /// `cargo test --workspace`. The surrounding `mod tests` is `#[cfg(test)]` only, so the gate has
+    /// to be here.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_default_tunnel_timeout_stays_beneath_the_idle_timeout() {
+        let default = openab_core::config::default_tunnel_timeout_seconds();
+        let ceiling = openab_gateway::adapters::acp_server::ACP_PROMPT_IDLE_TIMEOUT_SECS;
+        assert!(
+            default < ceiling,
+            "the default tunnel timeout ({default}s) must be strictly beneath the ACP prompt idle \
+             timeout ({ceiling}s); at or above it the turn ends there first and no `mcp/cancel` is \
+             ever sent"
+        );
+        assert!(
+            !openab_gateway::adapters::acp_server::tunnel_timeout_is_ineffective(default),
+            "the shipped default must not be a value the startup warning fires on"
+        );
+    }
 
     #[test]
     fn cli_no_args_defaults_to_run() {

@@ -65,9 +65,75 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+/// `[mcp]` — enables the in-process OAB MCP Facade: a loopback Streamable
+/// HTTP MCP server exposing `search_capabilities` / `execute_capability`
+/// over the shared MCP runtime (`openab-mcp` crate). Any coding CLI on the
+/// same host connects to `http://<listen>/mcp`. Provider connections stay in
+/// `~/.openab/agent/mcp.json` (the facade has no provider config here —
+/// single source of truth, ADR §6.3 / Alternative E).
+/// **Strict.** An unknown key here is a hard startup failure, not a warning — a mistyped `listen`
+/// or `tunnel_timeout_seconds` should stop startup, not be silently ignored into its default.
+///
+/// **The operator allowlist this attribute used to guard was removed on 2026-07-31 (D-29),
+/// reversing D-20's fail-closed default.** `[[mcp.acp_servers]]` is gone: admission for
+/// client-declared `type:acp` servers is now the `/acp` transport auth alone
+/// (`OPENAB_ACP_AUTH_KEY`, or loopback + `OPENAB_ACP_ALLOWED_ORIGINS`), because the extension
+/// already authenticates to reach the tunnel and a second operator allowlist duplicated that
+/// intent. `deny_unknown_fields` keeps a sharper edge for it: a config still carrying an
+/// `[[mcp.acp_servers]]` block HARD-FAILS to parse rather than ignoring it — intended, so a stale
+/// allowlist announces itself instead of looking effective.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {
-    /// AgentCore Runtime ARN (required)
+#[serde(deny_unknown_fields)]
+pub struct McpFacadeConfig {
+    /// Loopback listen address. Non-loopback addresses are refused at
+    /// startup — the endpoint has no authentication layer, so the host
+    /// boundary is the trust boundary.
+    #[serde(default = "default_mcp_listen")]
+    pub listen: String,
+    /// How long a single request tunnelled to a client-declared `type:acp` server may run
+    /// before openab gives up on it, in seconds.
+    ///
+    /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
+    /// browser extension we neither ship nor control, so there is nobody else to bound it.
+    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout in `handle_session_prompt`
+    /// (`ACP_PROMPT_IDLE_TIMEOUT_SECS`, 180s), and the margin is the point. Referenced by name, not
+    /// by line: the same claim was written as a line number twice and was wrong both times, because
+    /// every edit above it moves the target. Setting the two equal makes which one fires
+    /// first undecidable at the boundary, and they do different things: only when this one wins
+    /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
+    /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
+    /// cancellation exists to prevent.
+    ///
+    /// **180s is therefore the effective ceiling.** A larger value here is not an error and is not
+    /// clamped, but it cannot take effect: the idle timeout is not operator-configurable, so the turn
+    /// ends there first and this setting stops mattering. Startup warns when it is set that high
+    /// rather than letting the number look effective.
+    ///
+    /// The check lives in the gateway, beside the constant, as
+    /// `warn_if_tunnel_timeout_is_ineffective`; the binary only hands it this value. That keeps the
+    /// ceiling and the comparison in one place, so changing it — or making it configurable — is a
+    /// single edit. It does not remove coupling: this crate cannot see the constant, since
+    /// `openab-gateway` does not depend on `openab-core`, and the gateway never sees this value. The
+    /// binary is the only place both are visible, and it already depends on the gateway. Moving the
+    /// constant into this crate would ADD a dependency edge to save nothing. Earlier wording said to "raise both, in that
+    /// order" — there is no second knob to raise, so that instruction could not be followed.
+    #[serde(default = "default_tunnel_timeout_seconds")]
+    pub tunnel_timeout_seconds: u64,
+}
+
+/// Public so the binary can use the same value instead of repeating the literal. A private
+/// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
+/// the binary would silently keep the old number the day this changes.
+pub fn default_tunnel_timeout_seconds() -> u64 {
+    170
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:8848".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -173,11 +239,15 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     pub telegram: Option<TelegramConfig>,
     pub line: Option<LineConfig>,
+    pub lineworks: Option<LineWorksConfig>,
     pub wecom: Option<WecomConfig>,
     pub googlechat: Option<GoogleChatConfig>,
     pub teams: Option<TeamsConfig>,
     pub feishu: Option<FeishuConfig>,
     pub agentcore: Option<AgentCoreConfig>,
+    /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
+    /// the opt-in signal: absent = no facade, no listener, no new behavior.
+    pub mcp: Option<McpFacadeConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -896,6 +966,151 @@ impl LineConfig {
     /// uniform `GATEWAY_*` seed (and to warn when it does).
     pub fn env_trust_present() -> bool {
         std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
+}
+
+/// First-class `[lineworks]` section — credentials for the LINE WORKS bot
+/// adapter. Config-first invariant (#1375): each field resolves
+/// `[lineworks].field` (with `${}` expansion) → `LINEWORKS_*` env var →
+/// default. The adapter is enabled only when bot id, bot secret, and the
+/// full service-account auth material all resolve to non-empty values.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineWorksConfig {
+    /// Bot ID (also cross-checked against the `X-WORKS-BotId` callback
+    /// header). Env fallback: `LINEWORKS_BOT_ID`.
+    pub bot_id: Option<String>,
+    /// Bot Secret for webhook HMAC-SHA256 signature verification (L1).
+    /// Env fallback: `LINEWORKS_BOT_SECRET`.
+    pub bot_secret: Option<String>,
+    /// App Client ID (JWT `iss`). Env fallback: `LINEWORKS_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// App Client Secret (token request). Env fallback:
+    /// `LINEWORKS_CLIENT_SECRET`.
+    pub client_secret: Option<String>,
+    /// Service account email (JWT `sub`). Env fallback:
+    /// `LINEWORKS_SERVICE_ACCOUNT`.
+    pub service_account: Option<String>,
+    /// RS256 private key PEM (inline). Env fallback: `LINEWORKS_PRIVATE_KEY`.
+    /// Takes precedence over `private_key_file`.
+    pub private_key: Option<String>,
+    /// Path to the RS256 private key PEM downloaded from the Developer
+    /// Console. Env fallback: `LINEWORKS_PRIVATE_KEY_FILE`.
+    pub private_key_file: Option<String>,
+    /// Webhook mount path. Env fallback: `LINEWORKS_WEBHOOK_PATH`
+    /// (default `/webhook/lineworks`).
+    pub webhook_path: Option<String>,
+    /// Require an @-mention of the bot in channel (group) messages; 1:1
+    /// always passes. Env fallback: `LINEWORKS_REQUIRE_MENTION`
+    /// (default `true`).
+    pub require_mention: Option<bool>,
+    /// Bot display name for mention matching. When unset, fetched from
+    /// `GET /bots/{botId}`. Env fallback: `LINEWORKS_BOT_NAME`.
+    pub bot_name: Option<String>,
+    /// Render markdown replies as flexible-template messages (plain-text
+    /// fallback on any failure). Env fallback: `LINEWORKS_RICH_MESSAGES`
+    /// (default `true`).
+    pub rich_messages: Option<bool>,
+    /// Receipt acknowledgement message sent when a user message is accepted
+    /// (LINE WORKS has no reaction/typing APIs). Unset/empty = disabled.
+    /// Env fallback: `LINEWORKS_ACK_MESSAGE`.
+    pub ack_message: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `LINEWORKS_ALLOW_ALL_USERS` (empty string = unset).
+    pub allow_all_users: Option<bool>,
+    /// LINE WORKS userIds (UUIDs, as carried in callback events) allowed to
+    /// interact. Only checked when `allow_all_users` resolves to `false`.
+    /// Env fallback: `LINEWORKS_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE WORKS settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLineWorks {
+    pub bot_id: Option<String>,
+    pub bot_secret: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub service_account: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
+    pub rich_messages: bool,
+    pub ack_message: Option<String>,
+}
+
+impl ResolvedLineWorks {
+    /// The single activation validator: true only when every credential the
+    /// adapter constructor requires is present and non-empty (bot id/secret,
+    /// OAuth client pair, service account, and a private key — inline or
+    /// file path). Startup preflight, cron platform registration, and
+    /// adapter construction must all agree on this definition.
+    pub fn is_complete(&self) -> bool {
+        self.bot_id.is_some()
+            && self.bot_secret.is_some()
+            && self.client_id.is_some()
+            && self.client_secret.is_some()
+            && self.service_account.is_some()
+            && (self.private_key.is_some()
+                || self
+                    .private_key_file
+                    .as_deref()
+                    .is_some_and(|p| std::fs::read(p).is_ok()))
+    }
+}
+
+impl LineWorksConfig {
+    /// Resolve every field: config value (if set) → `LINEWORKS_*` env →
+    /// default. Same shape as [`LineConfig::resolve`]; empty strings — from
+    /// `${}` expansion of unset vars OR from empty env values — are treated
+    /// as unset on both layers, so activation checks and adapter
+    /// construction agree on what "configured" means.
+    pub fn resolve(&self) -> ResolvedLineWorks {
+        let field = |v: &Option<String>, env: &str| {
+            v.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        };
+        ResolvedLineWorks {
+            bot_id: field(&self.bot_id, "LINEWORKS_BOT_ID"),
+            bot_secret: field(&self.bot_secret, "LINEWORKS_BOT_SECRET"),
+            client_id: field(&self.client_id, "LINEWORKS_CLIENT_ID"),
+            client_secret: field(&self.client_secret, "LINEWORKS_CLIENT_SECRET"),
+            service_account: field(&self.service_account, "LINEWORKS_SERVICE_ACCOUNT"),
+            private_key: field(&self.private_key, "LINEWORKS_PRIVATE_KEY"),
+            private_key_file: field(&self.private_key_file, "LINEWORKS_PRIVATE_KEY_FILE"),
+            webhook_path: field(&self.webhook_path, "LINEWORKS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/lineworks".into()),
+            require_mention: self.require_mention.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_REQUIRE_MENTION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            bot_name: field(&self.bot_name, "LINEWORKS_BOT_NAME"),
+            rich_messages: self.rich_messages.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_RICH_MESSAGES")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            ack_message: field(&self.ack_message, "LINEWORKS_ACK_MESSAGE"),
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
     }
 }
 
@@ -2418,6 +2633,65 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_facade_absent_by_default() {
+        // Backward compat: no [mcp] section → no facade, no listener.
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.mcp.is_none());
+    }
+
+    #[test]
+    fn mcp_facade_presence_enables_with_default_listen() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
+        let mcp = cfg.mcp.expect("[mcp] presence is the opt-in signal");
+        assert_eq!(mcp.listen, "127.0.0.1:8848");
+    }
+
+    /// The operator allowlist was removed on 2026-07-31 (D-29), reversing D-20. `[[mcp.acp_servers]]`
+    /// is no longer a field on `McpFacadeConfig`, and `deny_unknown_fields` turns a leftover block
+    /// from a silent no-op into a hard parse failure — a stale allowlist must announce itself rather
+    /// than look effective. This replaces the pair of tests that pinned the allowlist's
+    /// mistyped-vs-correct spellings: there is no correct spelling any more, and the entry-key test
+    /// went with the `AcpServerPolicy` struct it exercised.
+    #[test]
+    fn an_acp_servers_block_is_now_refused_because_the_allowlist_was_removed() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
+             tools = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect_err("a leftover allowlist block must fail the parse, not be silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acp_servers"),
+            "the error must name the offending key so the operator can find it, got: {msg}"
+        );
+    }
+
+    /// Positive control for the test above: the `[mcp]` shape that SURVIVES D-29 — `listen` and
+    /// `tunnel_timeout_seconds` only — still parses, so the rejection above is about the removed
+    /// key and not a parser that refuses everything.
+    #[test]
+    fn a_bare_mcp_section_still_parses() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .expect("the surviving [mcp] shape must keep working");
+        let mcp = cfg.mcp.expect("[mcp] present");
+        assert_eq!(mcp.listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn mcp_facade_listen_override() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
     use std::io::Write;
 
     #[test]
@@ -3080,6 +3354,10 @@ allowed_users = ["users/123456789"]
 [teams]
 app_id = "app-1"
 allow_all_users = true
+
+[lineworks]
+bot_id = "123"
+allowed_users = ["uuid-a", "uuid-b"]
 "#;
         let cfg = parse_config_str(toml_str, "test").unwrap();
         let wecom = cfg.wecom.expect("wecom section");
@@ -3099,12 +3377,28 @@ allow_all_users = true
         let teams = cfg.teams.expect("teams section");
         assert_eq!(teams.app_id.as_deref(), Some("app-1"));
         assert_eq!(teams.allow_all_users, Some(true));
+        let lw = cfg.lineworks.expect("lineworks section");
+        assert_eq!(lw.bot_id.as_deref(), Some("123"));
+        assert_eq!(lw.allow_all_users, None);
+        assert_eq!(
+            lw.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
+        // trust_config() preserves the section's fields for the shared
+        // registry override path (platform_trust_override, prefix LINEWORKS).
+        let tc = lw.trust_config();
+        assert_eq!(tc.allow_all_users, None);
+        assert_eq!(
+            tc.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
 
         // Absent sections → None (trust falls back to legacy GATEWAY_* seed).
         let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
         assert!(cfg.wecom.is_none());
         assert!(cfg.googlechat.is_none());
         assert!(cfg.teams.is_none());
+        assert!(cfg.lineworks.is_none());
     }
 
     /// All `WECOM_*` env scenarios in ONE test — std::env is process-global and
@@ -3841,5 +4135,73 @@ allowed_channels = ["111"]"#));
         let f = write_tmp("[discord]\nallowed_channels = [\"111\"]\n");
         let r = persist_allowed_channel(f.path(), "C0NEW");
         assert!(r.is_err(), "no [slack] allowed_channels => error, not silent corruption");
+    }
+
+    #[test]
+    fn lineworks_activation_validator() {
+        // Serialized via env hygiene: clear all LINEWORKS_* first (tests in
+        // this binary do not otherwise touch these vars).
+        for var in [
+            "LINEWORKS_BOT_ID",
+            "LINEWORKS_BOT_SECRET",
+            "LINEWORKS_CLIENT_ID",
+            "LINEWORKS_CLIENT_SECRET",
+            "LINEWORKS_SERVICE_ACCOUNT",
+            "LINEWORKS_PRIVATE_KEY",
+            "LINEWORKS_PRIVATE_KEY_FILE",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let full = LineWorksConfig {
+            bot_id: Some("1".into()),
+            bot_secret: Some("s".into()),
+            client_id: Some("c".into()),
+            client_secret: Some("cs".into()),
+            service_account: Some("sa@x".into()),
+            private_key: Some("pem".into()),
+            ..Default::default()
+        };
+        assert!(full.resolve().is_complete());
+
+        // Empty environment → not activated.
+        assert!(!LineWorksConfig::default().resolve().is_complete());
+
+        // Any missing credential → incomplete (bot id alone must NOT activate).
+        let only_bot_id = LineWorksConfig {
+            bot_id: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(!only_bot_id.resolve().is_complete());
+        let mut partial = full.clone();
+        partial.client_secret = None;
+        assert!(!partial.resolve().is_complete());
+
+        // Empty-string config values are treated as unset.
+        let mut empty_val = full.clone();
+        empty_val.bot_secret = Some(String::new());
+        assert!(!empty_val.resolve().is_complete());
+
+        // Empty-string ENV values are also treated as unset...
+        let mut needs_env = full.clone();
+        needs_env.bot_id = None;
+        std::env::set_var("LINEWORKS_BOT_ID", "");
+        assert!(!needs_env.resolve().is_complete());
+        // ...while a real env value completes the set.
+        std::env::set_var("LINEWORKS_BOT_ID", "99");
+        assert!(needs_env.resolve().is_complete());
+        std::env::remove_var("LINEWORKS_BOT_ID");
+
+        // private_key_file counts as key material only when READABLE —
+        // activation must match adapter construction, which reads the file.
+        let mut file_key = full.clone();
+        file_key.private_key = None;
+        file_key.private_key_file = Some("/nonexistent/lineworks_key.pem".into());
+        assert!(!file_key.resolve().is_complete());
+        let tmp = std::env::temp_dir().join("lineworks_test_key_validator.pem");
+        std::fs::write(&tmp, "-----BEGIN PRIVATE KEY-----").unwrap();
+        file_key.private_key_file = Some(tmp.to_string_lossy().into_owned());
+        assert!(file_key.resolve().is_complete());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
