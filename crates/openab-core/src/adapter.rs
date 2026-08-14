@@ -1017,6 +1017,12 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    // True when the dropped-turn watchdog ended our listening early
+                    // WITHOUT cancelling the agent's turn. The turn may still be
+                    // running, so the session can answer the next prompt with a busy
+                    // no-op until it finishes. Logged at finalize so that ⏳ is
+                    // attributable rather than mysterious.
+                    let mut watchdog_flushed = false;
                     // Per-turn usage from the keyed result. `input_tokens == 0`
                     // means the model was never invoked — a prompt arrived while
                     // the session was mid-turn and ACP returned an instant empty
@@ -1085,6 +1091,18 @@ impl AdapterRouter {
                                 // rather than risk a silent drop on eviction. No
                                 // response_error is set, so the buffered reply is
                                 // delivered clean. See IDLE_FLUSH_AFTER.
+                                //
+                                // It does NOT cancel the turn (2026-08-14). The
+                                // watchdog cannot tell a hung agent from one that is
+                                // legitimately waiting: a `run_in_background` tool
+                                // reports pending→completed in the same millisecond,
+                                // so `has_running_tool` is false for the whole wait
+                                // and nothing resets `last_activity`. Sending
+                                // `session/cancel` here used to kill exactly the turn
+                                // that was about to report the background result.
+                                // Flushing without cancelling keeps that turn alive,
+                                // so its report is still delivered when it lands.
+                                // Root cause: AI-Memory/shared/2026-08-14-openab-background-task-final-reply-never-delivered.md §4
                                 let has_running_tool = tool_lines
                                     .iter()
                                     .any(|e| matches!(e.state, ToolState::Running));
@@ -1096,10 +1114,14 @@ impl AdapterRouter {
                                         idle_secs = last_activity.elapsed().as_secs(),
                                         buffered_chars = text_buf.len(),
                                         "agent idle after emitting content without \
-                                         stopReason; flushing buffered reply to avoid \
-                                         silent drop (dropped-turn watchdog)"
+                                         stopReason; flushing buffered reply without \
+                                         cancelling the turn (dropped-turn watchdog)"
                                     );
-                                    conn.abandon_request(request_id).await;
+                                    // Deliberately NOT abandon_request(): see above.
+                                    // The pending entry stays, so if the turn does
+                                    // finish later its id-bearing response resolves
+                                    // normally instead of arriving as a stale id.
+                                    watchdog_flushed = true;
                                     break;
                                 }
                                 continue;
@@ -1287,6 +1309,14 @@ impl AdapterRouter {
                         }
                     }
 
+                    if watchdog_flushed {
+                        tracing::info!(
+                            request_id,
+                            "turn left running after a watchdog flush — the agent was \
+                             not cancelled, so it may still be working; the next \
+                             prompt can busy-noop until it finishes"
+                        );
+                    }
                     conn.prompt_done().await;
                     // Stop the cosmetic edit loop before the finalize write path
                     // issues its authoritative edit. Dropping buf_tx closes the watch
