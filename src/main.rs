@@ -1057,6 +1057,7 @@ async fn main() -> anyhow::Result<()> {
                 adapters,
                 ctl_registry.clone(),
                 ctl_shard.clone(),
+                router.clone(),
             ))))
         }
     };

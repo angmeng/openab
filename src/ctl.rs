@@ -20,8 +20,23 @@
 //! - `message.send` — proactively post text to a channel, out-of-band (no
 //!   user-prompt turn). Lets cron / heartbeat / the agent's own shell push a
 //!   message immediately instead of waiting for the next turn to flush.
+//! - `agent.prompt` — inject a prompt into the target thread's agent session, so
+//!   the **agent itself** composes and delivers the reply through the normal turn
+//!   pipeline (its own voice, mrkdwn, markers, threading). Same `handle_message`
+//!   call the cron scheduler makes, minus the schedule and minus cron's visible
+//!   `🕐 [sender]:` trigger post. This is the delivery path for work that outlives
+//!   one prompt turn: the bridge stops listening to an agent once the turn ends
+//!   (`adapter.rs` dropped-turn watchdog → `prompt_done()`), so a long job's own
+//!   final report is dropped. A completion hook that pokes the session gets a real
+//!   reply instead of a script-composed imitation.
+//!
+//! `--thread` accepts `<channel_id>` or `<channel_id>:<thread_ts>`. Without the
+//! `:<thread_ts>` suffix the message/prompt lands at channel top level; with it,
+//! inside that thread.
 
-use openab_core::adapter::{ChannelRef, ChatAdapter};
+use openab_core::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageContext, MessageRef, SenderContext,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,6 +238,20 @@ pub type ShardSlot = Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>
 #[cfg(not(feature = "discord"))]
 pub type ShardSlot = Arc<std::sync::OnceLock<()>>;
 
+/// Split a `--thread` value into `(channel_id, thread_ts)`.
+///
+/// `C0ABCDEF:1787020033.237109` targets a thread; a bare `C0ABCDEF` targets the
+/// channel itself. Slack channel ids and Discord snowflakes never contain `:`, so
+/// the first colon is an unambiguous separator. An empty suffix (`C0ABCDEF:`) is
+/// treated as absent rather than as a thread whose ts is the empty string.
+fn split_thread_target(raw: &str) -> (&str, Option<&str>) {
+    match raw.split_once(':') {
+        Some((channel, ts)) if !ts.is_empty() => (channel, Some(ts)),
+        Some((channel, _)) => (channel, None),
+        None => (raw, None),
+    }
+}
+
 /// Concrete handler for `openab run` — dispatches to platform adapters.
 pub struct RuntimeHandler {
     /// Registered adapters by platform name.
@@ -230,6 +259,10 @@ pub struct RuntimeHandler {
     /// thread_id → platform mapping. Populated by `openab run` when it dispatches messages.
     registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     shard: ShardSlot,
+    /// Message router — the same one the adapters and the cron scheduler use.
+    /// Needed by `agent.prompt`, which must go through the full turn pipeline
+    /// rather than posting text directly.
+    router: Arc<AdapterRouter>,
 }
 
 impl RuntimeHandler {
@@ -237,8 +270,9 @@ impl RuntimeHandler {
         adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
         registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
         shard: ShardSlot,
+        router: Arc<AdapterRouter>,
     ) -> Self {
-        Self { adapters, registry, shard }
+        Self { adapters, registry, shard, router }
     }
 
     /// Resolve which adapter to use for a given thread_id.
@@ -424,10 +458,11 @@ impl CtlHandler for RuntimeHandler {
                         };
                     }
                 };
+                let (channel_id, thread_ts) = split_thread_target(tid);
                 let channel = ChannelRef {
                     platform: String::new(),
-                    channel_id: tid.to_string(),
-                    thread_id: None,
+                    channel_id: channel_id.to_string(),
+                    thread_id: thread_ts.map(str::to_string),
                     parent_id: None,
                     origin_event_id: None,
                 };
@@ -440,6 +475,121 @@ impl CtlHandler for RuntimeHandler {
                     Err(e) => Response {
                         ok: false,
                         message: format!("send failed: {e}"),
+                        value: None,
+                    },
+                }
+            }
+            "agent.prompt" => {
+                // Inject a prompt into the thread's agent session. Unlike
+                // `message.send` (which posts `value` verbatim), this makes the AGENT
+                // answer: same `router.handle_message` path as an inbound user message,
+                // so the reply carries the session's context, the persona's voice, and
+                // the adapter's mrkdwn / marker / threading handling.
+                let Some(tid) = thread_id else {
+                    return Response {
+                        ok: false,
+                        message: "agent.prompt requires --thread <channel_id[:thread_ts]>".into(),
+                        value: None,
+                    };
+                };
+                if value.is_empty() {
+                    return Response {
+                        ok: false,
+                        message: "agent.prompt requires a non-empty value (the prompt)".into(),
+                        value: None,
+                    };
+                }
+                // Same resolution as message.send: registry first, then the sole
+                // configured adapter (the registry is only populated after an inbound
+                // message, and a completion hook can fire before any).
+                let adapter = match self.resolve(Some(tid)).await {
+                    Some((a, _)) => a,
+                    None if self.adapters.len() == 1 => {
+                        self.adapters.values().next().unwrap().clone()
+                    }
+                    None => {
+                        return Response {
+                            ok: false,
+                            message: format!(
+                                "cannot resolve platform for thread {tid}: registry empty and \
+                                 {} adapters configured (ambiguous — wire the registry or run a \
+                                 single-adapter bridge)",
+                                self.adapters.len()
+                            ),
+                            value: None,
+                        };
+                    }
+                };
+
+                let (channel_id, thread_ts) = split_thread_target(tid);
+                let thread_channel = ChannelRef {
+                    platform: adapter.platform().to_string(),
+                    channel_id: channel_id.to_string(),
+                    thread_id: thread_ts.map(str::to_string),
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                let sender = SenderContext {
+                    schema: "openab.sender.v1".into(),
+                    sender_id: "openab-ctl".into(),
+                    sender_name: "openab-ctl".into(),
+                    display_name: "openab-ctl".into(),
+                    channel: adapter.platform().to_string(),
+                    channel_id: channel_id.to_string(),
+                    thread_id: thread_ts.map(str::to_string),
+                    is_bot: true,
+                    // No wall clock here: this crate has no chrono dependency and the
+                    // field is optional. The agent sees the prompt, not a timestamp.
+                    timestamp: None,
+                    message_id: None,
+                    receiver_id: None,
+                };
+                let sender_json = match serde_json::to_string(&sender) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Response {
+                            ok: false,
+                            message: format!("failed to serialize sender context: {e}"),
+                            value: None,
+                        };
+                    }
+                };
+
+                // No anchor message: nothing was posted for this prompt, so there is
+                // nothing to react to. An empty `message_id` disables the status-emoji
+                // lifecycle in StatusReactionController rather than firing reaction
+                // calls the platform answers with `message_not_found`.
+                let trigger_msg = MessageRef {
+                    channel: thread_channel.clone(),
+                    message_id: String::new(),
+                };
+
+                match self
+                    .router
+                    .handle_message(
+                        &adapter,
+                        MessageContext {
+                            thread_channel,
+                            sender_json,
+                            prompt: value.to_string(),
+                            extra_blocks: vec![],
+                            trigger_msg,
+                            other_bot_present: false,
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => Response {
+                        ok: true,
+                        message: format!("prompt delivered to {tid}"),
+                        value: None,
+                    },
+                    // A session already mid-turn answers with an instant empty
+                    // `end_turn`; the adapter surfaces that as the ⏳ busy notice in
+                    // the thread. That is a delivered turn, not an error here.
+                    Err(e) => Response {
+                        ok: false,
+                        message: format!("prompt failed: {e}"),
                         value: None,
                     },
                 }
@@ -517,6 +667,26 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn thread_target_bare_channel_has_no_thread() {
+        assert_eq!(split_thread_target("C0ABCDEF"), ("C0ABCDEF", None));
+    }
+
+    #[test]
+    fn thread_target_splits_on_first_colon() {
+        assert_eq!(
+            split_thread_target("C0ABCDEF:1787020033.237109"),
+            ("C0ABCDEF", Some("1787020033.237109"))
+        );
+    }
+
+    #[test]
+    fn thread_target_empty_suffix_is_not_a_thread() {
+        // `C0ABCDEF:` must not become a thread whose ts is "" — Slack would reject
+        // the post, and silently posting top-level is the safer read of the input.
+        assert_eq!(split_thread_target("C0ABCDEF:"), ("C0ABCDEF", None));
     }
 
     #[test]

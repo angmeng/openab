@@ -42,6 +42,11 @@ pub struct StatusReactionController {
 }
 
 impl StatusReactionController {
+    /// `message` is the inbound message the status emoji is attached to. A turn
+    /// with **no anchor message** — one injected by `openab set agent.prompt`,
+    /// where nothing was posted to react to — passes an empty `message_id`; the
+    /// controller then disables itself rather than firing `reactions.add` calls
+    /// the platform can only answer with `message_not_found`.
     pub fn new(
         enabled: bool,
         adapter: Arc<dyn ChatAdapter>,
@@ -49,6 +54,7 @@ impl StatusReactionController {
         emojis: ReactionEmojis,
         timing: ReactionTiming,
     ) -> Self {
+        let enabled = enabled && !message.message_id.is_empty();
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 adapter,
