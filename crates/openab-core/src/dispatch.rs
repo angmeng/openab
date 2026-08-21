@@ -354,6 +354,21 @@ impl Dispatcher {
         adapter: Arc<dyn ChatAdapter>,
         msg: BufferedMessage,
     ) -> Result<(), DispatchError> {
+        // Liveness marker. `bridge-liveness.py` reconciles the platform's message
+        // history against the log to catch "connection green but MESSAGE_CREATE
+        // never reaches the handler". It used to key off the adapters' DEBUG lines,
+        // which vanished when the bridges moved to RUST_LOG=openab=info (2026-08-20,
+        // to stop `acp_recv`/`acp_send` writing message bodies into the log) — the
+        // check then flagged every healthy bridge as deaf. This line is INFO so it
+        // survives that, and carries IDS ONLY — never the message body, which is the
+        // whole reason the DEBUG lines were turned off. Emitted at RECEIPT rather
+        // than at "batch dispatched" (which logs only after the turn completes, so a
+        // long turn would look like silence).
+        info!(
+            thread_key = %thread_key,
+            channel = %thread_channel.channel_id,
+            "inbound accepted"
+        );
         let cap = self.max_buffered_messages;
         let target = Arc::clone(&self.target);
         let max_tokens = self.max_batch_tokens;
