@@ -1527,11 +1527,18 @@ impl AdapterRouter {
                         // mark the trigger message "seen, not replying". This finishes
                         // the controller, so the caller's set_done (🆗 + mood face)
                         // becomes a no-op — a deliberate non-reply must not look like
-                        // an answer. Skipped on assistant-status platforms, which never
-                        // carry status reactions (matches the queued/done gating).
-                        if !assistant_status {
-                            reactions.set_seen().await;
-                        }
+                        // an answer.
+                        //
+                        // NOT gated on assistant_status, unlike queued/done. Those are
+                        // transient progress markers that the assistant status line
+                        // replaces; 🤫 is the *only* trace a chose-not-to-reply turn
+                        // leaves, and the status line is cleared at turn end. With the
+                        // gate, an assistant-mode bot (Tifa, 2026-09-07 #atlas-playground)
+                        // went silent with no ack at all — indistinguishable from a
+                        // dropped turn. The controller is still config-gated
+                        // (`[reactions] enabled`), so this is a no-op where reactions
+                        // are off.
+                        reactions.set_seen().await;
                         Vec::new()
                     } else if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);
