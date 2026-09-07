@@ -1523,7 +1523,15 @@ impl AdapterRouter {
                     };
 
                     let chunks = if suppress_send {
-                        // Reaction-only ack (multi-bot channel, empty turn): post nothing.
+                        // Reaction-only ack (empty turn, no error): post nothing and
+                        // mark the trigger message "seen, not replying". This finishes
+                        // the controller, so the caller's set_done (🆗 + mood face)
+                        // becomes a no-op — a deliberate non-reply must not look like
+                        // an answer. Skipped on assistant-status platforms, which never
+                        // carry status reactions (matches the queued/done gating).
+                        if !assistant_status {
+                            reactions.set_seen().await;
+                        }
                         Vec::new()
                     } else if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);

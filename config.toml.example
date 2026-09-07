@@ -309,6 +309,10 @@ coding = "👨💻"
 web = "⚡"
 done = "🆗"
 error = "😱"
+# Final reaction when the agent read the message and chose not to reply
+# (empty output, no error): "seen, not replying". Replaces the queued emoji;
+# the done emoji + mood face are NOT added on such turns.
+seen = "🤫"
 
 [reactions.timing]
 debounce_ms = 700

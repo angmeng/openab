@@ -109,7 +109,11 @@ impl StatusReactionController {
             return;
         }
         let emoji = { self.inner.lock().await.emojis.done.clone() };
-        self.finish(&emoji).await;
+        // A turn already finished by `set_seen` (chose-not-to-reply) or
+        // `set_error` must not pick up the done face on top.
+        if !self.finish(&emoji).await {
+            return;
+        }
         // Add a random mood face
         let faces = ["😊", "😎", "🫡", "🤓", "😏", "✌️", "💪", "🦾"];
         let face = faces[rand::random::<usize>() % faces.len()];
@@ -122,6 +126,18 @@ impl StatusReactionController {
             return;
         }
         let emoji = { self.inner.lock().await.emojis.error.clone() };
+        self.finish(&emoji).await;
+    }
+
+    /// Final state for a turn that read the message and deliberately emitted
+    /// nothing (empty output, no error, not a silent failure). Marks the turn
+    /// finished so the caller's subsequent `set_done` is a no-op — the reader
+    /// sees "seen, not replying", not "answered".
+    pub async fn set_seen(&self) {
+        if !self.enabled {
+            return;
+        }
+        let emoji = { self.inner.lock().await.emojis.seen.clone() };
         self.finish(&emoji).await;
     }
 
@@ -192,10 +208,12 @@ impl StatusReactionController {
         self.reset_stall_timers_inner(&mut inner);
     }
 
-    async fn finish(&self, emoji: &str) {
+    /// Returns `true` when this call performed the transition, `false` when the
+    /// controller was already finished (the emoji is left untouched then).
+    async fn finish(&self, emoji: &str) -> bool {
         let mut inner = self.inner.lock().await;
         if inner.finished {
-            return;
+            return false;
         }
         inner.finished = true;
         cancel_timers(&mut inner);
@@ -211,6 +229,7 @@ impl StatusReactionController {
         if !old.is_empty() && old != new {
             let _ = adapter.remove_reaction(&msg, &old).await;
         }
+        true
     }
 
     async fn reset_stall_timers(&self) {
@@ -284,5 +303,140 @@ fn cancel_timers(inner: &mut Inner) {
     }
     if let Some(h) = inner.stall_hard_handle.take() {
         h.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{ChannelRef, MessageRef};
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    /// Records every reaction call as ("add"|"remove", emoji).
+    struct RecordingAdapter {
+        calls: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(&self, _: &ChannelRef, _: &MessageRef, _: &str) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, emoji: &str) -> Result<()> {
+            self.calls.lock().await.push(("add", emoji.to_string()));
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, emoji: &str) -> Result<()> {
+            self.calls.lock().await.push(("remove", emoji.to_string()));
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    fn controller() -> (Arc<RecordingAdapter>, StatusReactionController) {
+        let adapter = Arc::new(RecordingAdapter {
+            calls: Mutex::new(Vec::new()),
+        });
+        let msg = MessageRef {
+            channel: ChannelRef {
+                platform: "test".into(),
+                channel_id: "C1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "m1".into(),
+        };
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            msg,
+            ReactionEmojis::default(),
+            ReactionTiming::default(),
+        );
+        (adapter, ctrl)
+    }
+
+    #[tokio::test]
+    async fn seen_replaces_queued_and_blocks_done_face() {
+        let (adapter, ctrl) = controller();
+        let e = ReactionEmojis::default();
+        ctrl.set_queued().await;
+        ctrl.set_seen().await;
+        // Dispatch always calls set_done after a successful turn; it must be a
+        // no-op here — no 🆗 and no mood face on a chose-not-to-reply turn.
+        ctrl.set_done().await;
+        let calls = adapter.calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("add", e.queued.clone()),
+                ("add", e.seen.clone()),
+                ("remove", e.queued.clone()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn done_still_adds_face_on_normal_turn() {
+        let (adapter, ctrl) = controller();
+        let e = ReactionEmojis::default();
+        ctrl.set_queued().await;
+        ctrl.set_done().await;
+        let calls = adapter.calls.lock().await.clone();
+        assert_eq!(calls.len(), 4, "add queued, add done, remove queued, add face: {calls:?}");
+        assert_eq!(calls[1], ("add", e.done.clone()));
+        assert_eq!(calls[3].0, "add");
+        assert_ne!(calls[3].1, e.done);
+    }
+
+    #[tokio::test]
+    async fn seen_is_noop_when_disabled() {
+        let adapter = Arc::new(RecordingAdapter {
+            calls: Mutex::new(Vec::new()),
+        });
+        let msg = MessageRef {
+            channel: ChannelRef {
+                platform: "test".into(),
+                channel_id: "C1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "m1".into(),
+        };
+        let ctrl = StatusReactionController::new(
+            false,
+            adapter.clone(),
+            msg,
+            ReactionEmojis::default(),
+            ReactionTiming::default(),
+        );
+        ctrl.set_seen().await;
+        assert!(adapter.calls.lock().await.is_empty());
+    }
+
+    #[test]
+    fn emojis_block_without_seen_gets_default() {
+        let e: ReactionEmojis = toml::from_str(r#"queued = "👀"
+done = "🆗""#).unwrap();
+        assert_eq!(e.queued, "👀");
+        assert_eq!(e.seen, emoji_seen_default_for_test());
+    }
+
+    fn emoji_seen_default_for_test() -> String {
+        ReactionEmojis::default().seen
     }
 }

@@ -64,6 +64,7 @@ fn unicode_to_slack_emoji(unicode: &str) -> &str {
         "⚡" => "zap",
         "🆗" => "ok",
         "😱" => "scream",
+        "🤫" => "shushing_face",
         "🚫" => "no_entry_sign",
         "😊" => "blush",
         "😎" => "sunglasses",

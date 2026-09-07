@@ -1904,6 +1904,11 @@ pub struct ReactionEmojis {
     pub done: String,
     #[serde(default = "emoji_error")]
     pub error: String,
+    /// Final reaction for a turn that read the message and deliberately chose
+    /// not to reply (empty output, no error). Distinct from `done` so a reader
+    /// can tell "seen, not replying" from "answered" at a glance.
+    #[serde(default = "emoji_seen")]
+    pub seen: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1984,6 +1989,9 @@ fn emoji_done() -> String {
 fn emoji_error() -> String {
     "😱".into()
 }
+fn emoji_seen() -> String {
+    "🤫".into()
+}
 
 fn default_debounce_ms() -> u64 {
     700
@@ -2038,6 +2046,7 @@ impl Default for ReactionEmojis {
             web: emoji_web(),
             done: emoji_done(),
             error: emoji_error(),
+            seen: emoji_seen(),
         }
     }
 }
