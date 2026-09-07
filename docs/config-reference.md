@@ -586,6 +586,7 @@ Customize the emoji for each processing stage.
 | `web` | ⚡ | Agent is doing web operations. |
 | `done` | 🆗 | Agent finished successfully. |
 | `error` | 😱 | Agent encountered an error. |
+| `seen` | 🤫 | Agent read the message and deliberately replied with nothing (empty output, no error). Replaces `done`; no mood face is added. |
 
 ### `[reactions.timing]`
 
