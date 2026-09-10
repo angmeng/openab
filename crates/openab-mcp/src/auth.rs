@@ -618,28 +618,32 @@ fn flock_exclusive(lock: &Path) -> Result<AuthFileLock> {
 /// Both `with_auth_locked` and `McpCredentialStore::clear` — which needs a
 /// delete-on-empty tail the funnel can't express — acquire here, so the
 /// `"global"` sidecar name and the acquire policy live in exactly one place.
+/// Split per-platform rather than cfg-ing only the body: `AuthFileLock` is itself
+/// `#[cfg(unix)]`, so naming it in a shared signature fails to resolve on Windows
+/// (E0412) no matter what the body does. Both callers bind the guard as `_guard`,
+/// so the differing guard type off-unix is invisible to them.
+#[cfg(unix)]
 fn lock_global(path: &Path) -> Result<Option<AuthFileLock>> {
-    #[cfg(unix)]
-    {
-        Ok(Some(flock_exclusive(&lock_path_for(path, "global"))?))
-    }
-    #[cfg(not(unix))]
-    {
-        // No flock(2) off-unix: every writer runs unprotected, so concurrent
-        // processes can silently corrupt auth.json (ADR §5.4). openab-agent is
-        // de-facto unix-only; warn once rather than fail silently so a non-unix
-        // build with concurrent processes is at least diagnosable.
-        use std::sync::Once;
-        static WARN_NO_LOCK: Once = Once::new();
-        WARN_NO_LOCK.call_once(|| {
-            tracing::warn!(
-                "auth.json cross-process file locking is unavailable on this non-unix platform; \
-                 concurrent openab-agent processes may corrupt stored credentials (ADR §5.4)"
-            );
-        });
-        let _ = path;
-        Ok(None)
-    }
+    Ok(Some(flock_exclusive(&lock_path_for(path, "global"))?))
+}
+
+/// See the `#[cfg(unix)]` twin above.
+#[cfg(not(unix))]
+fn lock_global(path: &Path) -> Result<Option<()>> {
+    // No flock(2) off-unix: every writer runs unprotected, so concurrent
+    // processes can silently corrupt auth.json (ADR §5.4). openab-agent is
+    // de-facto unix-only; warn once rather than fail silently so a non-unix
+    // build with concurrent processes is at least diagnosable.
+    use std::sync::Once;
+    static WARN_NO_LOCK: Once = Once::new();
+    WARN_NO_LOCK.call_once(|| {
+        tracing::warn!(
+            "auth.json cross-process file locking is unavailable on this non-unix platform; \
+             concurrent openab-agent processes may corrupt stored credentials (ADR §5.4)"
+        );
+    });
+    let _ = path;
+    Ok(None)
 }
 
 /// (a) File-integrity funnel (ADR §5.4). Holds the global sidecar lock across a
