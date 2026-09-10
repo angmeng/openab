@@ -1921,6 +1921,12 @@ enum OauthDialError {
     /// refreshing this server's token). Not an auth failure and not a transport
     /// failure — the caller leaves the status retryable, does NOT force re-login
     /// or trip the circuit breaker.
+    ///
+    /// Only constructed on unix: the per-tenant refresh lock is `flock(2)`-based,
+    /// so its `#[cfg(unix)]` acquire site is the sole producer. The variant and
+    /// its handling arm stay compiled everywhere (one code path, not two), so the
+    /// dead-code lint is silenced off-unix rather than cfg-ing the enum apart.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Transient(anyhow::Error),
 }
 
