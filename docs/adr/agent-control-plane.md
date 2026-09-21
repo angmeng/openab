@@ -100,8 +100,8 @@ Key properties:
    contract (§9).
 4. **CP connectivity is strictly additive.** Loss of the CP link never
    affects normal platform (Discord/Slack) operation; the runtime reconnects
-   with backoff. The CP itself is stateless enough that a restart only means
-   re-registration.
+   with backoff. The CP holds no durable state, so a restart costs
+   re-registration plus whatever delegations were in flight (§4).
 
 ### Naming
 
@@ -180,6 +180,12 @@ Agent A ◄──── result ◄──────── OAB-A ◄────
 
 ### Delegate frame
 
+What the initiator sends. Note what is *absent*: there is no `chain` field.
+Callers supply at most a parent reference; the CP constructs the ancestry
+from authenticated identities and its own in-flight table, so a runtime cannot
+forge it. This example is a *parented* delegation — a root one simply omits
+both parent fields.
+
 ```json
 {
   "method": "cp/delegate",
@@ -187,19 +193,55 @@ Agent A ◄──── result ◄──────── OAB-A ◄────
     "delegation_id": "d-01J...",
     "target": { "name": "worker-1" },
     "prompt": "…",
-    "chain": ["koudu"],
+    "parent_delegation_id": "d-01H...",
+    "parent_admission": 41,
     "deadline": "2026-08-06T22:45:00Z"
   }
 }
 ```
 
 - `target` — exact `name` or a `labels` selector (CP schedules among matches)
-- `chain` — the full delegation ancestry, appended at every hop. Enables
-  cycle rejection (target already in chain), depth enforcement, fan-out
-  budgets, and audit tracing back to the human-facing root.
+- `parent_delegation_id` + `parent_admission` — a **pair**, both omitted for a
+  root delegation and both required together otherwise. If present, the caller
+  must be the instance currently serving *that specific admission* of the
+  parent, in the caller's own namespace; the CP appends to that admission's
+  chain. "Currently serving that parent" means the exact forwarded admission —
+  the serving handle plus the `admission` token the CP stamped on the parent's
+  forwarded `cp/delegate` — **not** the serving handle plus the reusable
+  `delegation_id`. The id alone names a slot that cancel-then-retry
+  legitimately reuses, so handle + id would let a task from an admission that
+  has already ended inherit the chain and deadline budget of whatever was
+  re-admitted under the same id (see "Admissions carry a protocol-visible
+  token"). An id without a token is `INVALID_PARAMS`; so is a token without an
+  id, rather than being ignored as an accidental root delegation.
 - `deadline` — propagated absolute deadline. A child's timeout can never
   exceed its parent's remaining budget, so orphaned workers cannot keep
   consuming tokens after the root gave up.
+
+What the serving runtime receives is a different frame: the CP adds the
+authenticated `from`, the constructed `chain`, and the `admission` token for
+this admission.
+
+```json
+{
+  "method": "cp/delegate",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "prompt": "…",
+    "deadline": "2026-08-06T22:45:00Z",
+    "from": "prod/koudu",
+    "chain": ["prod/koudu", "prod/worker-2"]
+  }
+}
+```
+
+- `chain` — the full delegation ancestry, root first, appended at every hop.
+  Enables cycle rejection (target already in chain), depth enforcement, and
+  audit tracing back to the human-facing root. Every element was authenticated
+  by the CP, so the serving runtime can trust it.
+- `admission` — the token this runtime must echo on `cp/delegate_result` and
+  match on `cp/cancel` (see "Admissions carry a protocol-visible token").
 
 ### Result delivery is protocol-mandatory
 
@@ -208,6 +250,334 @@ complete until the serving runtime returns a structured result frame
 (`cp/delegate_result` with status, result text, and error detail on failure).
 The serving **runtime** emits this frame when the agent's turn ends — result
 delivery never depends on the sub-agent model "remembering" to report.
+
+The frame MUST echo the `admission` token the CP stamped on the forwarded
+`cp/delegate` (see "Admissions carry a protocol-visible token" below):
+
+```json
+{
+  "method": "cp/delegate_result",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "status": "completed",
+    "result": "…"
+  }
+}
+```
+
+`delegation_id` says *which delegation*; `admission` says *which admission of
+it*, and the id is reusable. A frame without the token is rejected as
+malformed, and one naming a superseded admission is dropped.
+
+### Cancel frame
+
+`cp/cancel` travels both ways — initiator → CP → serving runtime — and carries
+the token in both, for the same reason results do:
+
+```json
+{
+  "method": "cp/cancel",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "reason": "changed my mind"
+  }
+}
+```
+
+From the initiator, `admission` is the abort target: a cancel naming a
+superseded admission is refused rather than removing whatever holds the id now.
+CP-synthesized cancels (deadline sweep, initiator disconnect,
+stalled-initiator teardown) stamp the token of the admission they are ending, so
+a best-effort cancel that overtakes a same-id re-admission's forward is
+identifiable at the worker as belonging to work that is already over.
+
+### v1 contract amendments (from PR #1465 review)
+
+The first implementation (`crates/openab-cp`) freezes the following
+behaviors, resolving the review findings on identity, lifecycle, and
+recovery semantics:
+
+- **Identity binding.** CP config owns an immutable identity table: auth key
+  → (`namespace`, `name`, `type`, optional capacity cap). The runtime's
+  registration claims are *verified against* the key's bound identity and
+  rejected on mismatch (`IDENTITY_MISMATCH`). Authorization never derives
+  from self-asserted registration fields. Keys are per-agent
+  (individually revocable) and presented as `Authorization: Bearer` on the
+  WebSocket upgrade — never in URLs.
+- **CP-constructed chain.** `cp/delegate` carries only a parent *reference*
+  (`parent_delegation_id` + `parent_admission`); the CP derives the ancestry
+  chain from its
+  in-flight table and the authenticated caller identity, then stamps it on
+  the forwarded frame. A runtime cannot forge ancestry, so depth/cycle
+  checks operate on trusted data. Policy (role, depth, cycle, namespace,
+  deadline caps) is enforced by the CP authoritatively; facade checks are
+  defense in depth only.
+- **Registration lifecycle.** The first frame on a connection MUST be
+  `cp/register` (JSON-RPC 2.0 envelope validated — `jsonrpc: "2.0"` and a
+  request id are required; `protocol_version` field). Registrations are
+  keyed by a **CP-generated handle**, never the client-supplied
+  `instance_id`: a colliding `instance_id` cannot replace or tear down
+  another connection's registration, and all in-flight ownership checks
+  (completion, cancellation, parent linkage) compare handles — each paired
+  with the `admission` token, since the handle alone cannot say *which*
+  admission of a reusable id is meant. The ack
+  carries the heartbeat interval, lease window, and the effective (possibly
+  clamped) concurrency budget. Instances missing heartbeats past the lease
+  are deregistered, and their in-flight delegations fail immediately with a
+  **side-specific** outcome: delegations the expired instance was *serving*
+  send `target_disconnected` to the initiator, while delegations it had
+  *initiated* send a best-effort `cp/cancel` to the still-live server (and
+  release its reserved capacity). The two are mutually exclusive — one dead
+  instance never produces both frames for the same delegation. Heartbeats
+  refresh the lease only — CP-owned
+  in-flight accounting is authoritative and never merged from runtime
+  reports.
+- **Registration deadline.** `cp/register` must arrive within
+  `register_timeout_secs` of the completed WebSocket upgrade. WS Ping/Pong
+  keeps the transport alive but does **not** extend the deadline, and a
+  `cp/register` that arrives after it is never acked. On expiry the CP closes
+  the socket with WS code **1008** (policy violation) and reason
+  `registration timeout`. Rationale: authentication alone bounds nothing — an
+  authenticated peer could otherwise park sockets indefinitely in the
+  pre-registration state.
+- **Registration is per-connection and first-frame-only, so lease expiry ends
+  the connection.** When the CP drops a registration on its own initiative it
+  also closes the socket — WS code **1008**, reason `lease expired`. Leaving
+  it open would strand a connection whose every subsequent frame hits an
+  absent registry entry and which can never re-register. Recovery is
+  therefore always the same shape: **reconnect, re-authenticate, re-register**
+  (a new handle; the old one is gone for good). Frames that arrive in the
+  window between the sweep and the close are answered `NOT_REGISTERED` rather
+  than dropped silently, so a client can tell a swept lease from a hung CP.
+- **Per-identity connection quota.** `max_connections_per_identity` bounds
+  concurrent sockets per identity and is counted **from the upgrade**, so
+  pre-registration sockets occupy a slot too. An over-quota upgrade is refused
+  at the HTTP layer with **503** and a body naming the quota (a bare 503 is
+  indistinguishable from an overloaded CP). The slot is held by an RAII guard
+  released on every exit path, so no early return, failed handshake, or panic
+  can leak it. Replicas of one logical agent share one identity, so this is
+  also the replica ceiling.
+- **Resource bounds.** The WS transport rejects messages over
+  `max_frame_bytes` before parsing; oversized `prompt`s are rejected
+  (`max_prompt_bytes`); per-connection outbound queues are bounded and a
+  peer that cannot drain its queue is treated as disconnected. Every outbound
+  write is additionally bounded by `write_timeout_secs` and raced against the
+  CP's own close signal, because a bounded queue does not bound the *writer*:
+  a peer that stops reading (closed TCP receive window, half-open connection)
+  would otherwise park the connection task inside one `send`, pinning that
+  identity's connection quota and its in-flight delegations for as long as the
+  socket survives — and lease expiry could not reclaim them, since lease
+  expiry works by signalling that very task. A write that times out is a
+  disconnect. Delegation admission (duplicate check → target selection →
+  capacity reservation → in-flight insert) is one atomic sequence, and the
+  in-flight entry exists before the forward frame is sent.
+- **Terminal results are never silently dropped.** `cp/delegate_result`
+  delivery commits only after the initiator's queue accepts the frame: the
+  CP validates ownership, sends, and only then removes the in-flight entry
+  and releases the serving instance's capacity. If the initiator's bounded
+  queue refuses the frame, the serving runtime receives an error (not
+  `ok: true`), the initiator is closed (WS 1008, reason
+  `outbound queue overflow` — the "cannot drain → disconnected" rule applied
+  to the frame where it matters most), and the delegation resolves through
+  the disconnect path: `cp/cancel` to the serving runtime and exactly one
+  capacity release. Best-effort frames (`cp/cancel`, sweep-synthesized
+  `timeout`) remain fire-and-forget: the propagated deadline is their backstop.
+- **Admissions carry a protocol-visible token; commits are exact.** Every
+  admission is stamped with a CP-minted, never-reused **admission token**
+  (`admission`, a per-namespace monotonic counter). `(namespace,
+  delegation_id)` is deliberately not a stable identity over time — the id is
+  client-supplied and cancel-then-retry is an ordinary client pattern, which
+  with a single replica re-admits the same id to the same worker — so the token
+  is what identifies one admission, and it travels the whole round trip:
+  - the `cp/delegate` ack carries it, so the initiator can correlate;
+  - the forwarded `cp/delegate` carries it, so the serving runtime learns it;
+  - `cp/delegate_result` MUST echo it. It is a **required** field: a missing
+    token is `INVALID_PARAMS`, never a wildcard;
+  - `cp/cancel` carries it in **both** directions, also required. From the
+    initiator it names the admission to abort; on every CP-synthesized cancel
+    (deadline sweep, initiator disconnect, stalled-initiator teardown) the CP
+    stamps the token of the admission it is ending, built from the in-flight
+    entry it removed;
+  - every initiator-bound terminal frame carries it, CP-synthesized `timeout`
+    and `target_disconnected` included (both are built from the in-flight
+    entry);
+  - a **parent reference** on `cp/delegate` carries it as `parent_admission`,
+    required whenever `parent_delegation_id` is present.
+
+  The CP checks the echoed token *before* building the initiator-bound frame,
+  and the commit phase removes an in-flight entry only when key, serving
+  handle, AND token all match the admission it delivered a result for; anything
+  else is left strictly untouched, capacity included. Without the token on the
+  wire, a late result for a cancelled admission A — arriving after the same id
+  was re-admitted as B to the same worker — would be delivered to the initiator
+  as B's terminal frame and would then commit B (peek and commit both saw B),
+  releasing capacity B still occupies and leaving B's genuine result to be
+  dropped later as unknown. A stale-token result is dropped and answered with
+  the same generic ack as any other drop: a distinguishable reply would tell
+  the serving side whether an id is currently re-admitted, the class of oracle
+  namespace-scoped keys and byte-identical `cp/cancel` refusals removed. The
+  counter is per namespace for the same reason: a single global counter on the
+  wire would disclose other namespaces' delegation volume, while commit
+  matching only needs never-reuse per `(namespace, delegation_id)`. Exhaustion
+  fails closed (the admission is refused; the counter never wraps).
+
+  Cancellation needs the token for the same reason results do, in both
+  directions. `cp/cancel` from the initiator is matched on `(from_handle,
+  namespace + delegation_id, admission)` — all three under the one lock
+  acquisition that removes the entry — and any mismatch is refused with the
+  same byte-identical `POLICY_DENIED` as an unknown id or another instance's
+  live id, so a caller cannot learn whether the id it reused is currently
+  re-admitted. Without the token, an ordinary application-level *retry* of
+  `cancel(A)` landing after the same id was re-admitted as B matched B and
+  removed it: B's capacity was released while its work continued, and B's
+  genuine result was later dropped as unknown with no synthesized terminal
+  frame, because the entry was gone. In the CP-synthesized direction the gap is
+  structural rather than client-dependent: the deadline sweep removes an
+  expired entry under the in-flight lock and builds its best-effort
+  `cp/cancel` after releasing it, so a same-id re-admission can be admitted and
+  its forward enqueued to the same worker first. The worker would then receive
+  `forward(B)` followed by an id-only cancel for A — different producers into
+  one queue, so connection ordering does not help — and B's work would be
+  aborted at the source while the CP still shows it live. Stamping the ended
+  admission's token makes that frame identifiable as belonging to work that is
+  already over.
+
+  Parent linkage is the third surface, and the one that feeds the CP's own
+  authorization decisions rather than frame delivery. The parent lookup exists
+  to stop any runtime that knows a live id from borrowing its trusted chain and
+  deadline budget, and it checks that the caller is the instance *serving* that
+  parent — but "serving" resolved through `(namespace, delegation_id)` plus the
+  serving handle is not an admission. Once parent admission A ends (cancel,
+  completion, or sweep) and the id is re-admitted as B — with a single replica,
+  to the same worker — a residual task from A submitting
+  `cp/delegate { parent_delegation_id: P }` satisfies every one of those checks
+  against B. The child then inherits B's CP-constructed chain and B's remaining
+  deadline budget: depth, cycle, and parent-budget are evaluated for the wrong
+  admission, and the audit chain attributes A's work to B's root. Unlike the
+  result and cancel cases this is not misdelivery but a policy-envelope hijack,
+  and the CP cannot push it onto the worker: `cp/cancel` is best effort, and the
+  runtime holding the serving connection is precisely who would trigger it
+  deliberately. So the reference is a pair — `parent_delegation_id` plus
+  `parent_admission` — matched together with the serving handle under the one
+  in-flight lock acquisition the parent branch already takes, and the chain and
+  deadline are read from the entry that acquisition validated rather than from a
+  second lookup. Unknown, unauthorized and stale parents share one refusal
+  shape, so the reply is not an oracle for whether an id is currently
+  re-admitted.
+
+  ⚠️ **Wire-breaking (pre-1.0).** `admission` is a **required** field on both
+  `cp/delegate_result` (added in the round-8 revision of this contract) and
+  `cp/cancel` (added in round 9), and a **parented** `cp/delegate` must carry
+  `parent_admission` alongside `parent_delegation_id` (added here). Optional
+  would be a wildcard, which is exactly the
+  misdelivery path the token exists to close, so there is no
+  backward-compatible spelling of it. A runtime built against the pre-token
+  contract will have **every** result and **every** cancel refused with
+  `INVALID_PARAMS` after the CP is upgraded, and every *parented* delegation
+  refused with it too. Runtimes must echo
+  `DelegateForward::admission` on results, name the target admission on
+  cancels, and name the parent's admission when delegating a child while
+  serving that parent. Root delegations are unaffected — they carry neither
+  parent field, so their wire shape is unchanged. There are no shipped clients
+  at this point in the stack — every
+  serving runtime learns the token from the forwarded `cp/delegate` — so the
+  migration is mechanical, but it is not silent and it is not optional.
+- **First terminal frame per admission wins.** Delivery is commit-gated:
+  only the one path that authoritatively ended an admission (completion
+  commit, cancel, deadline sweep, disconnect teardown) may put an
+  initiator-bound terminal frame on the wire, and a result whose commit
+  loses the race is discarded undelivered — so under one CP process an
+  initiator receives at most one terminal frame per admission, and the
+  observer event stream records the committed outcome (an initiator whose
+  connection cannot accept its terminal frame is disconnected and misses it;
+  the stream still shows what the CP committed). The rule is retained as
+  client-side defence in depth (frames straddling a CP restart, future
+  multi-instance deployments): **initiators MUST treat the first terminal
+  frame (`completed`, `failed`, `timeout`, `target_disconnected`) for a
+  given `admission` token as authoritative and ignore every later terminal
+  frame for that token.** Correlation is per admission, not per
+  `delegation_id`: keyed on the reusable id, a late frame for a superseded
+  admission would permanently mask the live admission's genuine terminal
+  frame. CP-side state is exact either way — the token rule above makes the
+  commit exact, so exactly one path ever releases the capacity.
+- **Global admission and memory bounds.** Beyond per-frame and per-connection
+  limits the CP bounds its own aggregate state:
+  `max_inflight_delegations` (default 4096) caps simultaneously in-flight
+  delegations process-wide, enforced at admission before any capacity is
+  reserved and refused with `SATURATED` — per-target
+  `max_delegated_sessions` is runtime-advertised and bounds one target's
+  concurrency, not the CP's memory; `max_outbound_queue_bytes` (default 16 MiB)
+  caps each connection's outbound queue in **bytes** as well as entries, since
+  256 queued frames of a configurable frame size is not a memory bound; and
+  `default_max_delegated_sessions_cap` (default 16) clamps every advertised
+  capacity that has no per-identity cap, so a runtime can never advertise its
+  way out of saturation-based backpressure.
+- **Teardown of a registered connection is panic-safe.** Deregistration,
+  failing the connection's in-flight delegations, and downstream cancellation
+  run from an RAII guard scoped to the registered lifetime, so they happen on
+  the normal return path and on an unwind alike (the `expect("serializable")`
+  sites on production paths make a panic reachable). Without it a panicking
+  connection task left its registry entry and in-flight rows — and the capacity
+  they reserve on *other* instances — for the lease sweeper to reclaim up to
+  `lease_expiry_secs` later. Teardown is idempotent by construction:
+  deregistration is keyed by handle and capacity is released only for in-flight
+  entries actually removed, so the guard and the sweeper can both run over the
+  same handle without double-releasing.
+- **Capacity release follows entry removal.** Whichever path removes an
+  in-flight entry (result commit, cancel, deadline sweep, instance failure,
+  or a failed forward's rollback) releases its capacity reservation — and
+  only that path does, exactly once. A rollback that finds its entry already
+  removed by a concurrent sweep or disconnect must not decrement again:
+  session counts are saturating, so a double release is silent and would
+  let `saturated()` admit work to a full instance.
+- **Saturation = fast-fail.** When all matching targets are at capacity the
+  CP replies `SATURATED` immediately. The CP never queues — v1 has no
+  durable state, and a hidden in-memory queue would contradict that.
+  `NO_TARGET` (nothing matches) is a distinct error.
+- **Delegation ids are scoped to `(namespace, delegation_id)`.** The id is
+  client-supplied, so it is only unique within the namespace that produced
+  it. Two namespaces may hold the same id concurrently, legally and
+  invisibly: `DUPLICATE_DELEGATION` only ever refers to the caller's own
+  namespace, parent-chain lookup never reaches across namespaces, and result
+  routing resolves the id inside the sender's registered namespace. `cp/cancel`
+  refusals are deliberately **indistinguishable**: an unknown id and another
+  instance's live id return the same `POLICY_DENIED` error object, byte for
+  byte, so cancel cannot be used as an existence oracle for other tenants'
+  delegation ids. The CP's own logs keep the distinction.
+- **CP restart semantics.** A CP restart is equivalent to every lease
+  expiring at once *with* the connection closure that implies — except that
+  the CP is not there to send it: the in-flight table and the sockets die
+  together with the process, so no synthesized `timeout` or
+  `target_disconnected` frame can be emitted for delegations that were in
+  flight. Runtimes observe the transport drop, reconnect with backoff, and
+  re-register (new handles, empty in-flight table). Initiators reconcile
+  against the deadline they already propagated, which is the upper bound on
+  every orphaned delegation. Once the CP is back, late
+  `cp/delegate_result` frames for unknown ids are acknowledged, logged, and
+  dropped so reconnecting runtimes do not error-loop, and a frame from a
+  connection that has not re-registered is answered `NOT_REGISTERED`. Within a
+  *live* CP the synthesized failures do happen, but per side, not both at
+  once: lease expiry or disconnect sends `target_disconnected` to the
+  initiator when the *serving* instance died, and a best-effort `cp/cancel`
+  downstream when the *initiating* instance died. Only a deadline sweep emits
+  both frames for one delegation (see below), because there both peers are
+  still connected.
+- **Timeout and disconnect synthesis.** A deadline sweep terminates overdue
+  delegations: the initiator receives a synthesized `timeout` result and the
+  serving runtime a best-effort `cp/cancel` (stop burning tokens). Worker
+  disconnect → `target_disconnected` to the initiator; initiator disconnect
+  → best-effort `cp/cancel` downstream.
+- **Result size cap.** `cp/delegate_result.result` larger than the
+  configured `max_result_bytes` (default 256 KiB) is truncated head-first
+  with an explicit marker.
+- **Idempotency.** `delegation_id` is the caller-generated idempotency key;
+  a duplicate id already in flight **in the caller's own namespace** is
+  rejected (`DUPLICATE_DELEGATION`). Only the
+  instance a delegation was routed to may complete it; only the initiating
+  instance may cancel it.
+
 
 ---
 
@@ -260,10 +630,19 @@ integration. v1 tool surface, intentionally minimal:
 
 | Tool | Behavior |
 |------|----------|
-| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns `delegation_id` immediately). |
-| `check_delegation` | Status / result by `delegation_id`. |
+| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns a `delegation` handle immediately). |
+| `check_delegation` | Status / result by `delegation` handle. |
 | `list_agents` | Registry view for the caller's namespace (names, types, labels, availability) — lets the model discover targets by label. |
-| `cancel_delegation` | Cancel an in-flight delegation. |
+| `cancel_delegation` | Cancel an in-flight delegation by `delegation` handle. |
+
+The `delegation` handle returned by `spawn_agent` is opaque to callers and
+encapsulates the `(delegation_id, admission)` pair. This extends the wire
+invariant ("every surface that references an existing delegation names it by
+the (id, admission) pair; a bare reusable id is never accepted as a
+reference") to the local API: `check_delegation` and `cancel_delegation`
+resolve the handle to the exact admission it was minted for, so a delayed
+check or cancel can never observe or abort a same-id re-admission. Callers
+never see or construct the two halves separately.
 
 The facade is where policy is enforced *before* frames leave the box: schema
 validation, chain/depth checks, deadline clamping, audit logging. A
@@ -281,7 +660,10 @@ evolves underneath.
 ### CLI (`openab agent <verb>`) — secondary client, same socket
 
 - **Ops/debugging:** exec into a task and run `openab agent list` /
-  `openab agent status <id>` when a delegation hangs
+  `openab agent status <handle>` when a delegation hangs — the handle is the
+  same opaque `(delegation_id, admission)` value `spawn` printed, so a status
+  or cancel typed minutes later still names the exact admission, never a
+  same-id re-admission
 - **Hooks & cron:** lifecycle hooks and cron jobs can fire
   `openab agent spawn …` without new plumbing
 - **Escape hatch** for backends where MCP injection proves awkward
@@ -296,11 +678,24 @@ facade without changing anything shipped in v1.
 
 ## 7. Security
 
+Two distinct auth boundaries exist, and they must not be conflated:
+
+1. **Runtime ↔ CP (shipped in PR 1/4):** the OAB runtime authenticates to the
+   CP with `Authorization: Bearer <key>` on the WebSocket upgrade, over TCP.
+   The CP binds loopback by default; any non-loopback bind requires the
+   explicit `allow_insecure_bind` override and a TLS-terminating proxy (or a
+   private network) in front — bearer keys must never cross untrusted
+   cleartext TCP. See the "v1 contract amendments" in §4 for the enforced
+   registration semantics.
+2. **Agent subprocess ↔ local facade (PR 3/4, not yet shipped):** the UDS
+   path is the only thing the child needs; filesystem permissions on the
+   socket are the local auth boundary. The *local facade* is never exposed
+   on TCP — this claim is about the UDS facade, not about the CP itself,
+   which is a TCP service by design.
+
 - **No CP credentials in the agent process.** `OPENAB_CP_KEY` lives in the
   OAB runtime env; agent subprocesses keep the existing `env_clear`
-  whitelist. The UDS path is the only thing the child needs; filesystem
-  permissions on the socket are the local auth boundary. The local API is
-  never exposed on TCP.
+  whitelist.
 - **Per-agent auth keys** to the CP (not one shared fleet key), so a single
   compromised runtime is individually revocable.
 - **Per-peer identity.** Delegated prompts arrive attributed to the sending
@@ -365,14 +760,28 @@ of scope for v1.
 
 ## 11. Open Questions
 
-1. **Streaming intermediate output** — should `cp/delegate` stream
-   `session/update`-style chunks back to the primary, or only the final
-   result frame? v1 leans final-only; streaming is additive.
+1. ~~**Streaming intermediate output**~~ — *resolved (PR #1465 review):
+   committed scope as a fast-follow behind the same wire contract. Worker
+   runtimes will stream `session/update`-style chunks back through the CP.
+   Rationale: streaming is the observability substrate, not a feature — it
+   restores the free human visibility that Discord-mediated collaboration
+   provides today. *Phase 1 of the observer surface has since shipped
+   (PR #1470): the read-only `observer` identity type, the `cp/event`
+   lifecycle notification stream (per-namespace `seq`, admission-token
+   correlation, `metadata_only` redaction), and `cp/list_agents` — wire
+   contract documented in `docs/control-plane.md` ("Observer surface").
+   Accepted operational limits of that slice: delivery to observers is
+   best-effort (bounded queues, `seq`-gap detection), `seq` is not durable
+   across CP restarts, and there is no event replay — a lobby needing
+   history must retain its own.* Intermediate `session_*` relay streaming
+   remains future scope. v1 of the *delegation wire contract* ships
+   final-result-only; the stream frame shape is reserved.
 2. **CP high availability** — single instance + fast re-registration is
-   acceptable for v1; is active/standby needed before multi-tenant use?
-3. **Human-visibility directives** — should a primary be able to mirror
-   selected delegation traffic into a Discord thread (observability) via
-   existing output directives?
+   acceptable for v1 (restart semantics are now defined in §4); is
+   active/standby needed before multi-tenant use?
+3. **Human-visibility directives** — Discord mirroring becomes a consumer
+   of the delegation stream (Q1) rather than a separate mechanism; exact
+   directive syntax TBD when streaming lands.
 4. **AgentCore/remote runtimes** — an `agentcore-acp`-backed OAB registers
    like any other runtime; verify deadline propagation across the SDK
    boundary.

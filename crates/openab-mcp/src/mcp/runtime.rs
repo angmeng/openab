@@ -46,7 +46,9 @@ use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 
 use super::breaker::{ServerBreaker, Verdict};
-use super::config::{parse_logging_level, McpConfig, ServerConfig};
+use super::config::{
+    parse_http_headers, parse_logging_level, HttpHeaders, McpConfig, ServerConfig,
+};
 use super::flow::{canonical_resource, ensure_s256_supported, parse_redirect_params};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{auth_path, McpCredentialStore};
@@ -536,10 +538,22 @@ impl McpRuntimeManager {
             .servers
             .into_iter()
             .map(|(name, config)| {
+                // Layered loading preserves malformed header entries so the
+                // runtime can isolate them as `Failed` instead of dropping
+                // every sibling server before manager construction.
+                let status = match &config {
+                    ServerConfig::Http { headers, oauth, .. } => {
+                        match parse_http_headers(&name, headers, oauth.is_some()) {
+                            Ok(_) => ServerStatus::Disconnected,
+                            Err(e) => ServerStatus::Failed(super::concise_error_message(&e)),
+                        }
+                    }
+                    ServerConfig::Stdio { .. } => ServerStatus::Disconnected,
+                };
                 let handle = ServerHandle {
                     name: name.clone(),
                     config,
-                    status: ServerStatus::Disconnected,
+                    status,
                     client: None,
                     last_used: Instant::now(),
                     in_flight: Arc::new(AtomicUsize::new(0)),
@@ -610,10 +624,13 @@ impl McpRuntimeManager {
         // Bound the refresh round-trip (driven via `get_access_token`) so the
         // per-tenant lock held across it is provably released before another
         // process's lock deadline — see `crate::auth::REFRESH_HTTP_TIMEOUT`.
-        let http = reqwest013::Client::builder()
+        let http = mcp_http_client_builder()
             .timeout(crate::auth::REFRESH_HTTP_TIMEOUT)
             .build()
             .map_err(|e| anyhow!("mcp server {name:?} oauth http client build failed: {e}"))?;
+        manager
+            .with_client(http.clone())
+            .map_err(|e| anyhow!("mcp server {name:?} oauth http client setup failed: {e}"))?;
         let client = AuthClient::new(http, manager);
         cache.insert(name.to_string(), client.clone());
         Ok(client)
@@ -632,7 +649,12 @@ impl McpRuntimeManager {
     /// without touching the circuit breaker; a contended refresh lock returns
     /// [`OauthDialError::Transient`] so the caller retries without forcing
     /// re-login or tripping the breaker.
-    async fn resolve_oauth_dial(&self, name: &str, url: &str) -> Result<Dial, OauthDialError> {
+    async fn resolve_oauth_dial(
+        &self,
+        name: &str,
+        url: &str,
+        headers: HttpHeaders,
+    ) -> Result<Dial, OauthDialError> {
         let needs_login = || {
             OauthDialError::NeedsAuth(anyhow!(
                 "mcp server {name:?} needs oauth login — run `mcp login {name}`"
@@ -653,6 +675,7 @@ impl McpRuntimeManager {
         if !near_expiry {
             return Ok(Dial::Http {
                 url: url.to_string(),
+                headers,
                 client: Some(client),
             });
         }
@@ -707,6 +730,7 @@ impl McpRuntimeManager {
         })?;
         Ok(Dial::Http {
             url: url.to_string(),
+            headers,
             client: Some(client),
         })
     }
@@ -1426,18 +1450,41 @@ impl McpRuntimeManager {
                     }
                 }
             }
-            let resolved = handle.config.resolved(name)?;
+            let resolved = match handle.config.resolved(name) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    handle.status = ServerStatus::Failed(super::concise_error_message(&e));
+                    return Err(e);
+                }
+            };
             connect_log_level = resolved.log_level().and_then(parse_logging_level);
-            let plan = match resolved {
+            let plan_result: Result<DialPlan> = match resolved {
                 ServerConfig::Stdio {
                     command, args, env, ..
-                } => DialPlan::Dial(Dial::Stdio { command, args, env }),
+                } => Ok(DialPlan::Dial(Dial::Stdio { command, args, env })),
                 ServerConfig::Http {
                     url,
+                    headers,
                     oauth: Some(_),
                     ..
-                } => DialPlan::OauthHttp { url },
-                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, client: None }),
+                } => parse_http_headers(name, &headers, true)
+                    .map(|headers| DialPlan::OauthHttp { url, headers }),
+                ServerConfig::Http { url, headers, .. } => {
+                    parse_http_headers(name, &headers, false).map(|headers| {
+                        DialPlan::Dial(Dial::Http {
+                            url,
+                            headers,
+                            client: None,
+                        })
+                    })
+                }
+            };
+            let plan = match plan_result {
+                Ok(plan) => plan,
+                Err(e) => {
+                    handle.status = ServerStatus::Failed(super::concise_error_message(&e));
+                    return Err(e);
+                }
             };
             handle.status = ServerStatus::Connecting;
             plan
@@ -1458,34 +1505,36 @@ impl McpRuntimeManager {
         // valid token resolves straight to a `Dial::Http` with the cached client.
         let dial = match plan {
             DialPlan::Dial(d) => d,
-            DialPlan::OauthHttp { url } => match self.resolve_oauth_dial(name, &url).await {
-                Ok(d) => d,
-                Err(OauthDialError::NeedsAuth(e)) => {
-                    let mut guard = self.handles.write().await;
-                    if let Some(h) = guard.get_mut(name) {
-                        // A concurrent connect() may have finished a fresh login +
-                        // dial while we were resolving. Don't clobber the winner's
-                        // Connected status with NeedsAuth.
-                        if !matches!(h.status, ServerStatus::Connected) {
-                            h.status = ServerStatus::NeedsAuth;
+            DialPlan::OauthHttp { url, headers } => {
+                match self.resolve_oauth_dial(name, &url, headers).await {
+                    Ok(d) => d,
+                    Err(OauthDialError::NeedsAuth(e)) => {
+                        let mut guard = self.handles.write().await;
+                        if let Some(h) = guard.get_mut(name) {
+                            // A concurrent connect() may have finished a fresh login +
+                            // dial while we were resolving. Don't clobber the winner's
+                            // Connected status with NeedsAuth.
+                            if !matches!(h.status, ServerStatus::Connected) {
+                                h.status = ServerStatus::NeedsAuth;
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-                Err(OauthDialError::Transient(e)) => {
-                    // Refresh lock contended (another process holds this server's
-                    // refresh). Not an auth or transport failure — leave the status
-                    // retryable (don't force re-login, don't trip the breaker); the
-                    // next connect() retries cleanly once the holder releases.
-                    let mut guard = self.handles.write().await;
-                    if let Some(h) = guard.get_mut(name) {
-                        if !matches!(h.status, ServerStatus::Connected) {
-                            h.status = ServerStatus::Disconnected;
+                    Err(OauthDialError::Transient(e)) => {
+                        // Refresh lock contended (another process holds this server's
+                        // refresh). Not an auth or transport failure — leave the status
+                        // retryable (don't force re-login, don't trip the breaker); the
+                        // next connect() retries cleanly once the holder releases.
+                        let mut guard = self.handles.write().await;
+                        if let Some(h) = guard.get_mut(name) {
+                            if !matches!(h.status, ServerStatus::Connected) {
+                                h.status = ServerStatus::Disconnected;
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-            },
+            }
         };
 
         let dial_result = dial
@@ -1819,8 +1868,9 @@ fn build_device_oauth_client(
 /// coupling is needed).
 fn oauth_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("build reqwest client")
+        .context("build redirect-safe oauth reqwest client")
 }
 
 /// Adapt oauth2's `HttpRequest`/`HttpResponse` (the `http` crate types) onto
@@ -1909,7 +1959,21 @@ fn device_poll_error(
 /// lock is released.
 enum DialPlan {
     Dial(Dial),
-    OauthHttp { url: String },
+    OauthHttp { url: String, headers: HttpHeaders },
+}
+
+/// Build the reqwest client used by cached OAuth MCP traffic. Automatic
+/// redirects are disabled so arbitrary credential-bearing custom headers
+/// cannot be replayed to a redirect target. The default idle pool is retained
+/// so sequential OAuth-backed MCP requests can reuse TCP/TLS connections.
+fn mcp_http_client_builder() -> reqwest013::ClientBuilder {
+    reqwest013::Client::builder().redirect(reqwest013::redirect::Policy::none())
+}
+
+/// Match rmcp's anonymous Streamable HTTP client policy: no idle connection
+/// pool, but with redirects explicitly disabled for custom-header safety.
+fn anonymous_mcp_http_client_builder() -> reqwest013::ClientBuilder {
+    mcp_http_client_builder().pool_max_idle_per_host(0)
 }
 
 /// Why [`McpRuntimeManager::resolve_oauth_dial`] couldn't produce a `Dial`.
@@ -1941,6 +2005,7 @@ enum Dial {
     },
     Http {
         url: String,
+        headers: HttpHeaders,
         /// rmcp OAuth client for oauth-protected servers (injects the bearer
         /// per request and refreshes as needed); `None` for anonymous HTTP.
         client: Option<AuthClient<reqwest013::Client>>,
@@ -2030,12 +2095,17 @@ impl Dial {
                 .await
                 .with_context(|| format!("mcp handshake with {command:?}"))
             }
-            // `with_client` yields a transport parameterised by the OAuth client,
-            // a different type than the default `from_uri` transport, so each arm
-            // runs `serve` itself rather than unifying to a single value.
-            Dial::Http { url, client } => match client {
+            // The two arms use different concrete client types (`AuthClient`
+            // versus `reqwest::Client`), so each arm runs `serve` itself rather
+            // than trying to unify the parameterised transport values.
+            Dial::Http {
+                url,
+                headers,
+                client,
+            } => match client {
                 Some(client) => {
-                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                        .custom_headers(headers);
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
                     OpenabClientHandler::new(
                         name.to_string(),
@@ -2049,7 +2119,12 @@ impl Dial {
                     .with_context(|| format!("mcp handshake with {url:?}"))
                 }
                 None => {
-                    let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                        .custom_headers(headers);
+                    let client = anonymous_mcp_http_client_builder()
+                        .build()
+                        .context("build redirect-safe mcp http client")?;
+                    let transport = StreamableHttpClientTransport::with_client(client, cfg);
                     OpenabClientHandler::new(
                         name.to_string(),
                         tools_cache,
@@ -2159,6 +2234,86 @@ mod tests {
         for (_, status) in statuses {
             assert_eq!(status, ServerStatus::Disconnected);
         }
+    }
+
+    #[tokio::test]
+    async fn from_config_marks_only_invalid_http_header_server_failed() {
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "bad": {
+                    "type": "http",
+                    "url": "https://bad.example/mcp",
+                    "headers": { "Accept": "secret-must-not-leak" }
+                },
+                "good": {
+                    "type": "http",
+                    "url": "https://good.example/mcp",
+                    "headers": { "X-API-Key": "${env:GOOD_KEY}" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let statuses = mgr.statuses().await;
+        assert_eq!(statuses.len(), 2);
+        match &statuses[0] {
+            (name, ServerStatus::Failed(message)) => {
+                assert_eq!(name, "bad");
+                assert!(message.contains("reserved by the rmcp transport"));
+                assert!(!message.contains("secret-must-not-leak"));
+            }
+            other => panic!("expected isolated Failed status, got {other:?}"),
+        }
+        assert_eq!(
+            statuses[1],
+            ("good".to_string(), ServerStatus::Disconnected)
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_load_keeps_valid_siblings_when_one_header_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("mcp.json");
+        std::fs::write(
+            &project,
+            r#"{
+                "mcpServers": {
+                    "bad": {
+                        "type": "http",
+                        "url": "https://bad.example/mcp",
+                        "headers": { "Accept": "secret-must-not-leak" }
+                    },
+                    "good": {
+                        "type": "stdio",
+                        "command": "good-server"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = McpConfig::load_layered(None, Some(&project)).unwrap();
+        assert_eq!(cfg.servers.len(), 2, "layered load must preserve siblings");
+        assert!(
+            cfg.validate().is_err(),
+            "explicit strict validation must still reject the bad literal header"
+        );
+
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let statuses = mgr.statuses().await;
+        assert_eq!(statuses.len(), 2);
+        match &statuses[0] {
+            (name, ServerStatus::Failed(message)) => {
+                assert_eq!(name, "bad");
+                assert!(message.contains("reserved by the rmcp transport"));
+                assert!(!message.contains("secret-must-not-leak"));
+            }
+            other => panic!("expected isolated Failed status, got {other:?}"),
+        }
+        assert_eq!(
+            statuses[1],
+            ("good".to_string(), ServerStatus::Disconnected)
+        );
     }
 
     #[tokio::test]
@@ -2486,6 +2641,492 @@ mod tests {
         match &mgr.statuses().await[0].1 {
             ServerStatus::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_http_sends_configured_headers_on_the_wire() {
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+
+        async fn require_test_header(
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> Response {
+            let allowed = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                == Some("wire-secret");
+            if allowed {
+                next.run(request).await
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+
+        let router = crate::mcp::facade::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            Vec::new(),
+            crate::mcp::sources::SessionTokens::new(),
+        )
+        .layer(axum::middleware::from_fn(require_test_header));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": format!("http://{addr}/mcp"),
+                    "headers": { "X-API-Key": "wire-secret" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        mgr.connect("protected").await.unwrap();
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Connected);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_http_does_not_forward_custom_headers_to_redirect_target() {
+        use axum::extract::State;
+        use axum::http::{header::LOCATION, HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use tokio::sync::Mutex;
+
+        type CapturedHeader = Arc<Mutex<Option<String>>>;
+
+        async fn capture(headers: &HeaderMap, captured: &CapturedHeader) {
+            if let Some(value) = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+            {
+                *captured.lock().await = Some(value.to_string());
+            }
+        }
+
+        async fn redirect(
+            State((location, captured)): State<(String, CapturedHeader)>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            capture(&headers, &captured).await;
+            (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)])
+        }
+
+        async fn redirected(
+            State(captured): State<CapturedHeader>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            capture(&headers, &captured).await;
+            StatusCode::OK
+        }
+
+        let redirected_header = Arc::new(Mutex::new(None));
+        let redirected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected_addr = redirected_listener.local_addr().unwrap();
+        let redirected_server = tokio::spawn({
+            let captured = redirected_header.clone();
+            async move {
+                let app = axum::Router::new()
+                    .route("/capture", post(redirected))
+                    .with_state(captured);
+                axum::serve(redirected_listener, app).await.unwrap();
+            }
+        });
+
+        let original_header = Arc::new(Mutex::new(None));
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn({
+            let state = (
+                format!("http://{redirected_addr}/capture"),
+                original_header.clone(),
+            );
+            async move {
+                let app = axum::Router::new()
+                    .route("/mcp", post(redirect))
+                    .with_state(state);
+                axum::serve(redirect_listener, app).await.unwrap();
+            }
+        });
+
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "redirecting": {
+                    "type": "http",
+                    "url": format!("http://{redirect_addr}/mcp"),
+                    "headers": { "X-API-Key": "wire-secret" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let err = mgr.connect("redirecting").await.unwrap_err().to_string();
+        assert!(err.contains("handshake"), "got: {err}");
+        assert_eq!(original_header.lock().await.as_deref(), Some("wire-secret"));
+        assert!(
+            redirected_header.lock().await.is_none(),
+            "custom header reached redirect target"
+        );
+
+        redirect_server.abort();
+        redirected_server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_http_client_does_not_follow_redirects() {
+        use axum::extract::State;
+        use axum::http::{header::LOCATION, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+
+        async fn redirect(State(location): State<String>) -> impl IntoResponse {
+            (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)])
+        }
+
+        async fn redirected(State(hits): State<Arc<AtomicUsize>>) -> StatusCode {
+            hits.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+
+        let redirected_hits = Arc::new(AtomicUsize::new(0));
+        let redirected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected_addr = redirected_listener.local_addr().unwrap();
+        let redirected_server = tokio::spawn({
+            let hits = redirected_hits.clone();
+            async move {
+                let app = axum::Router::new()
+                    .route("/capture", post(redirected))
+                    .with_state(hits);
+                axum::serve(redirected_listener, app).await.unwrap();
+            }
+        });
+
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/oauth", post(redirect))
+                .with_state(format!("http://{redirected_addr}/capture"));
+            axum::serve(redirect_listener, app).await.unwrap();
+        });
+
+        let response = oauth_http_client()
+            .unwrap()
+            .post(format!("http://{redirect_addr}/oauth"))
+            .body("device_code=secret-must-not-leak")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(redirected_hits.load(Ordering::SeqCst), 0);
+
+        redirect_server.abort();
+        redirected_server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_transport_client_does_not_forward_custom_headers_to_redirect_target() {
+        use axum::extract::State;
+        use axum::http::{header::LOCATION, HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use reqwest013::header::{HeaderName, HeaderValue};
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, PingRequest, RequestId};
+        use rmcp::transport::streamable_http_client::StreamableHttpClient;
+        use tokio::sync::Mutex;
+
+        type CapturedHeaders = Arc<Mutex<(Option<String>, Option<String>)>>;
+        type RedirectTargetState = (Arc<AtomicUsize>, CapturedHeaders);
+
+        async fn redirect(
+            State((location, captured)): State<(String, CapturedHeaders)>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            *captured.lock().await = (api_key, authorization);
+            (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)])
+        }
+
+        async fn redirected(
+            State((hits, captured)): State<RedirectTargetState>,
+            headers: HeaderMap,
+        ) -> StatusCode {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            *captured.lock().await = (api_key, authorization);
+            StatusCode::OK
+        }
+
+        let redirected_hits = Arc::new(AtomicUsize::new(0));
+        let redirected_headers = Arc::new(Mutex::new((None, None)));
+        let redirected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected_addr = redirected_listener.local_addr().unwrap();
+        let redirected_server = tokio::spawn({
+            let state = (redirected_hits.clone(), redirected_headers.clone());
+            async move {
+                let app = axum::Router::new()
+                    .route("/capture", post(redirected))
+                    .with_state(state);
+                axum::serve(redirected_listener, app).await.unwrap();
+            }
+        });
+
+        let original_headers = Arc::new(Mutex::new((None, None)));
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn({
+            let state = (
+                format!("http://{redirected_addr}/capture"),
+                original_headers.clone(),
+            );
+            async move {
+                let app = axum::Router::new()
+                    .route("/mcp", post(redirect))
+                    .with_state(state);
+                axum::serve(redirect_listener, app).await.unwrap();
+            }
+        });
+
+        let http = mcp_http_client_builder().build().unwrap();
+        let manager = AuthorizationManager::new(format!("http://{redirect_addr}/mcp"))
+            .await
+            .unwrap();
+        let client = AuthClient::new(http, manager);
+        let message = ClientJsonRpcMessage::request(
+            ClientRequest::PingRequest(PingRequest::default()),
+            RequestId::Number(1),
+        );
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("oauth-transport-secret"),
+        );
+        let uri: Arc<str> = Arc::from(format!("http://{redirect_addr}/mcp"));
+        let result = client
+            .post_message(
+                uri,
+                message,
+                None,
+                Some("oauth-token".to_string()),
+                custom_headers,
+            )
+            .await;
+        assert!(result.is_err(), "redirect response must not complete MCP POST");
+        assert_eq!(
+            *original_headers.lock().await,
+            (
+                Some("oauth-transport-secret".to_string()),
+                Some("Bearer oauth-token".to_string())
+            )
+        );
+        assert_eq!(redirected_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(*redirected_headers.lock().await, (None, None));
+
+        redirect_server.abort();
+        redirected_server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_http_client_reuses_idle_http_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_connection(mut socket: tokio::net::TcpStream) {
+            let mut buffered = Vec::new();
+            loop {
+                let header_end = loop {
+                    if let Some(pos) = buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    let mut chunk = [0_u8; 1024];
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                };
+                buffered.drain(..header_end);
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve_connection(socket));
+                }
+            }
+        });
+
+        let client = mcp_http_client_builder().build().unwrap();
+        let url = format!("http://{addr}/reuse");
+        for _ in 0..2 {
+            let response = client.get(&url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest013::StatusCode::NO_CONTENT);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "cached OAuth MCP client must reuse its idle HTTP/1.1 connection"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_invalid_headers_without_leaking_values() {
+        for (header_name, header_value, expected) in [
+            (
+                "bad header",
+                "name-secret-must-not-leak",
+                "invalid HTTP header name",
+            ),
+            (
+                "X-API-Key",
+                "value-secret-must-not-leak\n",
+                "invalid HTTP header value",
+            ),
+        ] {
+            let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+                "mcpServers": {
+                    "protected": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/mcp",
+                        "headers": { header_name: header_value }
+                    }
+                }
+            }))
+            .unwrap();
+            let mgr = McpRuntimeManager::from_config(cfg);
+            let err = mgr.connect("protected").await.unwrap_err().to_string();
+            assert!(err.contains("protected"), "expected server context: {err}");
+            assert!(err.contains(header_name), "expected header name: {err}");
+            assert!(err.contains(expected), "got: {err}");
+            assert!(
+                !err.contains("secret-must-not-leak"),
+                "header value leaked: {err}"
+            );
+            assert!(
+                matches!(&mgr.statuses().await[0].1, ServerStatus::Failed(_)),
+                "invalid config must be visible as Failed"
+            );
+            for _ in 0..crate::mcp::breaker::FAIL_THRESHOLD {
+                let err = mgr.connect("protected").await.unwrap_err().to_string();
+                assert!(!err.contains("circuit-breaker open"), "got: {err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_reserved_headers_without_breaker_churn() {
+        for header_name in ["Accept", "MCP-Session-Id", "Last-Event-ID"] {
+            let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+                "mcpServers": {
+                    "protected": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/mcp",
+                        "headers": { header_name: "secret-must-not-leak" }
+                    }
+                }
+            }))
+            .unwrap();
+            let mgr = McpRuntimeManager::from_config(cfg);
+            for _ in 0..=crate::mcp::breaker::FAIL_THRESHOLD {
+                let err = mgr.connect("protected").await.unwrap_err().to_string();
+                assert!(err.contains("reserved by the rmcp transport"), "got: {err}");
+                assert!(err.contains(header_name), "got: {err}");
+                assert!(!err.contains("secret-must-not-leak"), "value leaked: {err}");
+                assert!(!err.contains("circuit-breaker open"), "got: {err}");
+                assert!(matches!(&mgr.statuses().await[0].1, ServerStatus::Failed(_)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_custom_authorization_with_oauth() {
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": { "Authorization": "Bearer custom-secret-must-not-leak" },
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let err = mgr.connect("protected").await.unwrap_err().to_string();
+        assert!(err.contains("protected"), "expected server context: {err}");
+        assert!(err.contains("Authorization"), "got: {err}");
+        assert!(err.contains("oauth"), "got: {err}");
+        assert!(
+            !err.contains("custom-secret-must-not-leak"),
+            "header value leaked: {err}"
+        );
+        assert!(matches!(&mgr.statuses().await[0].1, ServerStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_case_variant_duplicates_without_breaker_churn() {
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:1/mcp",
+                    "headers": { "X-Key": "first", "x-key": "second" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        for _ in 0..=crate::mcp::breaker::FAIL_THRESHOLD {
+            let err = mgr.connect("protected").await.unwrap_err().to_string();
+            assert!(err.contains("protected"), "expected server context: {err}");
+            assert!(err.contains("duplicate HTTP header"), "got: {err}");
+            assert!(!err.contains("circuit-breaker open"), "got: {err}");
+            assert!(matches!(
+                &mgr.statuses().await[0].1,
+                ServerStatus::Failed(_)
+            ));
         }
     }
 

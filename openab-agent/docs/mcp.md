@@ -22,10 +22,56 @@ LLM-driven dispatch loop. Two consequences run through every capability below:
 It connects over **stdio** and **streamable HTTP** transports (SSE retry honoured
 where rmcp supports it).
 
+### Custom HTTP headers
+
+The native `openab-agent` can send per-request custom headers to remote HTTP MCP
+servers. Keep credential values out of `mcp.json` by resolving them from the
+agent process environment:
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-API-Key": "${env:REMOTE_MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Every header value supports the same `${env:VAR}` interpolation as other MCP
+configuration strings; header names are literal and do not support
+interpolation. Header names are case-insensitive under HTTP semantics, so
+case-variant duplicates such as `X-Key` and `x-key` are rejected. Headers owned
+by the transport (`Accept`, `MCP-Session-Id`, and `Last-Event-ID`) are also
+rejected. Malformed literal headers are detected before connection and mark only
+the affected server as failed; explicit `McpConfig::validate` callers still
+receive the validation error. Values produced by environment resolution are
+validated again at connection time; a missing variable or invalid resolved
+value marks that server as failed without charging its transport circuit
+breaker. Errors name the server and header but never include the header value.
+When an `oauth` block is configured, a custom `Authorization` header is rejected
+so the OAuth bearer token remains unambiguous.
+
+Automatic HTTP redirects are disabled for MCP and OAuth requests so custom
+credentials cannot be replayed to a redirect target. Configure the final MCP or
+OAuth endpoint directly; an HTTP-to-HTTPS redirect, path migration, or
+load-balancer redirect fails closed instead of being followed. Use HTTPS for
+remote credential-bearing endpoints.
+
+`MCP-Protocol-Version` remains allowed to match rmcp 1.7/1.8. A configured value
+may be sent on the initial request; after initialization, rmcp replaces it with
+the version negotiated with the server. Most configurations should leave this
+header unset and let the SDK manage it.
+
 ## Capability matrix (openab-agent)
 
 | Capability | Status | Summary |
 |---|---|---|
+| Custom HTTP headers | ✅ | Per-server headers over streamable HTTP; values support `${env:VAR}` interpolation. |
 | Tools (list / call / describe) | ✅ | Full; enriched projection (title, annotations, schema, task-support). |
 | JSON Schema dialect | ✅ validated | `call` args validated against `inputSchema` (`jsonschema`); draft auto-detected (draft 4/6/7/2019-09/2020-12, absent ⇒ 2020-12); uncompilable dialect refused. |
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |

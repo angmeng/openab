@@ -418,6 +418,11 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
       "url": "https://mcp.linear.app/mcp",
       "oauth": { "provider": "linear" }
     },
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "X-API-Key": "${env:REMOTE_MCP_API_KEY}" }
+    },
     "fs": {
       "type": "stdio",
       "command": "mcp-server-filesystem",
@@ -428,9 +433,24 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
 }
 ```
 
-- `${env:VAR}` interpolation matches Cursor / Cline; missing var = startup error for that server (others continue)
+- `${env:VAR}` interpolation matches Cursor / Cline across string values,
+  including HTTP header values; header names are literal and are not interpolated
+- HTTP header names are case-insensitive; case-variant duplicates and
+  transport-owned names (`Accept`, `MCP-Session-Id`, `Last-Event-ID`) are
+  rejected before connection
+- Malformed literal headers are detected before connection; the runtime marks
+  only the affected server failed, while explicit strict validation returns the
+  error to its caller
+- Missing or invalid resolved values mark only that server failed at connect
+  time without charging its transport circuit breaker
+- Automatic HTTP redirects are disabled for MCP and OAuth requests; operators
+  must configure final endpoints directly so custom credentials are never
+  replayed to a redirect target
+- `MCP-Protocol-Version` remains allowed for rmcp compatibility; rmcp replaces
+  any initial configured value with the negotiated version after initialization
 - `tool_filter` supports `include` / `exclude` glob lists (lifted from OpenHands' `filter_tools_regex`)
-- Per-server failure isolated — one bad server does not block agent boot
+- Literal-header and runtime resolution failures are isolated per server;
+  whole-config OAuth policy validation remains fail-closed at load time
 
 ### 5.7 Lifecycle
 

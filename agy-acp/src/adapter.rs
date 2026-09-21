@@ -7,6 +7,23 @@ use uuid::Uuid;
 
 use crate::types::*;
 
+const DEFAULT_PRINT_TIMEOUT: &str = "20m";
+
+fn prompt_extra_args(extra: &str) -> Vec<String> {
+    let mut args = shell_words::split(extra).unwrap_or_else(|_| {
+        eprintln!("[agy-acp] WARN: failed to parse AGY_EXTRA_ARGS, ignoring");
+        Vec::new()
+    });
+    if !args
+        .iter()
+        .any(|arg| arg == "--print-timeout" || arg.starts_with("--print-timeout="))
+    {
+        args.push("--print-timeout".to_string());
+        args.push(DEFAULT_PRINT_TIMEOUT.to_string());
+    }
+    args
+}
+
 pub struct Adapter {
     pub sessions: HashMap<String, Session>,
     pub working_dir: String,
@@ -341,13 +358,7 @@ impl Adapter {
         let mut args: Vec<String> = Vec::new();
         args.push("--add-dir".to_string());
         args.push(self.working_dir.clone());
-        if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
-            if let Ok(parsed) = shell_words::split(&extra) {
-                args.extend(parsed);
-            } else {
-                eprintln!("[agy-acp] WARN: failed to parse AGY_EXTRA_ARGS, ignoring");
-            }
-        }
+        args.extend(prompt_extra_args(&std::env::var("AGY_EXTRA_ARGS").unwrap_or_default()));
         if let Some(session) = self.sessions.get(&session_id) {
             if let Some(conv_id) = &session.conversation_id {
                 args.push("--conversation".to_string());
@@ -365,5 +376,60 @@ impl Adapter {
         let initial_step_idx = self.sessions.get(&session_id).map(|s| s.last_step_idx).unwrap_or(-1);
 
         (session_id, clean_prompt, args, snapshot, initial_conv_id, initial_step_idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_extra_args;
+
+    #[test]
+    fn default_timeout_is_added_without_discarding_extra_args() {
+        assert_eq!(prompt_extra_args(""), ["--print-timeout", "20m"]);
+        assert_eq!(
+            prompt_extra_args("--model 'model with spaces'"),
+            ["--model", "model with spaces", "--print-timeout", "20m"]
+        );
+    }
+
+    #[test]
+    fn explicit_timeout_is_preserved_in_both_forms() {
+        assert_eq!(
+            prompt_extra_args("--print-timeout 5m"),
+            ["--print-timeout", "5m"]
+        );
+        assert_eq!(
+            prompt_extra_args("--print-timeout=30m"),
+            ["--print-timeout=30m"]
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_timeouts_are_left_for_cli_validation() {
+        for extra in [
+            "--print-timeout",
+            "--print-timeout=",
+            "--print-timeout ''",
+            "--print-timeout --model example",
+            "--print-timeout=invalid",
+        ] {
+            assert_eq!(prompt_extra_args(extra), shell_words::split(extra).unwrap());
+        }
+    }
+
+    #[test]
+    fn similar_flag_does_not_suppress_default() {
+        assert_eq!(
+            prompt_extra_args("--print-timeout-other 1s"),
+            ["--print-timeout-other", "1s", "--print-timeout", "20m"]
+        );
+    }
+
+    #[test]
+    fn malformed_extra_args_still_get_default_timeout() {
+        assert_eq!(
+            prompt_extra_args("--print-timeout '5m"),
+            ["--print-timeout", "20m"]
+        );
     }
 }
